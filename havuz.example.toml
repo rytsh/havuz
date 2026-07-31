@@ -8,8 +8,9 @@
 # Start with:  HAVUZ_MASTER_KEY=$(havuz keygen) havuz run --config havuz.toml
 
 [server]
-# Clients connect here with their normal PostgreSQL driver. The pool they reach
-# is chosen by the database name in their connection string:
+# Shared client listener. The pool is chosen by the database name in the
+# connection string. Pools may also request an optional dedicated listen port
+# from the dashboard; those ports exist only while that pool is enabled.
 #   postgresql://svc_orders:***@havuz:5432/app_main
 listen = "0.0.0.0:5432"
 

@@ -113,11 +113,11 @@
     @apply grid grid-cols-3 gap-1 lg:block;
   }
 
-  .nav button {
+  .nav a {
     @apply flex w-full cursor-pointer items-center justify-between rounded-md border-0 bg-transparent px-2.5 py-2 text-left text-xs text-muted transition-colors hover:bg-panel-raised hover:text-ink lg:mb-1 lg:text-[13px];
   }
 
-  .nav button.active {
+  .nav a.active {
     @apply bg-panel-raised font-medium text-ink shadow-[inset_2px_0_0_var(--accent)];
   }
 
@@ -240,15 +240,18 @@
     @apply border-negative/40 bg-negative/10 text-negative;
   }
 
-  button.action {
+  button.action,
+  a.action {
     @apply inline-flex cursor-pointer items-center justify-center whitespace-nowrap rounded-md border border-line bg-panel-raised px-3 py-1.5 text-xs font-medium text-ink transition hover:border-accent/70 hover:text-accent disabled:cursor-not-allowed disabled:opacity-40;
   }
 
-  button.action.primary {
+  button.action.primary,
+  a.action.primary {
     @apply border-accent-strong bg-accent-strong text-canvas hover:border-accent hover:bg-accent hover:text-canvas;
   }
 
-  button.action.danger:hover {
+  button.action.danger:hover,
+  a.action.danger:hover {
     @apply border-negative text-negative;
   }
 
@@ -293,6 +296,179 @@
     @apply border-accent bg-accent/5 shadow-[inset_0_0_0_1px_var(--accent)];
   }
 
+  .connection-heading {
+    @apply mb-6;
+  }
+
+  .connection-picker {
+    @apply overflow-hidden rounded-xl border border-line bg-panel shadow-[0_24px_70px_rgba(0,0,0,0.18)];
+  }
+
+  .connection-toolbar {
+    @apply flex flex-wrap items-end gap-3 border-b border-line p-4;
+  }
+
+  .view-switch {
+    @apply flex overflow-hidden rounded-md border border-line;
+  }
+
+  .view-switch button {
+    @apply cursor-pointer bg-panel-raised px-3 py-2 font-mono text-[10px] uppercase tracking-wider text-muted transition hover:text-ink;
+  }
+
+  .view-switch button + button {
+    @apply border-l border-line;
+  }
+
+  .view-switch button.active {
+    @apply bg-accent/10 text-accent;
+  }
+
+  .connection-search {
+    @apply relative min-w-[220px] max-w-md flex-1;
+  }
+
+  .connection-search span {
+    @apply sr-only;
+  }
+
+  .connection-search input {
+    @apply w-full rounded-md border border-line bg-canvas/50 px-3 py-2 text-sm text-ink outline-none placeholder:text-muted/70 focus:border-accent;
+  }
+
+  .catalog-count {
+    @apply ml-auto pb-2 font-mono text-[10px] uppercase tracking-wider text-muted;
+  }
+
+  .catalog-layout {
+    @apply grid min-h-[430px] md:grid-cols-[190px_1fr];
+  }
+
+  .catalog-categories {
+    @apply flex gap-1 overflow-x-auto border-b border-line bg-canvas/30 p-3 md:block md:border-b-0 md:border-r;
+  }
+
+  .catalog-categories button {
+    @apply mb-1 flex min-w-max cursor-pointer items-center justify-between gap-5 rounded-md px-3 py-2.5 text-left text-xs text-muted transition hover:bg-panel-raised hover:text-ink md:w-full;
+  }
+
+  .catalog-categories button.active {
+    @apply bg-accent/10 font-semibold text-accent;
+  }
+
+  .catalog-categories small {
+    @apply font-mono text-[9px] opacity-70;
+  }
+
+  .database-catalog {
+    @apply grid content-start gap-2 p-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4;
+  }
+
+  .database-catalog.list {
+    @apply grid-cols-1 lg:grid-cols-2;
+  }
+
+  .database-type-card {
+    @apply relative flex min-h-28 cursor-not-allowed flex-col items-center justify-center gap-2 rounded-lg border border-line bg-canvas/20 p-4 text-center text-ink opacity-45 transition;
+  }
+
+  .database-type-card.available {
+    @apply cursor-pointer opacity-100 hover:-translate-y-0.5 hover:border-accent/70 hover:bg-accent/5 hover:shadow-[0_10px_30px_rgba(0,0,0,0.16)];
+  }
+
+  .database-catalog.list .database-type-card {
+    @apply min-h-20 flex-row justify-start text-left;
+  }
+
+  .database-mark {
+    @apply flex size-10 shrink-0 items-center justify-center rounded-xl border border-line bg-panel-raised;
+  }
+
+  .database-mark svg {
+    @apply size-5;
+    fill: var(--brand, var(--accent));
+  }
+
+  .database-card-copy {
+    @apply flex flex-col items-center gap-1;
+  }
+
+  .database-catalog.list .database-card-copy {
+    @apply items-start;
+  }
+
+  .database-card-copy strong {
+    @apply text-xs;
+  }
+
+  .database-card-copy small {
+    @apply font-mono text-[9px] uppercase tracking-wider text-muted;
+  }
+
+  .database-type-card > .badge {
+    @apply absolute right-2 top-2;
+  }
+
+  .catalog-empty {
+    @apply col-span-full flex min-h-48 items-center justify-center rounded-lg border border-dashed border-line text-sm text-muted;
+  }
+
+  .back-link {
+    @apply mb-4 cursor-pointer font-mono text-[10px] uppercase tracking-wider text-muted transition hover:text-accent;
+  }
+
+  .back-link::before {
+    content: "<- ";
+  }
+
+  .selected-database-title {
+    @apply flex items-center gap-3;
+  }
+
+  .selected-database-title h1 {
+    @apply mb-0;
+  }
+
+  .connection-form {
+    @apply grid gap-4;
+  }
+
+  .form-section {
+    @apply grid gap-6 rounded-xl border border-line bg-panel p-5 lg:grid-cols-[220px_1fr] lg:p-7;
+  }
+
+  .form-section-heading {
+    @apply flex items-start gap-3;
+  }
+
+  .form-section-heading > span {
+    @apply mt-0.5 font-mono text-[10px] text-accent;
+  }
+
+  .form-section-heading h2 {
+    @apply mb-1 normal-case tracking-tight text-ink;
+  }
+
+  .form-section-heading p {
+    @apply text-xs leading-relaxed text-muted;
+  }
+
+  .form-fields {
+    @apply grid content-start gap-x-5 md:grid-cols-2;
+  }
+
+  .form-fields .field {
+    @apply max-w-none;
+  }
+
+  .form-fields.wide {
+    @apply block;
+  }
+
+  .connection-actions {
+    @apply flex justify-end gap-2 border-t border-line pt-4;
+  }
+
   .config-panel {
     @apply mt-5 grid gap-5 rounded-lg border border-accent/30 bg-panel p-5 shadow-[0_18px_50px_rgba(0,0,0,0.12)];
   }
@@ -302,7 +478,39 @@
   }
 
   .config-grid {
-    @apply grid gap-3 md:grid-cols-3;
+    @apply grid gap-3 md:grid-cols-2 xl:grid-cols-4;
+  }
+
+  .mode-guide {
+    @apply mb-5 grid gap-2 lg:grid-cols-3;
+  }
+
+  .mode-guide article {
+    @apply rounded-lg border border-line bg-canvas/30 p-3 transition;
+  }
+
+  .mode-guide article.active {
+    @apply border-accent/60 bg-accent/5 shadow-[inset_0_0_0_1px_color-mix(in_srgb,var(--accent)_35%,transparent)];
+  }
+
+  .mode-guide-head {
+    @apply mb-1 flex items-center justify-between gap-2;
+  }
+
+  .mode-guide-head strong {
+    @apply text-xs;
+  }
+
+  .mode-guide-head span {
+    @apply font-mono text-[8px] uppercase tracking-wider text-accent;
+  }
+
+  .mode-guide p {
+    @apply mb-2 mt-0 text-xs leading-relaxed text-muted;
+  }
+
+  .mode-guide small {
+    @apply block text-[10px] leading-relaxed text-muted/80;
   }
 
   .trace-filters {
@@ -322,8 +530,74 @@
     @apply grid size-7 place-items-center rounded-full border border-accent/40 bg-accent/10 font-mono text-xs text-accent;
   }
 
+  .live-count.has-blockers {
+    @apply border-warning/50 bg-warning/10 text-warning;
+  }
+
+  .pressure-grid {
+    @apply mb-8 grid gap-2 md:grid-cols-2 xl:grid-cols-3;
+  }
+
+  .pressure-grid article {
+    @apply rounded-lg border border-line bg-panel p-3;
+  }
+
+  .pressure-grid article.hot {
+    @apply border-warning/50;
+  }
+
+  .pressure-head,
+  .pressure-meta {
+    @apply flex items-center justify-between gap-3;
+  }
+
+  .pressure-head strong {
+    @apply text-xs;
+  }
+
+  .pressure-head span,
+  .pressure-meta {
+    @apply font-mono text-[9px] text-muted;
+  }
+
+  .pressure-bar {
+    @apply my-2 h-1 overflow-hidden rounded-full bg-panel-raised;
+  }
+
+  .pressure-bar i {
+    @apply block h-full rounded-full bg-accent transition-all;
+  }
+
+  .pressure-grid article.hot .pressure-bar i {
+    @apply bg-warning;
+  }
+
   .active-traces {
     @apply grid gap-3 xl:grid-cols-2;
+  }
+
+  .holder-grid {
+    @apply grid gap-3 xl:grid-cols-2;
+  }
+
+  .holder-card {
+    @apply rounded-lg border border-warning/30 bg-warning/5 p-4;
+  }
+
+  .holder-card.waiting {
+    @apply border-negative/40 bg-negative/5;
+  }
+
+  .holder-top {
+    @apply flex items-start justify-between gap-4;
+  }
+
+  .holder-top > div {
+    @apply flex flex-wrap items-center gap-2;
+  }
+
+  .holder-card p {
+    @apply mb-0 mt-2 text-xs leading-relaxed text-muted;
   }
 
   .active-trace {
@@ -355,8 +629,36 @@
     @apply min-w-[1100px];
   }
 
+  .history-summary {
+    @apply mb-3 grid grid-cols-2 gap-px overflow-hidden rounded-lg border border-line bg-line md:grid-cols-4;
+  }
+
+  .history-summary div {
+    @apply flex items-center justify-between gap-3 bg-panel px-4 py-3;
+  }
+
+  .history-summary span {
+    @apply text-[9px] font-medium uppercase tracking-[0.13em] text-muted;
+  }
+
+  .history-summary strong {
+    @apply font-mono text-base tabular-nums;
+  }
+
+  .danger-text {
+    @apply text-negative;
+  }
+
+  .trace-query-cell {
+    @apply flex max-w-[430px] items-center gap-2;
+  }
+
   .trace-sql {
-    @apply block max-w-[360px] overflow-hidden text-ellipsis whitespace-nowrap;
+    @apply block min-w-0 flex-1 overflow-hidden text-ellipsis whitespace-nowrap;
+  }
+
+  .copy-button {
+    @apply shrink-0 cursor-pointer rounded border border-transparent bg-transparent px-1.5 py-1 font-mono text-[9px] uppercase tracking-wider text-muted transition hover:border-line hover:bg-panel-raised hover:text-accent;
   }
 
   .trace-detail-backdrop {

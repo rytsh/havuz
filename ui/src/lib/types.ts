@@ -51,6 +51,7 @@ export interface Pool {
   mode: PoolMode;
   database: string;
   backend_user: string;
+  listen_port: number | null;
   /** Whether a password is stored. The password itself is never served. */
   has_backend_password: boolean;
   targets: Target[];
@@ -266,7 +267,24 @@ export interface TraceDetail extends TraceSummary {
 
 export interface TraceResponse {
   active: ActiveTrace[];
+  holders: BackendHolder[];
+  pool_snapshots: PoolSnapshot[];
   traces: TraceSummary[];
   retention_days: number;
   result_limits: { rows: number; bytes: number };
+}
+
+export interface BackendHolder {
+  id: number;
+  since_ms: number;
+  elapsed_us: number;
+  pool: string;
+  user: string;
+  application: string | null;
+  client_addr: string;
+  mode: PoolMode;
+  reason: "startup_wait" | "session_mode" | "idle_in_transaction" | "pinned";
+  pin_reason: PinReason | null;
+  target: string | null;
+  backend_pid: number | null;
 }

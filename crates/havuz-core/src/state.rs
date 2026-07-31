@@ -53,6 +53,10 @@ pub enum StateError {
     MinIdleAboveMax { pool: String, min_idle: u32, max_size: u32 },
     #[error("pool '{0}': max_size must be at least 1")]
     ZeroMaxSize(String),
+    #[error("pool '{0}': listen_port must be between 1 and 65535")]
+    ZeroListenPort(String),
+    #[error("pools '{first}' and '{second}' both request listen port {port}")]
+    DuplicateListenPort { first: String, second: String, port: u16 },
     #[error("user '{user}' is granted unknown pool '{pool}'")]
     UnknownPoolGrant { user: String, pool: String },
     #[error("user '{0}' has no pool grants and could never connect")]
@@ -69,11 +73,20 @@ impl State {
             return Err(StateError::UnsupportedVersion { found: self.version, expected: STATE_VERSION });
         }
 
+        let mut listen_ports = BTreeMap::new();
         for (name, pool) in &self.pools {
             if !is_valid_name(name) {
                 return Err(StateError::BadPoolName(name.clone()));
             }
             pool.validate(name)?;
+            if let Some(port) = pool.listen_port {
+                if port == 0 {
+                    return Err(StateError::ZeroListenPort(name.clone()));
+                }
+                if let Some(first) = listen_ports.insert(port, name.clone()) {
+                    return Err(StateError::DuplicateListenPort { first, second: name.clone(), port });
+                }
+            }
         }
 
         for (name, user) in &self.users {
@@ -184,6 +197,10 @@ pub struct PoolConfig {
     pub backend_user: String,
     /// Database opened on the backend.
     pub database: String,
+    /// Optional client-facing port dedicated to this pool. When absent, clients
+    /// use the shared listener and select the pool by database name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen_port: Option<u16>,
     pub limits: PoolLimits,
     /// Family-specific settings validated against the registry's config fields.
     #[serde(default)]
@@ -437,6 +454,7 @@ mod tests {
             targets: vec![Target::new("pg-primary.internal", 5432)],
             backend_user: "app".into(),
             database: "appdb".into(),
+            listen_port: None,
             limits: PoolLimits::default(),
             settings: Default::default(),
             routing: Default::default(),
@@ -521,6 +539,23 @@ mod tests {
         let mut p = pool();
         p.targets.clear();
         assert_eq!(state_with_pool("x", p).validate().unwrap_err(), StateError::NoTargets("x".into()));
+    }
+
+    #[test]
+    fn dedicated_listen_ports_must_be_nonzero_and_unique() {
+        let mut zero = pool();
+        zero.listen_port = Some(0);
+        assert_eq!(state_with_pool("zero", zero).validate().unwrap_err(), StateError::ZeroListenPort("zero".into()));
+
+        let mut state = state_with_pool("first", pool());
+        state.pools.get_mut("first").unwrap().listen_port = Some(5544);
+        let mut second = pool();
+        second.listen_port = Some(5544);
+        state.pools.insert("second".into(), second);
+        assert_eq!(
+            state.validate().unwrap_err(),
+            StateError::DuplicateListenPort { first: "first".into(), second: "second".into(), port: 5544 }
+        );
     }
 
     #[test]

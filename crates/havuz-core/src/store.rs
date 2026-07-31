@@ -184,6 +184,7 @@ mod tests {
             targets: vec![Target::new("pg", 5432)],
             backend_user: "app".into(),
             database: "appdb".into(),
+            listen_port: None,
             limits: PoolLimits::default(),
             settings: Default::default(),
             routing: Default::default(),

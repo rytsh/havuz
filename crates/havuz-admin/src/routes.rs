@@ -85,6 +85,7 @@ struct PoolView {
     mode: PoolMode,
     database: String,
     backend_user: String,
+    listen_port: Option<u16>,
     /// Whether a password is stored. Never the password itself.
     has_backend_password: bool,
     targets: Vec<Target>,
@@ -107,6 +108,7 @@ fn pool_view(name: &str, config: &PoolConfig, state: &havuz_core::State, runtime
         mode: config.mode,
         database: config.database.clone(),
         backend_user: config.backend_user.clone(),
+        listen_port: config.listen_port,
         has_backend_password: state.secrets.contains(&havuz_secrets::pool_backend_password(name)),
         targets: config.targets.clone(),
         limits: config.limits.clone(),
@@ -153,6 +155,8 @@ struct CreatePool {
     database: String,
     backend_user: String,
     #[serde(default)]
+    listen_port: Option<u16>,
+    #[serde(default)]
     backend_password: Option<String>,
     #[serde(default)]
     limits: Option<PoolLimits>,
@@ -168,6 +172,10 @@ async fn create_pool(
     State(state): State<AdminState>,
     Json(body): Json<CreatePool>,
 ) -> Result<impl IntoResponse, ApiError> {
+    state
+        .family
+        .validate_listen_port(&body.name, body.listen_port)
+        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
     let (family, profile) = havuz_registry::resolve(&body.family, body.profile.as_deref())
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
@@ -191,6 +199,7 @@ async fn create_pool(
         targets: body.targets,
         backend_user: body.backend_user,
         database: body.database,
+        listen_port: body.listen_port,
         limits: body.limits.unwrap_or_default(),
         settings: body.settings,
         routing: body.routing.unwrap_or_default(),
@@ -232,6 +241,15 @@ struct UpdatePool {
     max_size: Option<u32>,
     #[serde(default)]
     max_client_connections: Option<u32>,
+    #[serde(default, deserialize_with = "deserialize_nullable_port")]
+    listen_port: Option<Option<u16>>,
+}
+
+fn deserialize_nullable_port<'de, D>(deserializer: D) -> Result<Option<Option<u16>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<u16>::deserialize(deserializer).map(Some)
 }
 
 async fn update_pool(
@@ -239,6 +257,12 @@ async fn update_pool(
     Path(name): Path<String>,
     Json(body): Json<UpdatePool>,
 ) -> Result<impl IntoResponse, ApiError> {
+    if let Some(listen_port) = body.listen_port {
+        state
+            .family
+            .validate_listen_port(&name, listen_port)
+            .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    }
     let update_name = name.clone();
     let found = state
         .store
@@ -252,6 +276,9 @@ async fn update_pool(
                 }
                 if let Some(max_clients) = body.max_client_connections {
                     pool.limits.max_client_connections = max_clients;
+                }
+                if let Some(listen_port) = body.listen_port {
+                    pool.listen_port = listen_port;
                 }
                 true
             }
@@ -310,6 +337,14 @@ async fn resume_pool(State(state): State<AdminState>, Path(name): Path<String>) 
 }
 
 async fn set_disabled(state: &AdminState, name: &str, disabled: bool) -> Result<(), ApiError> {
+    if !disabled {
+        let current = state.store.load();
+        let pool = current.pools.get(name).ok_or_else(|| ApiError::NotFound(format!("pool '{name}'")))?;
+        state
+            .family
+            .validate_listen_port(name, pool.listen_port)
+            .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    }
     let found = state
         .store
         .update({
@@ -530,6 +565,8 @@ async fn get_traces(
     let traces = state.family.traces().list(&filter).map_err(|error| ApiError::Internal(error.to_string()))?;
     Ok(Json(json!({
         "active": state.family.traces().active(),
+        "holders": state.family.holders().snapshot(),
+        "pool_snapshots": state.family.snapshots(),
         "traces": traces,
         "retention_days": havuz_pg::trace::RETENTION_DAYS,
         "result_limits": {
@@ -687,6 +724,36 @@ mod tests {
         let (status, _) = patch(&app, "/api/v1/pools/app_main", json!({ "max_size": 0 })).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(state.store.load().pools["app_main"].limits.max_size, 3);
+    }
+
+    #[tokio::test]
+    async fn dedicated_port_can_be_created_updated_and_removed() {
+        let (app, state) = app();
+        let mut payload = pool_payload();
+        payload["listen_port"] = json!(5544);
+        let (status, created) = post(&app, "/api/v1/pools", payload).await;
+        assert_eq!(status, StatusCode::CREATED, "body: {created}");
+        assert_eq!(created["listen_port"], 5544);
+
+        let (_, updated) = patch(&app, "/api/v1/pools/app_main", json!({ "listen_port": 5545 })).await;
+        assert_eq!(updated["listen_port"], 5545);
+        let (_, cleared) = patch(&app, "/api/v1/pools/app_main", json!({ "listen_port": null })).await;
+        assert!(cleared["listen_port"].is_null());
+        assert_eq!(state.store.load().pools["app_main"].listen_port, None);
+    }
+
+    #[tokio::test]
+    async fn occupied_dedicated_port_is_rejected_before_pool_creation() {
+        let (app, state) = app();
+        let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = occupied.local_addr().unwrap().port();
+        state.family.configure_listeners("127.0.0.1:5432".parse().unwrap(), 100);
+        let mut payload = pool_payload();
+        payload["listen_port"] = json!(port);
+
+        let (status, body) = post(&app, "/api/v1/pools", payload).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+        assert!(state.store.load().pools.is_empty(), "rejected bind must not persist the pool");
     }
 
     #[tokio::test]
@@ -1022,6 +1089,8 @@ mod tests {
             application: Some("orders-api".into()),
             client_addr: "127.0.0.1:5000".into(),
         };
+        let holder = state.family.holders().session(context.clone(), havuz_core::PoolMode::Transaction);
+        holder.idle_in_transaction("primary/127.0.0.1:5432".into(), Some(4242));
         let mut span = state.family.traces().begin(&context, "select 42");
         span.assign("primary/127.0.0.1:5432", Some(4242));
 
@@ -1029,6 +1098,9 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(active["active"][0]["sql"], "select 42");
         assert_eq!(active["active"][0]["backend_pid"], 4242);
+        assert_eq!(active["holders"][0]["reason"], "idle_in_transaction");
+        assert_eq!(active["holders"][0]["backend_pid"], 4242);
+        assert!(active["pool_snapshots"].is_array());
 
         span.succeed();
         let mut history = serde_json::Value::Null;

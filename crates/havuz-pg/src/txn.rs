@@ -30,6 +30,7 @@ use tokio::io::AsyncWriteExt;
 use crate::backend::PgConnector;
 use crate::classify::{classify, route_intent, ClientIntent, RouteIntent};
 use crate::group::PoolGroup;
+use crate::holder::HolderHandle;
 use crate::prepared::{ClientStatements, Rewrite};
 use crate::protocol::{sqlstate, Message, TransactionStatus};
 use crate::relay::RelayStats;
@@ -58,7 +59,7 @@ pub async fn transaction_relay(
     group: &PoolGroup,
     state: &mut SessionState,
 ) -> ProtoResult<TxnOutcome> {
-    transaction_relay_inner(client, group, state, None).await
+    transaction_relay_inner(client, group, state, None, None).await
 }
 
 pub async fn transaction_relay_traced(
@@ -67,8 +68,9 @@ pub async fn transaction_relay_traced(
     state: &mut SessionState,
     traces: &std::sync::Arc<TraceStore>,
     context: &TraceContext,
+    holder: &HolderHandle,
 ) -> ProtoResult<TxnOutcome> {
-    transaction_relay_inner(client, group, state, Some((traces, context))).await
+    transaction_relay_inner(client, group, state, Some((traces, context)), Some(holder)).await
 }
 
 async fn transaction_relay_inner(
@@ -76,6 +78,7 @@ async fn transaction_relay_inner(
     group: &PoolGroup,
     state: &mut SessionState,
     tracing: Option<(&std::sync::Arc<TraceStore>, &TraceContext)>,
+    holder: Option<&HolderHandle>,
 ) -> ProtoResult<TxnOutcome> {
     let mut held: Option<Checkout<PgConnector>> = None;
     let mut stats = RelayStats::default();
@@ -107,6 +110,12 @@ async fn transaction_relay_inner(
         if intent == ClientIntent::Terminate {
             stats.client_terminated = true;
             break;
+        }
+
+        if held.is_some() {
+            if let Some(holder) = holder {
+                holder.clear();
+            }
         }
 
         if let ClientIntent::Pins(reason) = intent {
@@ -168,11 +177,16 @@ async fn transaction_relay_inner(
                         havuz_pool::PoolError::Timeout { .. } => sqlstate::TOO_MANY_CONNECTIONS,
                         _ => sqlstate::CANNOT_CONNECT_NOW,
                     };
+                    let message = if matches!(e, havuz_pool::PoolError::Timeout { .. }) {
+                        format!("{e}; {}", holder.map(HolderHandle::timeout_hint).unwrap_or_default())
+                    } else {
+                        e.to_string()
+                    };
                     if let Some(span) = trace_span.take() {
-                        span.fail(code, e.to_string());
+                        span.fail(code, &message);
                     }
-                    let _ = Message::fatal(code, &e.to_string()).write(client).await;
-                    return Err(ProtoError::backend(e.to_string()));
+                    let _ = Message::fatal(code, &message).write(client).await;
+                    return Err(ProtoError::backend(message));
                 }
             }
         }
@@ -283,6 +297,7 @@ async fn transaction_relay_inner(
                         routing.begin_transaction(current_route);
                     }
                 }
+                update_holder(holder, state, group, current_route, checkout);
                 if let Some(span) = trace_span.take() {
                     span.succeed();
                 }
@@ -372,6 +387,7 @@ async fn transaction_relay_inner(
                                     routing.begin_transaction(current_route);
                                 }
                             }
+                            update_holder(holder, state, group, current_route, &checkout);
                             if let Some(span) = trace_span.take() {
                                 span.succeed();
                             }
@@ -421,6 +437,24 @@ async fn transaction_relay_inner(
     }
 
     Ok(TxnOutcome { stats, exchanges, pinned: state.pin(), checkouts, to_replica })
+}
+
+fn update_holder(
+    holder: Option<&HolderHandle>,
+    state: &SessionState,
+    group: &PoolGroup,
+    route: Route,
+    checkout: &Checkout<PgConnector>,
+) {
+    let Some(holder) = holder else { return };
+    let target = group.target_label(route);
+    if let Some(reason) = state.pin() {
+        holder.pinned(reason, target, checkout.backend_pid());
+    } else if state.in_transaction() {
+        holder.idle_in_transaction(target, checkout.backend_pid());
+    } else {
+        holder.clear();
+    }
 }
 
 /// Where the statement carried by this message may run.
@@ -766,6 +800,7 @@ mod tests {
             targets,
             backend_user: "app".into(),
             database: "appdb".into(),
+            listen_port: None,
             limits: PoolLimits { max_size, queue_timeout: Duration::from_secs(5), ..PoolLimits::default() },
             settings: Default::default(),
             routing: RoutingConfig {

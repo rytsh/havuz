@@ -1,7 +1,6 @@
 //! Accept loops.
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -40,6 +39,7 @@ pub fn spawn_admin(addr: SocketAddr, router: axum_router::Router, shutdown: Shut
 /// The global client cap is enforced at accept time so a connection storm
 /// cannot exhaust file descriptors before per-pool limits get a say.
 pub fn spawn_pooler(addr: SocketAddr, family: Arc<PgFamily>, max_clients: u32, shutdown: Shutdown) -> JoinHandle<()> {
+    family.configure_listeners(addr, max_clients);
     tokio::spawn(async move {
         let listener = match TcpListener::bind(addr).await {
             Ok(listener) => listener,
@@ -50,8 +50,6 @@ pub fn spawn_pooler(addr: SocketAddr, family: Arc<PgFamily>, max_clients: u32, s
             }
         };
         tracing::info!(%addr, max_clients, "pooler listening");
-
-        let live = Arc::new(AtomicU64::new(0));
 
         loop {
             let accepted = tokio::select! {
@@ -73,15 +71,13 @@ pub fn spawn_pooler(addr: SocketAddr, family: Arc<PgFamily>, max_clients: u32, s
                 }
             };
 
-            if live.load(Ordering::Relaxed) >= max_clients as u64 {
+            let Some(permit) = family.try_acquire_client() else {
                 tracing::warn!(%peer, max_clients, "refusing connection, global client limit reached");
                 drop(socket);
                 continue;
-            }
+            };
 
-            live.fetch_add(1, Ordering::Relaxed);
             let family = family.clone();
-            let live = live.clone();
 
             tokio::spawn(async move {
                 match family.serve(socket, peer).await {
@@ -96,16 +92,16 @@ pub fn spawn_pooler(addr: SocketAddr, family: Arc<PgFamily>, max_clients: u32, s
                     Ok(_) => {}
                     Err(e) => tracing::debug!(%peer, error = %e, kind = e.kind(), "session failed"),
                 }
-                live.fetch_sub(1, Ordering::Relaxed);
+                drop(permit);
             });
         }
 
         // Give in-flight sessions a moment to finish before the process exits.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        while live.load(Ordering::Relaxed) > 0 && tokio::time::Instant::now() < deadline {
+        while family.live_clients() > 0 && tokio::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        let remaining = live.load(Ordering::Relaxed);
+        let remaining = family.live_clients();
         if remaining > 0 {
             tracing::warn!(remaining, "closing with sessions still active");
         }

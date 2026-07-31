@@ -101,6 +101,19 @@ impl<A: Authenticator> ClientHandshake<A> {
     /// caller finishes startup once it has a backend, because the parameters a
     /// client sees must come from the backend it will actually talk to.
     pub async fn run(&self, socket: TcpStream, peer: SocketAddr) -> ProtoResult<(MaybeTls, HandshakeOutcome)> {
+        self.run_for_pool(socket, peer, None).await
+    }
+
+    /// Run a handshake on a listener dedicated to one pool.
+    ///
+    /// The dedicated route wins over the startup packet's database field, so a
+    /// client may omit the database and still reach the configured pool.
+    pub async fn run_for_pool(
+        &self,
+        socket: TcpStream,
+        peer: SocketAddr,
+        forced_pool: Option<&str>,
+    ) -> ProtoResult<(MaybeTls, HandshakeOutcome)> {
         socket.set_nodelay(true).ok();
         let mut stream = MaybeTls::Plain(socket);
 
@@ -135,7 +148,10 @@ impl<A: Authenticator> ClientHandshake<A> {
         }
 
         let user = packet.user().map_err(|e| ProtoError::protocol(e.to_string()))?.to_string();
-        let pool = packet.database().map_err(|e| ProtoError::protocol(e.to_string()))?.to_string();
+        let pool = match forced_pool {
+            Some(pool) => pool.to_string(),
+            None => packet.database().map_err(|e| ProtoError::protocol(e.to_string()))?.to_string(),
+        };
         let application_name = packet.application_name().map(str::to_string);
         let startup_params = match &packet {
             StartupPacket::Startup { params } => params.clone(),
@@ -441,6 +457,25 @@ mod tests {
         assert!(err.contains("28000"), "got: {err}");
         assert!(err.contains("authentication failed"));
         assert!(!err.contains("svc_orders"), "the message must not confirm the user exists");
+    }
+
+    #[tokio::test]
+    async fn dedicated_listener_pool_overrides_the_startup_database() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handshake = ClientHandshake::new(TestAuth::new());
+        let server = tokio::spawn(async move {
+            let (socket, peer) = listener.accept().await.unwrap();
+            handshake.run_for_pool(socket, peer, Some("app_main")).await
+        });
+
+        let client = tokio::spawn(async move { client_connect(addr, "svc_orders", "other", "hunter2").await });
+        let (_, outcome) = server.await.unwrap().expect("forced pool must authenticate");
+        client.await.unwrap().expect("client must reach AuthenticationOk");
+        let HandshakeOutcome::Established { identity, .. } = outcome else {
+            panic!("expected an established session");
+        };
+        assert_eq!(identity.pool, "app_main");
     }
 
     #[tokio::test]

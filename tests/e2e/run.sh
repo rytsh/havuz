@@ -12,6 +12,8 @@ set -euo pipefail
 PG_PORT="${PG_PORT:-15432}"
 POOL_PORT="${POOL_PORT:-16432}"
 ADMIN_PORT="${ADMIN_PORT:-17432}"
+DEDICATED_PORT="${DEDICATED_PORT:-16433}"
+DEDICATED_PORT_2="${DEDICATED_PORT_2:-16434}"
 WORK="${WORK:-$(mktemp -d)}"
 MAX_SIZE=3
 CLIENTS=20
@@ -23,6 +25,13 @@ HAVUZ="$ROOT/target/debug/havuz"
 psql_client() {
   docker run --rm --add-host host.docker.internal:host-gateway -e PGPASSWORD=clientpass postgres:16 \
     psql -qtAX -h host.docker.internal -p "$POOL_PORT" -U svc_orders -d app_main "$@"
+}
+
+psql_dedicated() {
+  local port="$1"
+  shift
+  docker run --rm --add-host host.docker.internal:host-gateway -e PGPASSWORD=clientpass postgres:16 \
+    psql -qtAX -h host.docker.internal -p "$port" -U svc_orders -d ignored "$@"
 }
 
 api() {
@@ -84,12 +93,25 @@ api /api/v1/pools -H 'content-type: application/json' -d "{
   \"name\": \"app_main\", \"family\": \"postgres\", \"mode\": \"session\",
   \"targets\": [{\"host\": \"127.0.0.1\", \"port\": $PG_PORT}],
   \"database\": \"appdb\", \"backend_user\": \"app\", \"backend_password\": \"hunter2\",
+  \"listen_port\": $DEDICATED_PORT,
   \"settings\": {\"host\": \"127.0.0.1\", \"port\": $PG_PORT, \"database\": \"appdb\",
                  \"username\": \"app\", \"sslmode\": \"disable\"},
   \"limits\": {\"max_size\": $MAX_SIZE, \"max_client_connections\": 100}}" > /dev/null
 
 api /api/v1/users -H 'content-type: application/json' \
   -d '{"name":"svc_orders","password":"clientpass","pools":["app_main"]}' > /dev/null
+
+echo "==> dedicated pool listener"
+dedicated_result="$(psql_dedicated "$DEDICATED_PORT" -c "select 77;")"
+[[ "$dedicated_result" == "77" ]] || { echo "FAIL: dedicated listener returned '$dedicated_result'"; exit 1; }
+api /api/v1/pools/app_main -X PATCH -H 'content-type: application/json' \
+  -d "{\"listen_port\":$DEDICATED_PORT_2}" > /dev/null
+if psql_dedicated "$DEDICATED_PORT" -c "select 1;" > /dev/null 2>&1; then
+  echo "FAIL: old dedicated port stayed open after reconfiguration"
+  exit 1
+fi
+dedicated_result="$(psql_dedicated "$DEDICATED_PORT_2" -c "select 78;")"
+[[ "$dedicated_result" == "78" ]] || { echo "FAIL: reconfigured listener returned '$dedicated_result'"; exit 1; }
 
 echo "==> test connection"
 api /api/v1/pools/app_main/probe -X POST | grep -q '"ok":true' \
@@ -142,10 +164,15 @@ timeouts="$(api /api/v1/summary | python3 -c 'import sys,json; print(json.load(s
 echo
 echo "==> switching app_main to transaction mode"
 api /api/v1/pools/app_main -X DELETE > /dev/null
+if psql_dedicated "$DEDICATED_PORT_2" -c "select 1;" > /dev/null 2>&1; then
+  echo "FAIL: dedicated port stayed open after pool deletion"
+  exit 1
+fi
 api /api/v1/pools -H 'content-type: application/json' -d "{
   \"name\": \"app_main\", \"family\": \"postgres\", \"mode\": \"transaction\",
   \"targets\": [{\"host\": \"127.0.0.1\", \"port\": $PG_PORT}],
   \"database\": \"appdb\", \"backend_user\": \"app\", \"backend_password\": \"hunter2\",
+  \"listen_port\": $DEDICATED_PORT_2,
   \"settings\": {\"host\": \"127.0.0.1\", \"port\": $PG_PORT, \"database\": \"appdb\",
                  \"username\": \"app\", \"sslmode\": \"disable\"},
   \"limits\": {\"max_size\": $MAX_SIZE, \"max_client_connections\": 100}}" > /dev/null

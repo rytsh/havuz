@@ -19,5 +19,9 @@
     "tailwindcss": "^4.3.3",
     "typescript": "^5.7.3",
     "vite": "^6.0.11"
+  },
+  "dependencies": {
+    "simple-icons": "^16.27.1",
+    "svelte-spa-router": "^5.1.1"
   }
 }

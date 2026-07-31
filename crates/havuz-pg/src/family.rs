@@ -1,8 +1,9 @@
 //! Wiring: state -> pools -> sessions.
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
-use std::sync::{Arc, RwLock};
+use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -14,11 +15,13 @@ use havuz_proto::{
 };
 use havuz_registry::FamilyDescriptor;
 use havuz_secrets::MasterKey;
-use tokio::net::TcpStream;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::task::JoinHandle;
 
 use crate::backend::{BackendConfig, PgConnector};
 use crate::cancel::{CancelKey, CancelRegistry, CancelTarget};
 use crate::group::{GroupSnapshot, PoolGroup};
+use crate::holder::HolderRegistry;
 use crate::protocol::{sqlstate, Message};
 use crate::scram::ScramVerifier;
 use crate::session::{complete_startup, AuthDenial, Authenticator, ClientHandshake, HandshakeOutcome};
@@ -34,7 +37,44 @@ pub struct PgFamily {
     cancels: Arc<CancelRegistry>,
     pins: Arc<PinRegistry>,
     traces: Arc<TraceStore>,
+    holders: Arc<HolderRegistry>,
+    listener_base: RwLock<Option<ListenerBase>>,
+    dedicated_listeners: Mutex<HashMap<String, DedicatedListener>>,
+    listener_routes: RwLock<HashMap<u16, String>>,
+    live_clients: Arc<AtomicU64>,
+    max_clients: AtomicU64,
     handshake: ClientHandshake<StateAuthenticator>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ListenerBase {
+    ip: IpAddr,
+    shared_port: u16,
+}
+
+struct DedicatedListener {
+    port: u16,
+    handle: JoinHandle<()>,
+}
+
+pub struct ClientPermit {
+    live: Arc<AtomicU64>,
+}
+
+impl Drop for PgFamily {
+    fn drop(&mut self) {
+        if let Ok(listeners) = self.dedicated_listeners.get_mut() {
+            for listener in listeners.values() {
+                listener.handle.abort();
+            }
+        }
+    }
+}
+
+impl Drop for ClientPermit {
+    fn drop(&mut self) {
+        self.live.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl PgFamily {
@@ -59,6 +99,12 @@ impl PgFamily {
             cancels: Arc::new(CancelRegistry::new()),
             pins: Arc::new(PinRegistry::new()),
             traces,
+            holders: HolderRegistry::new(),
+            listener_base: RwLock::new(None),
+            dedicated_listeners: Mutex::new(HashMap::new()),
+            listener_routes: RwLock::new(HashMap::new()),
+            live_clients: Arc::new(AtomicU64::new(0)),
+            max_clients: AtomicU64::new(u64::MAX),
             handshake: ClientHandshake::new(authenticator),
         })
     }
@@ -76,6 +122,54 @@ impl PgFamily {
         &self.traces
     }
 
+    pub fn holders(&self) -> &Arc<HolderRegistry> {
+        &self.holders
+    }
+
+    pub fn configure_listeners(&self, shared: SocketAddr, max_clients: u32) {
+        *self.listener_base.write().expect("listener base poisoned") =
+            Some(ListenerBase { ip: shared.ip(), shared_port: shared.port() });
+        self.max_clients.store(max_clients as u64, Ordering::Relaxed);
+    }
+
+    pub fn try_acquire_client(&self) -> Option<ClientPermit> {
+        let max = self.max_clients.load(Ordering::Relaxed);
+        self.live_clients
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |live| (live < max).then_some(live + 1))
+            .ok()
+            .map(|_| ClientPermit { live: self.live_clients.clone() })
+    }
+
+    pub fn live_clients(&self) -> u64 {
+        self.live_clients.load(Ordering::Relaxed)
+    }
+
+    pub fn validate_listen_port(&self, pool: &str, port: Option<u16>) -> Result<(), ProtoError> {
+        let Some(port) = port else { return Ok(()) };
+        if port == 0 {
+            return Err(ProtoError::backend("dedicated listen port must be between 1 and 65535"));
+        }
+        let Some(base) = *self.listener_base.read().expect("listener base poisoned") else {
+            return Ok(());
+        };
+        if port == base.shared_port {
+            return Err(ProtoError::backend(format!(
+                "dedicated listen port {port} conflicts with the shared listener"
+            )));
+        }
+        let listeners = self.dedicated_listeners.lock().expect("dedicated listener map poisoned");
+        if listeners.get(pool).is_some_and(|listener| listener.port == port) {
+            return Ok(());
+        }
+        if let Some((owner, _)) = listeners.iter().find(|(_, listener)| listener.port == port) {
+            return Err(ProtoError::backend(format!("dedicated listen port {port} is already used by pool '{owner}'")));
+        }
+        drop(listeners);
+        std::net::TcpListener::bind(SocketAddr::new(base.ip, port))
+            .map(drop)
+            .map_err(|error| ProtoError::backend(format!("cannot bind dedicated listen port {port}: {error}")))
+    }
+
     /// Configured pooling mode for a pool, defaulting to the safest option if
     /// the pool vanished between routing and lookup.
     fn pool_mode(&self, name: &str) -> PoolMode {
@@ -86,7 +180,7 @@ impl PgFamily {
     ///
     /// Pools that disappeared are drained rather than dropped, so in-flight
     /// clients finish their work instead of getting a reset connection.
-    pub fn sync_pools(&self) -> Result<(), ProtoError> {
+    pub fn sync_pools(self: &Arc<Self>) -> Result<(), ProtoError> {
         let state = self.state.load();
         let mut pools = self.pools.write().expect("pool map poisoned");
 
@@ -118,7 +212,8 @@ impl PgFamily {
             live
         });
 
-        Ok(())
+        drop(pools);
+        self.sync_dedicated_listeners(&state)
     }
 
     /// Rebuild one pool after its runtime settings change.
@@ -127,9 +222,92 @@ impl PgFamily {
     /// subsequent lookups use the freshly configured group. The old group must
     /// stay active because an idle transaction-mode client may need to borrow
     /// another backend before it disconnects.
-    pub fn reload_pool(&self, name: &str) -> Result<(), ProtoError> {
+    pub fn reload_pool(self: &Arc<Self>, name: &str) -> Result<(), ProtoError> {
         self.pools.write().expect("pool map poisoned").remove(name);
         self.sync_pools()
+    }
+
+    pub fn stop_dedicated_listeners(&self) {
+        let mut listeners = self.dedicated_listeners.lock().expect("dedicated listener map poisoned");
+        for (_, listener) in listeners.drain() {
+            listener.handle.abort();
+        }
+        self.listener_routes.write().expect("listener routes poisoned").clear();
+    }
+
+    fn sync_dedicated_listeners(self: &Arc<Self>, state: &State) -> Result<(), ProtoError> {
+        let Some(base) = *self.listener_base.read().expect("listener base poisoned") else {
+            return Ok(());
+        };
+        let desired: HashMap<String, u16> = state
+            .pools
+            .iter()
+            .filter(|(_, config)| config.family == "postgres" && !config.disabled)
+            .filter_map(|(name, config)| config.listen_port.map(|port| (name.clone(), port)))
+            .collect();
+
+        let mut listeners = self.dedicated_listeners.lock().expect("dedicated listener map poisoned");
+        let retired: Vec<_> = listeners
+            .iter()
+            .filter(|(name, listener)| desired.get(*name) != Some(&listener.port))
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in retired {
+            if let Some(listener) = listeners.remove(&name) {
+                listener.handle.abort();
+                self.listener_routes.write().expect("listener routes poisoned").remove(&listener.port);
+                tracing::info!(pool = %name, port = listener.port, "dedicated pool listener stopped");
+            }
+        }
+
+        for (name, port) in desired {
+            if listeners.contains_key(&name) {
+                continue;
+            }
+            if port == base.shared_port {
+                return Err(ProtoError::backend(format!(
+                    "pool '{name}' dedicated listen port {port} conflicts with the shared listener"
+                )));
+            }
+            let addr = SocketAddr::new(base.ip, port);
+            let std_listener = std::net::TcpListener::bind(addr)
+                .map_err(|error| ProtoError::backend(format!("pool '{name}' cannot listen on {addr}: {error}")))?;
+            std_listener
+                .set_nonblocking(true)
+                .map_err(|error| ProtoError::backend(format!("pool '{name}' cannot configure {addr}: {error}")))?;
+            let listener = TcpListener::from_std(std_listener)
+                .map_err(|error| ProtoError::backend(format!("pool '{name}' cannot use {addr}: {error}")))?;
+            self.listener_routes.write().expect("listener routes poisoned").insert(port, name.clone());
+            let weak = Arc::downgrade(self);
+            let listener_pool = name.clone();
+            let handle = tokio::spawn(async move {
+                loop {
+                    let (socket, peer) = match listener.accept().await {
+                        Ok(accepted) => accepted,
+                        Err(error) => {
+                            tracing::warn!(pool = %listener_pool, %addr, %error, "dedicated listener accept failed");
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            continue;
+                        }
+                    };
+                    let Some(family) = weak.upgrade() else { return };
+                    let Some(permit) = family.try_acquire_client() else {
+                        tracing::warn!(pool = %listener_pool, %peer, "refusing dedicated connection, global client limit reached");
+                        drop(socket);
+                        continue;
+                    };
+                    tokio::spawn(async move {
+                        if let Err(error) = family.serve(socket, peer).await {
+                            tracing::debug!(%peer, error = %error, kind = error.kind(), "dedicated session failed");
+                        }
+                        drop(permit);
+                    });
+                }
+            });
+            listeners.insert(name.clone(), DedicatedListener { port, handle });
+            tracing::info!(pool = %name, %addr, "dedicated pool listener ready");
+        }
+        Ok(())
     }
 
     fn connector_for(
@@ -202,7 +380,9 @@ impl ProtocolFamily for PgFamily {
     }
 
     async fn serve(&self, io: TcpStream, peer: SocketAddr) -> ProtoResult<ServeOutcome> {
-        let (mut client, outcome) = self.handshake.run(io, peer).await?;
+        let local_port = io.local_addr().map_err(ProtoError::Io)?.port();
+        let forced_pool = self.listener_routes.read().expect("listener routes poisoned").get(&local_port).cloned();
+        let (mut client, outcome) = self.handshake.run_for_pool(io, peer, forced_pool.as_deref()).await?;
 
         let (identity, _params) = match outcome {
             HandshakeOutcome::Cancel { process_id, secret_key } => {
@@ -232,6 +412,14 @@ impl ProtocolFamily for PgFamily {
         };
 
         let mode = self.pool_mode(&identity.pool);
+        let trace_context = TraceContext {
+            pool: identity.pool.clone(),
+            user: identity.user.clone(),
+            application: identity.application_name.clone(),
+            client_addr: identity.peer.to_string(),
+        };
+        let holder = self.holders.session(trace_context.clone(), mode);
+        holder.waiting_for_startup();
 
         // The startup checkout always comes from the primary: the client needs
         // a real backend's parameters, and the primary is the one target every
@@ -240,7 +428,9 @@ impl ProtocolFamily for PgFamily {
             Ok(checkout) => checkout,
             Err(e) => {
                 let (code, text) = match &e {
-                    havuz_pool::PoolError::Timeout { .. } => (sqlstate::TOO_MANY_CONNECTIONS, e.to_string()),
+                    havuz_pool::PoolError::Timeout { .. } => {
+                        (sqlstate::TOO_MANY_CONNECTIONS, format!("{e}; {}", self.holders.timeout_hint(&identity.pool)))
+                    }
                     havuz_pool::PoolError::Unavailable { .. } => (sqlstate::CANNOT_CONNECT_NOW, e.to_string()),
                     havuz_pool::PoolError::Connect { .. } => (sqlstate::CANNOT_CONNECT_NOW, e.to_string()),
                 };
@@ -258,24 +448,24 @@ impl ProtocolFamily for PgFamily {
 
         complete_startup(&mut client, checkout.parameters(), cancel_key.process_id, cancel_key.secret_key).await?;
 
-        let trace_context = TraceContext {
-            pool: identity.pool.clone(),
-            user: identity.user.clone(),
-            application: identity.application_name.clone(),
-            client_addr: identity.peer.to_string(),
-        };
-
         let outcome = if mode.multiplexes() {
             // Transaction mode: the startup checkout has done its job (the
             // client needed a real backend's parameters), so give it straight
             // back. From here the client holds nothing while it is idle, which
             // is the entire source of the fan-in.
             drop(checkout);
+            holder.clear();
 
             let mut state = SessionState::new(mode);
-            let result =
-                crate::txn::transaction_relay_traced(&mut client, &group, &mut state, &self.traces, &trace_context)
-                    .await;
+            let result = crate::txn::transaction_relay_traced(
+                &mut client,
+                &group,
+                &mut state,
+                &self.traces,
+                &trace_context,
+                &holder,
+            )
+            .await;
             self.cancels.unregister(cancel_key);
 
             match result {
@@ -298,6 +488,7 @@ impl ProtocolFamily for PgFamily {
             let backend_pid = checkout.backend_pid();
             let target =
                 group.target_label(crate::routing::Route::Primary(crate::routing::PrimaryReason::SplitDisabled));
+            holder.session_reserved(target.clone(), backend_pid);
             let relay = crate::relay::session_relay_traced(
                 &mut client,
                 checkout.stream_mut(),
@@ -445,6 +636,7 @@ mod tests {
             targets: vec![Target::new("127.0.0.1", 1)],
             backend_user: "app".into(),
             database: "appdb".into(),
+            listen_port: None,
             limits: PoolLimits::default(),
             settings: Default::default(),
             routing: Default::default(),
@@ -530,6 +722,42 @@ mod tests {
             havuz_pool::PoolStatus::Active,
             "established clients must be able to finish against the old group"
         );
+    }
+
+    #[tokio::test]
+    async fn dedicated_listener_follows_pool_configuration() {
+        let reserved = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dedicated_port = reserved.local_addr().unwrap().port();
+        drop(reserved);
+        let shared = TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap();
+
+        let key = MasterKey::generate();
+        let mut state = state_with_user("hunter2", &key);
+        state.pools.get_mut("app_main").unwrap().listen_port = Some(dedicated_port);
+        let store = Arc::new(StateStore::ephemeral(state));
+        let family = PgFamily::new(store.clone(), Arc::new(key));
+        family.configure_listeners(shared, 100);
+        family.sync_pools().unwrap();
+
+        let socket = TcpStream::connect(("127.0.0.1", dedicated_port)).await.expect("dedicated port must open");
+        drop(socket);
+
+        store.update(|state| state.pools.get_mut("app_main").unwrap().listen_port = None).await.unwrap();
+        family.sync_pools().unwrap();
+        assert!(TcpStream::connect(("127.0.0.1", dedicated_port)).await.is_err(), "removed port must close");
+    }
+
+    #[tokio::test]
+    async fn occupied_or_shared_dedicated_ports_are_rejected_before_state_changes() {
+        let occupied = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let occupied_port = occupied.local_addr().unwrap().port();
+        let shared = TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap();
+        let key = MasterKey::generate();
+        let family = PgFamily::new(Arc::new(StateStore::ephemeral(state_with_user("hunter2", &key))), Arc::new(key));
+        family.configure_listeners(shared, 100);
+
+        assert!(family.validate_listen_port("app_main", Some(occupied_port)).is_err());
+        assert!(family.validate_listen_port("app_main", Some(shared.port())).is_err());
     }
 
     #[tokio::test]

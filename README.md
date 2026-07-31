@@ -63,6 +63,12 @@ Open <http://127.0.0.1:7432>, add a database, create a user, then connect:
 psql "postgresql://svc_orders:yourpassword@127.0.0.1:5432/app_main"
 ```
 
+The shared listener (`5432` by default) routes by database name. A pool can
+optionally have a dedicated client port, configured when it is created or from
+**Databases -> Configure**. A dedicated port routes directly to that pool even
+if the client omits the database name, and is opened only while the pool exists
+and is enabled. Port changes take effect without restarting havuz.
+
 The dashboard is served from the binary when built with
 `--features havuz-admin/embed-ui`, or from disk via `HAVUZ_UI_DIR=ui/dist`.
 

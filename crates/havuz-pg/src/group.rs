@@ -261,6 +261,7 @@ mod tests {
             targets,
             backend_user: "app".into(),
             database: "appdb".into(),
+            listen_port: None,
             limits: PoolLimits { max_size: 3, ..PoolLimits::default() },
             settings: Default::default(),
             routing: RoutingConfig { read_write_split: split, ..RoutingConfig::default() },

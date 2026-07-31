@@ -2,6 +2,7 @@
   import { api, formatFanIn } from "../lib/api";
   import type { Pool, Warning } from "../lib/types";
   import Warnings from "../components/Warnings.svelte";
+  import PoolModeGuide from "../components/PoolModeGuide.svelte";
 
   let pools = $state<Pool[]>([]);
   let warnings = $state<Warning[]>([]);
@@ -12,6 +13,7 @@
   let editMode = $state<Pool["mode"]>("transaction");
   let editMaxSize = $state(10);
   let editMaxClients = $state(100);
+  let editListenPort = $state<number | undefined>(undefined);
 
   async function refresh() {
     try {
@@ -65,6 +67,7 @@
     editMode = pool.mode;
     editMaxSize = pool.limits.max_size;
     editMaxClients = pool.limits.max_client_connections;
+    editListenPort = pool.listen_port ?? undefined;
   }
 
   async function saveConfiguration(event: Event) {
@@ -76,6 +79,7 @@
         mode: editMode,
         max_size: editMaxSize,
         max_client_connections: editMaxClients,
+        listen_port: editListenPort || null,
       }),
     );
     if (!error) editing = null;
@@ -102,6 +106,7 @@
     <thead>
       <tr>
         <th>Name</th>
+        <th>Client endpoint</th>
         <th>Type</th>
         <th>Target</th>
         <th>Mode</th>
@@ -118,6 +123,13 @@
           <td>
             <strong>{pool.name}</strong>
             <div class="muted text-[11px]">{pool.database} as {pool.backend_user}</div>
+          </td>
+          <td>
+            {#if pool.listen_port}
+              <span class="badge ok">dedicated :{pool.listen_port}</span>
+            {:else}
+              <span class="muted">shared listener</span>
+            {/if}
           </td>
           <td>
             {pool.family}
@@ -199,7 +211,12 @@
           <label for="edit-max-clients">Client connections</label>
           <input id="edit-max-clients" type="number" min="1" bind:value={editMaxClients} />
         </div>
+        <div class="field mb-0">
+          <label for="edit-listen-port">Dedicated port <span class="muted font-normal">(optional)</span></label>
+          <input id="edit-listen-port" type="number" min="1" max="65535" bind:value={editListenPort} placeholder="shared" />
+        </div>
       </div>
+      <PoolModeGuide mode={editMode} />
       {#if editMode === "session" && editMaxClients > editMaxSize}
         <div class="warning mb-0">
           Session mode reserves one backend per connected client. The excess clients will wait and receive SQLSTATE

@@ -1,12 +1,16 @@
 <script lang="ts">
+  import { push } from "svelte-spa-router";
   import { api, formatMicros } from "../lib/api";
-  import type { ActiveTrace, TraceDetail, TraceResponse, TraceSummary } from "../lib/types";
+  import type { ActiveTrace, BackendHolder, TraceDetail, TraceResponse, TraceSummary } from "../lib/types";
+
+  let { params: routeParams = {} }: { params?: Record<string, string> } = $props();
 
   let data = $state<TraceResponse | null>(null);
   let detail = $state<TraceDetail | null>(null);
   let error = $state<string | null>(null);
   let loadingDetail = $state(false);
   let clearing = $state(false);
+  let copied = $state<string | null>(null);
 
   let search = $state("");
   let pool = $state("");
@@ -28,8 +32,21 @@
         (!search || `${trace.sql} ${trace.application ?? ""}`.toLowerCase().includes(search.toLowerCase())),
     ),
   );
+  const visibleHolders = $derived(
+    (data?.holders ?? []).filter(
+      (holder) =>
+        (!pool || holder.pool === pool) &&
+        (!user || holder.user === user) &&
+        (!search || `${holder.reason} ${holder.application ?? ""}`.toLowerCase().includes(search.toLowerCase())),
+    ),
+  );
+  const failedCount = $derived((data?.traces ?? []).filter((trace) => trace.status === "failed").length);
+  const averageDuration = $derived(
+    data?.traces.length ? Math.round(data.traces.reduce((sum, trace) => sum + trace.duration_us, 0) / data.traces.length) : 0,
+  );
+  const totalRows = $derived((data?.traces ?? []).reduce((sum, trace) => sum + trace.row_count, 0));
 
-  function params(): URLSearchParams {
+  function queryParams(): URLSearchParams {
     const value = new URLSearchParams({ limit: "200" });
     if (search) value.set("q", search);
     if (pool) value.set("pool", pool);
@@ -41,7 +58,7 @@
 
   async function refresh() {
     try {
-      data = await api.traces(params());
+      data = await api.traces(queryParams());
       error = null;
     } catch (cause) {
       error = cause instanceof Error ? cause.message : String(cause);
@@ -49,15 +66,77 @@
   }
 
   async function openTrace(trace: TraceSummary) {
+    await push(`/trace/${trace.id}`);
+  }
+
+  async function loadTrace(id: number) {
     loadingDetail = true;
     try {
-      detail = await api.trace(trace.id);
+      detail = await api.trace(id);
       error = null;
     } catch (cause) {
       error = cause instanceof Error ? cause.message : String(cause);
     } finally {
       loadingDetail = false;
     }
+  }
+
+  async function closeDetail() {
+    detail = null;
+    await push("/trace");
+  }
+
+  async function copyText(value: string, key: string) {
+    try {
+      await navigator.clipboard.writeText(value);
+      copied = key;
+      setTimeout(() => {
+        if (copied === key) copied = null;
+      }, 1400);
+    } catch (cause) {
+      error = cause instanceof Error ? cause.message : "Clipboard access failed";
+    }
+  }
+
+  function csvCell(value: unknown): string {
+    if (value === null || value === undefined) return "";
+    let text = String(value);
+    if (/^[=+\-@]/.test(text)) text = `'${text}`;
+    return `"${text.replaceAll('"', '""')}"`;
+  }
+
+  function download(name: string, content: string, type: string) {
+    const url = URL.createObjectURL(new Blob([content], { type }));
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = name;
+    anchor.click();
+    URL.revokeObjectURL(url);
+  }
+
+  function exportHistory() {
+    const header = ["time", "status", "pool", "user", "application", "client", "target", "wait_us", "execution_us", "total_us", "rows", "sql"];
+    const rows = (data?.traces ?? []).map((trace) => [
+      new Date(trace.started_at_ms).toISOString(), trace.status, trace.pool, trace.user, trace.application,
+      trace.client_addr, trace.target, trace.wait_us, trace.execution_us, trace.duration_us, trace.row_count, trace.sql,
+    ]);
+    download("havuz-query-history.csv", [header, ...rows].map((row) => row.map(csvCell).join(",")).join("\n"), "text/csv;charset=utf-8");
+  }
+
+  function exportResultCsv() {
+    if (!detail) return;
+    const sections = detail.result.sets.map((result, index) => {
+      const title = [csvCell(`Result set ${index + 1}`), csvCell(result.command_tag)].join(",");
+      const header = result.columns.map(csvCell).join(",");
+      const rows = result.rows.map((row) => row.map(csvCell).join(","));
+      return [title, header, ...rows].join("\n");
+    });
+    download(`havuz-trace-${detail.id}.csv`, sections.join("\n\n"), "text/csv;charset=utf-8");
+  }
+
+  function exportResultJson() {
+    if (!detail) return;
+    download(`havuz-trace-${detail.id}.json`, JSON.stringify(detail, null, 2), "application/json");
   }
 
   async function clearHistory() {
@@ -96,10 +175,41 @@
     return formatMicros(trace.elapsed_us);
   }
 
+  function holderAdvice(holder: BackendHolder): { title: string; detail: string } {
+    switch (holder.reason) {
+      case "startup_wait":
+        return {
+          title: "Waiting to start",
+          detail: "Authentication succeeded, but every backend slot is occupied. This connection can hit queue_timeout.",
+        };
+      case "session_mode":
+        return {
+          title: "Reserved by session mode",
+          detail: "This client owns one backend until it disconnects, even when it is not running a query.",
+        };
+      case "idle_in_transaction":
+        return {
+          title: "Idle in transaction",
+          detail: "The last query finished, but COMMIT or ROLLBACK has not arrived, so the backend cannot be released.",
+        };
+      case "pinned":
+        return {
+          title: `Pinned: ${holder.pin_reason ?? "unknown"}`,
+          detail: "Session-scoped state prevents this backend from being shared until the client disconnects.",
+        };
+    }
+  }
+
   $effect(() => {
     refresh();
     const timer = setInterval(refresh, 1000);
     return () => clearInterval(timer);
+  });
+
+  $effect(() => {
+    const id = Number(routeParams.id);
+    if (Number.isInteger(id) && id > 0 && detail?.id !== id) loadTrace(id);
+    if (!routeParams.id) detail = null;
   });
 </script>
 
@@ -111,6 +221,7 @@
   </div>
   <div class="row">
     <span class="badge">{data?.retention_days ?? 7} day retention</span>
+    <button class="action" disabled={!data?.traces.length} onclick={exportHistory}>Export history CSV</button>
     <button class="action danger" disabled={clearing} onclick={clearHistory}>Clear history</button>
   </div>
 </div>
@@ -155,6 +266,20 @@
   </div>
 </form>
 
+{#if data?.pool_snapshots.length}
+  <div class="pressure-grid">
+    {#each data.pool_snapshots as snapshot (snapshot.name)}
+      <article class:hot={snapshot.waiting > 0 || snapshot.active >= snapshot.max_size}>
+        <div class="pressure-head"><strong>{snapshot.name}</strong><span>{snapshot.active}/{snapshot.max_size} active</span></div>
+        <div class="pressure-bar"><i style={`width:${Math.min(100, (snapshot.active / Math.max(1, snapshot.max_size)) * 100)}%`}></i></div>
+        <div class="pressure-meta">
+          <span>{snapshot.waiting} waiting</span><span>{snapshot.idle} idle</span><span>{snapshot.timeout_total} timeouts</span>
+        </div>
+      </article>
+    {/each}
+  </div>
+{/if}
+
 <div class="trace-section-heading">
   <div>
     <div class="eyebrow">Live</div>
@@ -188,10 +313,46 @@
 
 <div class="trace-section-heading">
   <div>
+    <div class="eyebrow">Pool blockers</div>
+    <h2>Backend holders</h2>
+  </div>
+  <span class="live-count" class:has-blockers={visibleHolders.length > 0}>{visibleHolders.length}</span>
+</div>
+
+{#if visibleHolders.length === 0}
+  <div class="trace-empty">No idle client is holding or waiting for a backend slot.</div>
+{:else}
+  <div class="holder-grid">
+    {#each visibleHolders as holder (holder.id)}
+      {@const advice = holderAdvice(holder)}
+      <article class="holder-card" class:waiting={holder.reason === "startup_wait"}>
+        <div class="holder-top">
+          <div><span class="badge warn">{advice.title}</span><strong>{holder.user}</strong></div>
+          <span class="trace-clock">{formatMicros(holder.elapsed_us)}</span>
+        </div>
+        <p>{advice.detail}</p>
+        <div class="trace-meta">
+          <span>{holder.application ?? "unknown app"}</span><span>{holder.pool}</span><span>{holder.client_addr}</span>
+          {#if holder.target}<span>{holder.target}</span>{/if}{#if holder.backend_pid}<span>PID {holder.backend_pid}</span>{/if}
+        </div>
+      </article>
+    {/each}
+  </div>
+{/if}
+
+<div class="trace-section-heading">
+  <div>
     <div class="eyebrow">SQLite history</div>
     <h2>Completed queries</h2>
   </div>
   <span class="muted text-xs">Latest {data?.traces.length ?? 0} records</span>
+</div>
+
+<div class="history-summary">
+  <div><span>Displayed</span><strong>{data?.traces.length ?? 0}</strong></div>
+  <div><span>Failed</span><strong class:danger-text={failedCount > 0}>{failedCount}</strong></div>
+  <div><span>Average time</span><strong>{formatMicros(averageDuration)}</strong></div>
+  <div><span>Rows affected</span><strong>{totalRows}</strong></div>
 </div>
 
 {#if data && data.traces.length > 0}
@@ -203,7 +364,16 @@
       {#each data.traces as trace (trace.id)}
         <tr class="cursor-pointer" onclick={() => openTrace(trace)}>
           <td class="whitespace-nowrap muted">{timestamp(trace.started_at_ms)}</td>
-          <td><code class="trace-sql">{trace.sql}</code></td>
+          <td>
+            <div class="trace-query-cell">
+              <code class="trace-sql">{trace.sql}</code>
+              <button
+                class="copy-button"
+                title="Copy query"
+                onclick={(event) => { event.stopPropagation(); copyText(trace.sql, `row-${trace.id}`); }}
+              >{copied === `row-${trace.id}` ? "Copied" : "Copy"}</button>
+            </div>
+          </td>
           <td><strong>{trace.user}</strong><div class="muted text-[11px]">{trace.application ?? trace.client_addr}</div></td>
           <td>{trace.pool}<div class="muted text-[11px]">{trace.target ?? "—"}</div></td>
           <td>{formatMicros(trace.wait_us)}</td>
@@ -222,7 +392,7 @@
 {/if}
 
 {#if detail}
-  <div class="trace-detail-backdrop" role="presentation" onclick={() => (detail = null)}>
+  <div class="trace-detail-backdrop" role="presentation" onclick={closeDetail}>
     <div
       class="trace-detail"
       role="dialog"
@@ -230,14 +400,19 @@
       aria-label="Query trace detail"
       tabindex="-1"
       onclick={(event) => event.stopPropagation()}
-      onkeydown={(event) => event.key === "Escape" && (detail = null)}
+      onkeydown={(event) => event.key === "Escape" && closeDetail()}
     >
       <div class="trace-detail-head">
         <div>
           <div class="eyebrow">Trace #{detail.id}</div>
           <h2>Query result</h2>
         </div>
-        <button class="action" onclick={() => (detail = null)}>Close</button>
+        <div class="row">
+          <button class="action" onclick={() => detail && copyText(detail.sql, "detail-query")}>{copied === "detail-query" ? "Copied" : "Copy query"}</button>
+          <button class="action" disabled={detail.result.sets.length === 0} onclick={exportResultCsv}>Export CSV</button>
+          <button class="action" onclick={exportResultJson}>Export JSON</button>
+          <button class="action" onclick={closeDetail}>Close</button>
+        </div>
       </div>
       <pre class="trace-detail-sql">{detail.sql}</pre>
       <div class="trace-detail-metrics">

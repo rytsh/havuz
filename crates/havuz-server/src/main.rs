@@ -102,6 +102,7 @@ async fn serve(bootstrap: Bootstrap) -> Result<()> {
 
     let family = PgFamily::persistent(store.clone(), master_key.clone(), bootstrap.state.dir.join("traces.sqlite3"))
         .context("opening query trace store")?;
+    family.configure_listeners(bootstrap.server.listen, bootstrap.server.max_client_connections);
     family.sync_pools().map_err(|e| anyhow::anyhow!("building pools: {e}"))?;
 
     let current = store.load();
@@ -123,12 +124,13 @@ async fn serve(bootstrap: Bootstrap) -> Result<()> {
     let admin = listener::spawn_admin(bootstrap.admin.listen, havuz_admin::router(admin_state), shutdown.clone());
     let pooler = listener::spawn_pooler(
         bootstrap.server.listen,
-        family,
+        family.clone(),
         bootstrap.server.max_client_connections,
         shutdown.clone(),
     );
 
     shutdown.wait_for_signal().await;
+    family.stop_dedicated_listeners();
     tracing::info!("shutting down, waiting for in-flight sessions");
 
     let _ = tokio::join!(admin, pooler);
