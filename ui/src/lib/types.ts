@@ -68,7 +68,9 @@ export interface Pool {
 export type Warning =
   | { kind: "session_mode_queues"; pool: string; max_client_connections: number; max_size: number }
   | { kind: "backends_exceed_clients"; pool: string; max_client_connections: number; max_size: number }
-  | { kind: "pool_without_users"; pool: string };
+  | { kind: "pool_without_users"; pool: string }
+  | { kind: "split_without_replicas"; pool: string }
+  | { kind: "no_sticky_window"; pool: string };
 
 export interface Summary {
   uptime_seconds: number;
@@ -215,4 +217,56 @@ export interface RoutingConfig {
   health_interval: string;
   failure_threshold: number;
   recovery_cooldown: string;
+}
+
+export interface ActiveTrace {
+  id: number;
+  started_at_ms: number;
+  elapsed_us: number;
+  pool: string;
+  user: string;
+  application: string | null;
+  client_addr: string;
+  sql: string;
+  phase: "waiting" | "running";
+  target: string | null;
+  backend_pid: number | null;
+}
+
+export interface TraceSummary {
+  id: number;
+  started_at_ms: number;
+  duration_us: number;
+  wait_us: number;
+  execution_us: number;
+  pool: string;
+  user: string;
+  application: string | null;
+  client_addr: string;
+  sql: string;
+  status: "succeeded" | "failed" | "cancelled";
+  target: string | null;
+  backend_pid: number | null;
+  command_tag: string | null;
+  row_count: number;
+  result_truncated: boolean;
+  error_code: string | null;
+  error_message: string | null;
+}
+
+export interface TraceResultSet {
+  columns: string[];
+  rows: (string | null)[][];
+  command_tag: string | null;
+}
+
+export interface TraceDetail extends TraceSummary {
+  result: { sets: TraceResultSet[] };
+}
+
+export interface TraceResponse {
+  active: ActiveTrace[];
+  traces: TraceSummary[];
+  retention_days: number;
+  result_limits: { rows: number; bytes: number };
 }

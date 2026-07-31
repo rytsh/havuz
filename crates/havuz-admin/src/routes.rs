@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
@@ -23,7 +23,7 @@ pub fn router(state: AdminState) -> Router {
     let api = Router::new()
         .route("/families", get(list_families))
         .route("/pools", get(list_pools).post(create_pool))
-        .route("/pools/{name}", get(get_pool).delete(delete_pool))
+        .route("/pools/{name}", get(get_pool).patch(update_pool).delete(delete_pool))
         .route("/pools/{name}/pause", post(pause_pool))
         .route("/pools/{name}/resume", post(resume_pool))
         .route("/pools/{name}/drain", post(drain_pool))
@@ -33,7 +33,9 @@ pub fn router(state: AdminState) -> Router {
         .route("/users/{name}", delete(delete_user))
         .route("/config", get(get_config))
         .route("/summary", get(get_summary))
-        .route("/pins", get(get_pins).delete(reset_pins));
+        .route("/pins", get(get_pins).delete(reset_pins))
+        .route("/traces", get(get_traces).delete(clear_traces))
+        .route("/traces/{id}", get(get_trace));
 
     Router::new()
         .nest("/api/v1", api)
@@ -220,6 +222,52 @@ async fn create_pool(
     let current = state.store.load();
     let config = current.pools.get(&body.name).expect("just inserted");
     Ok((axum::http::StatusCode::CREATED, Json(pool_view(&body.name, config, &current, None))))
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdatePool {
+    #[serde(default)]
+    mode: Option<PoolMode>,
+    #[serde(default)]
+    max_size: Option<u32>,
+    #[serde(default)]
+    max_client_connections: Option<u32>,
+}
+
+async fn update_pool(
+    State(state): State<AdminState>,
+    Path(name): Path<String>,
+    Json(body): Json<UpdatePool>,
+) -> Result<impl IntoResponse, ApiError> {
+    let update_name = name.clone();
+    let found = state
+        .store
+        .update(move |s| match s.pools.get_mut(&update_name) {
+            Some(pool) => {
+                if let Some(mode) = body.mode {
+                    pool.mode = mode;
+                }
+                if let Some(max_size) = body.max_size {
+                    pool.limits.max_size = max_size;
+                }
+                if let Some(max_clients) = body.max_client_connections {
+                    pool.limits.max_client_connections = max_clients;
+                }
+                true
+            }
+            None => false,
+        })
+        .await?;
+
+    if !found {
+        return Err(ApiError::NotFound(format!("pool '{name}'")));
+    }
+
+    state.family.reload_pool(&name).map_err(|e| ApiError::Internal(e.to_string()))?;
+    let current = state.store.load();
+    let config = current.pools.get(&name).expect("updated pool exists");
+    let runtime = state.family.snapshots().into_iter().find(|s| s.name == name);
+    Ok(Json(pool_view(&name, config, &current, runtime)))
 }
 
 async fn delete_pool(State(state): State<AdminState>, Path(name): Path<String>) -> Result<impl IntoResponse, ApiError> {
@@ -475,6 +523,37 @@ async fn reset_pins(State(state): State<AdminState>) -> impl IntoResponse {
     Json(json!({ "reset": true }))
 }
 
+async fn get_traces(
+    State(state): State<AdminState>,
+    Query(filter): Query<havuz_pg::TraceFilter>,
+) -> Result<impl IntoResponse, ApiError> {
+    let traces = state.family.traces().list(&filter).map_err(|error| ApiError::Internal(error.to_string()))?;
+    Ok(Json(json!({
+        "active": state.family.traces().active(),
+        "traces": traces,
+        "retention_days": havuz_pg::trace::RETENTION_DAYS,
+        "result_limits": {
+            "rows": havuz_pg::trace::MAX_RESULT_ROWS,
+            "bytes": havuz_pg::trace::MAX_RESULT_BYTES,
+        }
+    })))
+}
+
+async fn get_trace(State(state): State<AdminState>, Path(id): Path<u64>) -> Result<impl IntoResponse, ApiError> {
+    state
+        .family
+        .traces()
+        .get(id)
+        .map_err(|error| ApiError::Internal(error.to_string()))?
+        .map(Json)
+        .ok_or_else(|| ApiError::NotFound(format!("query trace '{id}'")))
+}
+
+async fn clear_traces(State(state): State<AdminState>) -> Result<impl IntoResponse, ApiError> {
+    let deleted = state.family.traces().clear().map_err(|error| ApiError::Internal(error.to_string()))?;
+    Ok(Json(json!({ "deleted": deleted })))
+}
+
 async fn prometheus(State(state): State<AdminState>) -> impl IntoResponse {
     let body = metrics::render(
         &state.family.snapshots(),
@@ -539,6 +618,22 @@ mod tests {
         (response.status(), body_json(response).await)
     }
 
+    async fn patch(app: &Router, uri: &str, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        (response.status(), body_json(response).await)
+    }
+
     fn pool_payload() -> serde_json::Value {
         json!({
             "name": "app_main",
@@ -547,9 +642,51 @@ mod tests {
             "database": "appdb",
             "backend_user": "app",
             "backend_password": "hunter2",
+            "mode": "session",
             "settings": { "host": "pg-primary.internal", "database": "appdb", "username": "app" },
             "limits": { "max_size": 3, "max_client_connections": 100 }
         })
+    }
+
+    #[tokio::test]
+    async fn postgres_defaults_to_transaction_mode() {
+        let (app, _) = app();
+        let mut payload = pool_payload();
+        payload.as_object_mut().unwrap().remove("mode");
+
+        let (status, body) = post(&app, "/api/v1/pools", payload).await;
+        assert_eq!(status, StatusCode::CREATED, "body: {body}");
+        assert_eq!(body["mode"], "transaction");
+        assert!(body["configured_fan_in"].is_number());
+    }
+
+    #[tokio::test]
+    async fn a_pool_can_be_reconfigured_without_deleting_it() {
+        let (app, state) = app();
+        post(&app, "/api/v1/pools", pool_payload()).await;
+
+        let (status, body) = patch(
+            &app,
+            "/api/v1/pools/app_main",
+            json!({ "mode": "transaction", "max_size": 12, "max_client_connections": 240 }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(body["mode"], "transaction");
+        assert_eq!(body["limits"]["max_size"], 12);
+        assert_eq!(body["limits"]["max_client_connections"], 240);
+        assert!(state.family.snapshots().iter().any(|pool| pool.name == "app_main" && pool.max_size == 12));
+    }
+
+    #[tokio::test]
+    async fn invalid_pool_reconfiguration_is_rejected_without_changing_state() {
+        let (app, state) = app();
+        post(&app, "/api/v1/pools", pool_payload()).await;
+
+        let (status, _) = patch(&app, "/api/v1/pools/app_main", json!({ "max_size": 0 })).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(state.store.load().pools["app_main"].limits.max_size, 3);
     }
 
     #[tokio::test]
@@ -874,6 +1011,47 @@ mod tests {
 
         let (_, body) = get(&app, "/api/v1/pins").await;
         assert_eq!(body["pinned_sessions"], 0, "so an operator can confirm the fix worked");
+    }
+
+    #[tokio::test]
+    async fn query_traces_expose_active_history_detail_and_filters() {
+        let (app, state) = app();
+        let context = havuz_pg::TraceContext {
+            pool: "app_main".into(),
+            user: "svc_orders".into(),
+            application: Some("orders-api".into()),
+            client_addr: "127.0.0.1:5000".into(),
+        };
+        let mut span = state.family.traces().begin(&context, "select 42");
+        span.assign("primary/127.0.0.1:5432", Some(4242));
+
+        let (status, active) = get(&app, "/api/v1/traces?pool=app_main&user=svc_orders").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(active["active"][0]["sql"], "select 42");
+        assert_eq!(active["active"][0]["backend_pid"], 4242);
+
+        span.succeed();
+        let mut history = serde_json::Value::Null;
+        for _ in 0..20 {
+            history = get(&app, "/api/v1/traces?q=select&status=succeeded").await.1;
+            if history["traces"].as_array().is_some_and(|traces| !traces.is_empty()) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let id = history["traces"][0]["id"].as_u64().expect("completed trace id");
+        let (status, detail) = get(&app, &format!("/api/v1/traces/{id}")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(detail["user"], "svc_orders");
+        assert!(detail["result"]["sets"].is_array());
+
+        let response = app
+            .clone()
+            .oneshot(Request::builder().method("DELETE").uri("/api/v1/traces").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(state.family.traces().list(&havuz_pg::TraceFilter::default()).unwrap().is_empty());
     }
 
     #[tokio::test]

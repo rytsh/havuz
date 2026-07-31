@@ -24,8 +24,14 @@
   });
 </script>
 
-<h1>Dashboard</h1>
-<p class="subtitle">Live view of what havuz is doing right now.</p>
+<div class="page-heading">
+  <div>
+    <div class="eyebrow">Live telemetry</div>
+    <h1>Connection overview</h1>
+    <p class="subtitle">What your applications request and what PostgreSQL actually sees.</p>
+  </div>
+  <button class="action" onclick={refresh}>Refresh now</button>
+</div>
 
 {#if error}
   <div class="error">{error}</div>

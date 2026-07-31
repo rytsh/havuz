@@ -24,7 +24,7 @@
 //! nothing. That is the entire source of the fan-in.
 
 use havuz_pool::Checkout;
-use havuz_proto::{FlowEvent, PinReason, ProtoError, ProtoResult, SessionState};
+use havuz_proto::{BackendConn, FlowEvent, PinReason, ProtoError, ProtoResult, SessionState};
 use tokio::io::AsyncWriteExt;
 
 use crate::backend::PgConnector;
@@ -35,6 +35,7 @@ use crate::protocol::{sqlstate, Message, TransactionStatus};
 use crate::relay::RelayStats;
 use crate::routing::{PrimaryReason, Route, SessionRouting};
 use crate::stream::MaybeTls;
+use crate::trace::{TraceContext, TraceSpan, TraceStore};
 
 /// Outcome of a transaction-mode session.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,6 +58,25 @@ pub async fn transaction_relay(
     group: &PoolGroup,
     state: &mut SessionState,
 ) -> ProtoResult<TxnOutcome> {
+    transaction_relay_inner(client, group, state, None).await
+}
+
+pub async fn transaction_relay_traced(
+    client: &mut MaybeTls,
+    group: &PoolGroup,
+    state: &mut SessionState,
+    traces: &std::sync::Arc<TraceStore>,
+    context: &TraceContext,
+) -> ProtoResult<TxnOutcome> {
+    transaction_relay_inner(client, group, state, Some((traces, context))).await
+}
+
+async fn transaction_relay_inner(
+    client: &mut MaybeTls,
+    group: &PoolGroup,
+    state: &mut SessionState,
+    tracing: Option<(&std::sync::Arc<TraceStore>, &TraceContext)>,
+) -> ProtoResult<TxnOutcome> {
     let mut held: Option<Checkout<PgConnector>> = None;
     let mut stats = RelayStats::default();
     let mut exchanges = 0u64;
@@ -72,6 +92,7 @@ pub async fn transaction_relay(
     // the retry has to re-derive prepared statement state against whichever
     // backend it lands on.
     let mut exchange: Vec<Message> = Vec::new();
+    let mut trace_span: Option<TraceSpan> = None;
 
     loop {
         // Read one client message. While this is pending we hold no backend
@@ -90,6 +111,16 @@ pub async fn transaction_relay(
 
         if let ClientIntent::Pins(reason) = intent {
             state.observe(FlowEvent::MustPin(reason));
+        }
+
+        if trace_span.is_none() {
+            if let (Some(sql), Some((traces, context))) = (trace_sql(&msg, &statements), tracing) {
+                let mut span = traces.begin(context, sql);
+                if let Some(checkout) = held.as_ref() {
+                    span.assign(group.target_label(current_route), checkout.backend_pid());
+                }
+                trace_span = Some(span);
+            }
         }
 
         exchange.push(msg.clone());
@@ -126,6 +157,9 @@ pub async fn transaction_relay(
                     if matches!(current_route, Route::Replica(_)) {
                         to_replica += 1;
                     }
+                    if let Some(span) = trace_span.as_mut() {
+                        span.assign(group.target_label(current_route), checkout.backend_pid());
+                    }
                     held = Some(checkout);
                 }
                 Err(e) => {
@@ -134,6 +168,9 @@ pub async fn transaction_relay(
                         havuz_pool::PoolError::Timeout { .. } => sqlstate::TOO_MANY_CONNECTIONS,
                         _ => sqlstate::CANNOT_CONNECT_NOW,
                     };
+                    if let Some(span) = trace_span.take() {
+                        span.fail(code, e.to_string());
+                    }
                     let _ = Message::fatal(code, &e.to_string()).write(client).await;
                     return Err(ProtoError::backend(e.to_string()));
                 }
@@ -189,6 +226,9 @@ pub async fn transaction_relay(
                 let _ =
                     Message::error_response("ERROR", sqlstate::PROTOCOL_VIOLATION, &e.to_string()).write(client).await;
                 let _ = Message::ready_for_query(TransactionStatus::Failed).write(client).await;
+                if let Some(span) = trace_span.take() {
+                    span.fail(sqlstate::PROTOCOL_VIOLATION, e.to_string());
+                }
                 continue;
             }
         };
@@ -228,7 +268,7 @@ pub async fn transaction_relay(
 
         // Pump the answer through until the server says it is ready again.
         let client_bytes_before = stats.to_client;
-        match pump_until_ready(client, checkout, &mut stats).await {
+        match pump_until_ready(client, checkout, &mut stats, trace_span.as_mut()).await {
             Ok(status) => {
                 exchanges += 1;
                 group.router().record_result(current_route, true);
@@ -242,6 +282,9 @@ pub async fn transaction_relay(
                         // Pin the rest of the transaction to this target.
                         routing.begin_transaction(current_route);
                     }
+                }
+                if let Some(span) = trace_span.take() {
+                    span.succeed();
                 }
             }
             Err(e) => {
@@ -276,6 +319,9 @@ pub async fn transaction_relay(
                         }
                     };
                     checkouts += 1;
+                    if let Some(span) = trace_span.as_mut() {
+                        span.assign(group.target_label(current_route), checkout.backend_pid());
+                    }
 
                     for buffered in &exchange {
                         let outgoing = match rewrite_prepared(buffered, &mut statements, &checkout) {
@@ -312,7 +358,7 @@ pub async fn transaction_relay(
                         .await
                         .map_err(|e| ProtoError::backend(format!("replaying exchange: {e}")))?;
 
-                    match pump_until_ready(client, &mut checkout, &mut stats).await {
+                    match pump_until_ready(client, &mut checkout, &mut stats, trace_span.as_mut()).await {
                         Ok(status) => {
                             exchanges += 1;
                             group.router().record_result(current_route, true);
@@ -325,6 +371,9 @@ pub async fn transaction_relay(
                                     state.observe(FlowEvent::InTransaction);
                                     routing.begin_transaction(current_route);
                                 }
+                            }
+                            if let Some(span) = trace_span.take() {
+                                span.succeed();
                             }
                             exchange.clear();
                             held = Some(checkout);
@@ -404,6 +453,27 @@ fn message_intent(msg: &Message, statements: &ClientStatements) -> RouteIntent {
             }
         }
         _ => RouteIntent::Write,
+    }
+}
+
+fn trace_sql(msg: &Message, statements: &ClientStatements) -> Option<String> {
+    match msg.tag {
+        b'Q' => {
+            let end = msg.body.iter().position(|byte| *byte == 0).unwrap_or(msg.body.len());
+            Some(String::from_utf8_lossy(&msg.body[..end]).into_owned())
+        }
+        b'P' => {
+            let mut parts = msg.body.splitn(3, |byte| *byte == 0);
+            parts.next()?;
+            Some(String::from_utf8_lossy(parts.next()?).into_owned())
+        }
+        b'B' => {
+            let mut parts = msg.body.splitn(3, |byte| *byte == 0);
+            parts.next()?;
+            let statement = String::from_utf8_lossy(parts.next()?);
+            statements.get(&statement).map(|prepared| prepared.sql.clone())
+        }
+        _ => None,
     }
 }
 
@@ -512,6 +582,7 @@ async fn pump_until_ready(
     client: &mut MaybeTls,
     checkout: &mut Checkout<PgConnector>,
     stats: &mut RelayStats,
+    mut trace: Option<&mut TraceSpan>,
 ) -> ProtoResult<TransactionStatus> {
     loop {
         let msg = Message::read(checkout.stream_mut())
@@ -519,6 +590,9 @@ async fn pump_until_ready(
             .map_err(|e| ProtoError::backend(format!("reading from backend: {e}")))?;
 
         let status = msg.transaction_status();
+        if let Some(span) = trace.as_mut() {
+            span.observe(&msg);
+        }
 
         client
             .write_all(&msg.encode())

@@ -22,6 +22,7 @@ use crate::group::{GroupSnapshot, PoolGroup};
 use crate::protocol::{sqlstate, Message};
 use crate::scram::ScramVerifier;
 use crate::session::{complete_startup, AuthDenial, Authenticator, ClientHandshake, HandshakeOutcome};
+use crate::trace::{TraceContext, TraceError, TraceStore};
 
 const CANCEL_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -32,11 +33,24 @@ pub struct PgFamily {
     pools: RwLock<HashMap<String, Arc<PoolGroup>>>,
     cancels: Arc<CancelRegistry>,
     pins: Arc<PinRegistry>,
+    traces: Arc<TraceStore>,
     handshake: ClientHandshake<StateAuthenticator>,
 }
 
 impl PgFamily {
     pub fn new(state: Arc<StateStore>, master_key: Arc<MasterKey>) -> Arc<Self> {
+        Self::with_traces(state, master_key, TraceStore::memory())
+    }
+
+    pub fn persistent(
+        state: Arc<StateStore>,
+        master_key: Arc<MasterKey>,
+        trace_path: impl AsRef<std::path::Path>,
+    ) -> Result<Arc<Self>, TraceError> {
+        Ok(Self::with_traces(state, master_key, TraceStore::open(trace_path)?))
+    }
+
+    fn with_traces(state: Arc<StateStore>, master_key: Arc<MasterKey>, traces: Arc<TraceStore>) -> Arc<Self> {
         let authenticator = Arc::new(StateAuthenticator { state: state.clone(), master_key: master_key.clone() });
         Arc::new(Self {
             state,
@@ -44,6 +58,7 @@ impl PgFamily {
             pools: RwLock::new(HashMap::new()),
             cancels: Arc::new(CancelRegistry::new()),
             pins: Arc::new(PinRegistry::new()),
+            traces,
             handshake: ClientHandshake::new(authenticator),
         })
     }
@@ -55,6 +70,10 @@ impl PgFamily {
     /// Why sessions stopped being shareable. Served by the admin API.
     pub fn pins(&self) -> &Arc<PinRegistry> {
         &self.pins
+    }
+
+    pub fn traces(&self) -> &Arc<TraceStore> {
+        &self.traces
     }
 
     /// Configured pooling mode for a pool, defaulting to the safest option if
@@ -100,6 +119,17 @@ impl PgFamily {
         });
 
         Ok(())
+    }
+
+    /// Rebuild one pool after its runtime settings change.
+    ///
+    /// Existing sessions keep an `Arc` to the retired group and can finish;
+    /// subsequent lookups use the freshly configured group. The old group must
+    /// stay active because an idle transaction-mode client may need to borrow
+    /// another backend before it disconnects.
+    pub fn reload_pool(&self, name: &str) -> Result<(), ProtoError> {
+        self.pools.write().expect("pool map poisoned").remove(name);
+        self.sync_pools()
     }
 
     fn connector_for(
@@ -228,6 +258,13 @@ impl ProtocolFamily for PgFamily {
 
         complete_startup(&mut client, checkout.parameters(), cancel_key.process_id, cancel_key.secret_key).await?;
 
+        let trace_context = TraceContext {
+            pool: identity.pool.clone(),
+            user: identity.user.clone(),
+            application: identity.application_name.clone(),
+            client_addr: identity.peer.to_string(),
+        };
+
         let outcome = if mode.multiplexes() {
             // Transaction mode: the startup checkout has done its job (the
             // client needed a real backend's parameters), so give it straight
@@ -236,7 +273,9 @@ impl ProtocolFamily for PgFamily {
             drop(checkout);
 
             let mut state = SessionState::new(mode);
-            let result = crate::txn::transaction_relay(&mut client, &group, &mut state).await;
+            let result =
+                crate::txn::transaction_relay_traced(&mut client, &group, &mut state, &self.traces, &trace_context)
+                    .await;
             self.cancels.unregister(cancel_key);
 
             match result {
@@ -256,7 +295,18 @@ impl ProtocolFamily for PgFamily {
             // Session mode: bytes are shovelled in both directions, with just
             // enough framing awareness to stop the client's Terminate from
             // reaching — and killing — a backend we want to reuse.
-            let relay = crate::relay::session_relay(&mut client, checkout.stream_mut()).await;
+            let backend_pid = checkout.backend_pid();
+            let target =
+                group.target_label(crate::routing::Route::Primary(crate::routing::PrimaryReason::SplitDisabled));
+            let relay = crate::relay::session_relay_traced(
+                &mut client,
+                checkout.stream_mut(),
+                &self.traces,
+                &trace_context,
+                target,
+                backend_pid,
+            )
+            .await;
             self.cancels.unregister(cancel_key);
 
             let (to_backend, to_client) = match relay {
@@ -453,6 +503,33 @@ mod tests {
         let second = Arc::as_ptr(&family.pool("app_main").unwrap());
 
         assert_eq!(first, second, "resyncing must not tear down a working pool");
+    }
+
+    #[tokio::test]
+    async fn reload_replaces_lookups_without_draining_existing_sessions() {
+        let key = MasterKey::generate();
+        let state = state_with_user("hunter2", &key);
+        let store = Arc::new(StateStore::ephemeral(state));
+        let family = PgFamily::new(store.clone(), Arc::new(key));
+        family.sync_pools().unwrap();
+        let old = family.pool("app_main").unwrap();
+
+        store
+            .update(|s| {
+                s.pools.get_mut("app_main").unwrap().mode = PoolMode::Transaction;
+            })
+            .await
+            .unwrap();
+        family.reload_pool("app_main").unwrap();
+
+        let new = family.pool("app_main").unwrap();
+        assert!(!Arc::ptr_eq(&old, &new), "new connections must use the replacement");
+        assert_eq!(new.mode(), PoolMode::Transaction);
+        assert_eq!(
+            old.primary().status(),
+            havuz_pool::PoolStatus::Active,
+            "established clients must be able to finish against the old group"
+        );
     }
 
     #[tokio::test]

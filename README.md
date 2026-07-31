@@ -195,6 +195,20 @@ read/write split is enabled means the replicas are idle;
 for a replica that has never been measured, because a scrape must not confuse
 that with zero.
 
+The **Query trace** screen shows queries that are waiting for a backend or
+running now, including the havuz user, application name, client address,
+target, backend PID and elapsed time. Completed traces include pool wait time,
+execution time, command status, PostgreSQL errors and a sample of the actual
+result rows. History can be filtered by pool, user, status, SQL/application text
+and minimum duration.
+
+Completed traces are stored for seven days in `traces.sqlite3` beside
+`state.json`. The file and its WAL are created with mode `0600` on Unix. Result
+capture is capped at 100 rows and 256 KiB per query and marks truncated results
+in the UI. SQL text and result values may contain credentials or personal data,
+so protect the state directory and never expose the admin listener without
+authentication.
+
 ## Development
 
 ```sh

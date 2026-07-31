@@ -14,11 +14,15 @@
 //! not parse them — it only tracks boundaries and watches for a single tag,
 //! copying everything else in whole chunks.
 
+use std::collections::{HashMap, VecDeque};
 use std::io;
 
+use bytes::{Buf, Bytes, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+use crate::protocol::Message;
 use crate::stream::MaybeTls;
+use crate::trace::{TraceContext, TraceSpan, TraceStore};
 
 const BUF_SIZE: usize = 16 * 1024;
 
@@ -41,6 +45,26 @@ pub struct RelayStats {
 
 /// Shovel bytes between a client and its backend until either side is done.
 pub async fn session_relay(client: &mut MaybeTls, backend: &mut MaybeTls) -> io::Result<RelayStats> {
+    session_relay_inner(client, backend, None).await
+}
+
+pub async fn session_relay_traced(
+    client: &mut MaybeTls,
+    backend: &mut MaybeTls,
+    traces: &std::sync::Arc<TraceStore>,
+    context: &TraceContext,
+    target: String,
+    backend_pid: Option<u32>,
+) -> io::Result<RelayStats> {
+    session_relay_inner(client, backend, Some(SessionTrace::new(traces.clone(), context.clone(), target, backend_pid)))
+        .await
+}
+
+async fn session_relay_inner(
+    client: &mut MaybeTls,
+    backend: &mut MaybeTls,
+    mut trace: Option<SessionTrace>,
+) -> io::Result<RelayStats> {
     // Split so the two directions can be driven concurrently without aliasing
     // the same stream.
     let (mut client_rx, mut client_tx) = tokio::io::split(&mut *client);
@@ -69,6 +93,9 @@ pub async fn session_relay(client: &mut MaybeTls, backend: &mut MaybeTls) -> io:
                     Some(offset) => {
                         // Forward everything before the goodbye, then stop.
                         if offset > 0 {
+                            if let Some(trace) = trace.as_mut() {
+                                trace.observe_client(&from_client[..offset]);
+                            }
                             backend_tx.write_all(&from_client[..offset]).await?;
                             backend_tx.flush().await?;
                             stats.to_backend += offset as u64;
@@ -77,6 +104,9 @@ pub async fn session_relay(client: &mut MaybeTls, backend: &mut MaybeTls) -> io:
                         break;
                     }
                     None => {
+                        if let Some(trace) = trace.as_mut() {
+                            trace.observe_client(&from_client[..n]);
+                        }
                         backend_tx.write_all(&from_client[..n]).await?;
                         backend_tx.flush().await?;
                         stats.to_backend += n as u64;
@@ -90,6 +120,9 @@ pub async fn session_relay(client: &mut MaybeTls, backend: &mut MaybeTls) -> io:
                     stats.backend_closed = true;
                     break;
                 }
+                if let Some(trace) = trace.as_mut() {
+                    trace.observe_backend(&from_backend[..n]);
+                }
                 client_tx.write_all(&from_backend[..n]).await?;
                 client_tx.flush().await?;
                 stats.to_client += n as u64;
@@ -98,6 +131,128 @@ pub async fn session_relay(client: &mut MaybeTls, backend: &mut MaybeTls) -> io:
     }
 
     Ok(stats)
+}
+
+struct SessionTrace {
+    store: std::sync::Arc<TraceStore>,
+    context: TraceContext,
+    target: String,
+    backend_pid: Option<u32>,
+    client_frames: FrameObserver,
+    backend_frames: FrameObserver,
+    pending: VecDeque<TraceSpan>,
+    statements: HashMap<String, String>,
+    extended_open: bool,
+}
+
+impl SessionTrace {
+    fn new(store: std::sync::Arc<TraceStore>, context: TraceContext, target: String, backend_pid: Option<u32>) -> Self {
+        Self {
+            store,
+            context,
+            target,
+            backend_pid,
+            client_frames: FrameObserver::default(),
+            backend_frames: FrameObserver::default(),
+            pending: VecDeque::new(),
+            statements: HashMap::new(),
+            extended_open: false,
+        }
+    }
+
+    fn observe_client(&mut self, bytes: &[u8]) {
+        for message in self.client_frames.feed(bytes) {
+            match message.tag {
+                b'Q' => {
+                    if let Some(sql) = first_cstring(&message.body) {
+                        self.start(sql);
+                    }
+                    self.extended_open = false;
+                }
+                b'P' => {
+                    let mut parts = message.body.splitn(3, |byte| *byte == 0);
+                    let name = parts.next().map(|value| String::from_utf8_lossy(value).into_owned());
+                    let sql = parts.next().map(|value| String::from_utf8_lossy(value).into_owned());
+                    if let (Some(name), Some(sql)) = (name, sql) {
+                        if !name.is_empty() {
+                            self.statements.insert(name, sql.clone());
+                        }
+                        if !self.extended_open {
+                            self.start(sql);
+                        }
+                        self.extended_open = true;
+                    }
+                }
+                b'B' if !self.extended_open => {
+                    let mut parts = message.body.splitn(3, |byte| *byte == 0);
+                    parts.next();
+                    if let Some(name) = parts.next().map(|value| String::from_utf8_lossy(value)) {
+                        if let Some(sql) = self.statements.get(name.as_ref()).cloned() {
+                            self.start(sql);
+                        }
+                    }
+                    self.extended_open = true;
+                }
+                b'S' => self.extended_open = false,
+                _ => {}
+            }
+        }
+    }
+
+    fn observe_backend(&mut self, bytes: &[u8]) {
+        for message in self.backend_frames.feed(bytes) {
+            if let Some(span) = self.pending.front_mut() {
+                span.observe(&message);
+            }
+            if message.tag == b'Z' {
+                if let Some(span) = self.pending.pop_front() {
+                    span.succeed();
+                }
+            }
+        }
+    }
+
+    fn start(&mut self, sql: String) {
+        let mut span = self.store.begin(&self.context, sql);
+        span.assign(self.target.clone(), self.backend_pid);
+        self.pending.push_back(span);
+    }
+}
+
+#[derive(Default)]
+struct FrameObserver {
+    buffered: BytesMut,
+}
+
+impl FrameObserver {
+    fn feed(&mut self, bytes: &[u8]) -> Vec<Message> {
+        self.buffered.extend_from_slice(bytes);
+        let mut messages = Vec::new();
+        loop {
+            if self.buffered.len() < HEADER_LEN {
+                break;
+            }
+            let declared = i32::from_be_bytes([self.buffered[1], self.buffered[2], self.buffered[3], self.buffered[4]]);
+            if !(4..=16 * 1024 * 1024).contains(&declared) {
+                self.buffered.clear();
+                break;
+            }
+            let frame_len = 1 + declared as usize;
+            if self.buffered.len() < frame_len {
+                break;
+            }
+            let mut frame = self.buffered.split_to(frame_len).freeze();
+            let tag = frame.get_u8();
+            frame.advance(4);
+            messages.push(Message::new(tag, Bytes::copy_from_slice(&frame)));
+        }
+        messages
+    }
+}
+
+fn first_cstring(body: &[u8]) -> Option<String> {
+    let end = body.iter().position(|byte| *byte == 0).unwrap_or(body.len());
+    Some(String::from_utf8_lossy(body.get(..end)?).into_owned())
 }
 
 /// Tracks message boundaries in the client-to-backend byte stream.

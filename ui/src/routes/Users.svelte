@@ -83,10 +83,10 @@
 {#if created}
   <div class="warning">
     <strong>Save this password now — it cannot be shown again.</strong>
-    <div style="margin-top:6px">
+    <div class="mt-1.5 overflow-x-auto">
       <code>postgresql://{created.name}:{created.password}@&lt;havuz-host&gt;:5432/&lt;pool&gt;</code>
     </div>
-    <button class="action" style="margin-top:8px" onclick={() => (created = null)}>Dismiss</button>
+    <button class="action mt-2" onclick={() => (created = null)}>Dismiss</button>
   </div>
 {/if}
 
@@ -153,7 +153,7 @@
       <label for="grants">Pool access</label>
       <div id="grants">
         {#each pools as pool (pool.name)}
-          <label style="display:block; font-weight:400">
+          <label class="block font-normal">
             <input type="checkbox" checked={granted.includes(pool.name)} onchange={() => toggle(pool.name)} />
             {pool.name}
           </label>
@@ -162,7 +162,7 @@
     </div>
 
     <div class="field">
-      <label style="font-weight:400">
+      <label class="font-normal">
         <input type="checkbox" bind:checked={readOnly} />
         Read only
       </label>

@@ -15,7 +15,7 @@
 
   let name = $state("");
   let mode = $state<PoolMode>("session");
-  let maxSize = $state(3);
+  let maxSize = $state(10);
   let maxClients = $state(100);
 
   $effect(() => {
@@ -145,7 +145,7 @@
       <div class="field">
         <label for={`f-${key}`}>
           {prop.title ?? key}
-          {#if !isRequired(selected, key)}<span class="muted" style="font-weight:400">(optional)</span>{/if}
+          {#if !isRequired(selected, key)}<span class="muted font-normal">(optional)</span>{/if}
         </label>
         {#if prop.description}<div class="help">{prop.description}</div>{/if}
 
@@ -201,7 +201,7 @@
       <input id="max-size" type="number" min="1" bind:value={maxSize} />
     </div>
 
-    <div class="card" style="max-width:460px; margin-bottom:16px">
+    <div class="card mb-4 max-w-[460px]">
       {#if fanIn === null}
         <div class="label">Fan-in</div>
         <div class="value">—</div>

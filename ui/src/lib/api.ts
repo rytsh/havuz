@@ -1,4 +1,4 @@
-import type { Family, GroupSnapshot, PinReport, Pool, Summary, User } from "./types";
+import type { Family, GroupSnapshot, PinReport, Pool, Summary, TraceDetail, TraceResponse, User } from "./types";
 
 /**
  * Bearer token for a remote admin listener.
@@ -58,10 +58,15 @@ export const api = {
   pools: () => request<{ pools: Pool[]; warnings: Summary["warnings"] }>("/api/v1/pools"),
   users: () => request<{ users: User[] }>("/api/v1/users").then((r) => r.users),
   pins: () => request<PinReport>("/api/v1/pins"),
+  traces: (params: URLSearchParams) => request<TraceResponse>(`/api/v1/traces?${params}`),
+  trace: (id: number) => request<TraceDetail>(`/api/v1/traces/${id}`),
+  clearTraces: () => request<{ deleted: number }>("/api/v1/traces", { method: "DELETE" }),
   poolTargets: (name: string) => request<GroupSnapshot>(`/api/v1/pools/${encodeURIComponent(name)}/targets`),
   resetPins: () => request<unknown>("/api/v1/pins", { method: "DELETE" }),
 
   createPool: (body: unknown) => request<Pool>("/api/v1/pools", { method: "POST", body: JSON.stringify(body) }),
+  updatePool: (name: string, body: unknown) =>
+    request<Pool>(`/api/v1/pools/${encodeURIComponent(name)}`, { method: "PATCH", body: JSON.stringify(body) }),
   deletePool: (name: string) => request<unknown>(`/api/v1/pools/${encodeURIComponent(name)}`, { method: "DELETE" }),
   pausePool: (name: string) => request<unknown>(`/api/v1/pools/${encodeURIComponent(name)}/pause`, { method: "POST" }),
   resumePool: (name: string) =>

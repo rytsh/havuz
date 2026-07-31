@@ -100,7 +100,8 @@ async fn serve(bootstrap: Bootstrap) -> Result<()> {
         tracing::warn!(count = stale, "secrets sealed under a different master key; they cannot be read");
     }
 
-    let family = PgFamily::new(store.clone(), master_key.clone());
+    let family = PgFamily::persistent(store.clone(), master_key.clone(), bootstrap.state.dir.join("traces.sqlite3"))
+        .context("opening query trace store")?;
     family.sync_pools().map_err(|e| anyhow::anyhow!("building pools: {e}"))?;
 
     let current = store.load();

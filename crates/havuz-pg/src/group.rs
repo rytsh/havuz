@@ -26,6 +26,14 @@ pub struct PoolGroup {
     health: Option<tokio::task::JoinHandle<()>>,
 }
 
+impl Drop for PoolGroup {
+    fn drop(&mut self) {
+        if let Some(handle) = &self.health {
+            handle.abort();
+        }
+    }
+}
+
 impl std::fmt::Debug for PoolGroup {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PoolGroup")
@@ -122,6 +130,18 @@ impl PoolGroup {
         match route {
             Route::Primary(_) => &self.primary,
             Route::Replica(index) => self.replica_pools.get(index).unwrap_or(&self.primary),
+        }
+    }
+
+    pub fn target_label(&self, route: Route) -> String {
+        match route {
+            Route::Primary(_) => format!("primary/{}", self.primary_label),
+            Route::Replica(index) => self
+                .router
+                .replicas()
+                .get(index)
+                .map(|replica| format!("replica/{}", replica.label))
+                .unwrap_or_else(|| format!("primary/{}", self.primary_label)),
         }
     }
 

@@ -117,7 +117,7 @@
 
     <h2>
       By client
-      <label style="font-weight:400; font-size:12px; margin-left:12px">
+      <label class="ml-3 text-xs font-normal">
         <input type="checkbox" bind:checked={hideUnactionable} />
         only what can be fixed
       </label>
@@ -154,12 +154,12 @@
     {/if}
 
     {#if report.truncated}
-      <p class="muted" style="margin-top:10px">
+      <p class="muted mt-2.5">
         Per-client detail was capped to keep memory bounded. The counts by reason above remain exact.
       </p>
     {/if}
 
-    <button class="action" style="margin-top:16px" onclick={reset}>Reset statistics</button>
+    <button class="action mt-4" onclick={reset}>Reset statistics</button>
   {/if}
 {:else if !error}
   <p class="muted">Loading…</p>

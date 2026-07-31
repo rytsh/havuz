@@ -8,6 +8,10 @@
   let error = $state<string | null>(null);
   let busy = $state<string | null>(null);
   let probes = $state<Record<string, string>>({});
+  let editing = $state<string | null>(null);
+  let editMode = $state<Pool["mode"]>("transaction");
+  let editMaxSize = $state(10);
+  let editMaxClients = $state(100);
 
   async function refresh() {
     try {
@@ -56,6 +60,27 @@
     act(name, () => api.deletePool(name));
   }
 
+  function configure(pool: Pool) {
+    editing = pool.name;
+    editMode = pool.mode;
+    editMaxSize = pool.limits.max_size;
+    editMaxClients = pool.limits.max_client_connections;
+  }
+
+  async function saveConfiguration(event: Event) {
+    event.preventDefault();
+    if (!editing) return;
+    const name = editing;
+    await act(name, () =>
+      api.updatePool(name, {
+        mode: editMode,
+        max_size: editMaxSize,
+        max_client_connections: editMaxClients,
+      }),
+    );
+    if (!error) editing = null;
+  }
+
   $effect(() => {
     refresh();
   });
@@ -92,12 +117,12 @@
         <tr>
           <td>
             <strong>{pool.name}</strong>
-            <div class="muted" style="font-size:11px">{pool.database} as {pool.backend_user}</div>
+            <div class="muted text-[11px]">{pool.database} as {pool.backend_user}</div>
           </td>
           <td>
             {pool.family}
             {#if pool.profile && pool.profile !== pool.family}
-              <div class="muted" style="font-size:11px">{pool.profile}</div>
+              <div class="muted text-[11px]">{pool.profile}</div>
             {/if}
           </td>
           <td class="muted">{pool.targets.map((t) => `${t.host}:${t.port}`).join(", ")}</td>
@@ -129,6 +154,7 @@
           <td>
             <div class="row">
               <button class="action" disabled={busy === pool.name} onclick={() => probe(pool.name)}>Test</button>
+              <button class="action" disabled={busy === pool.name} onclick={() => configure(pool)}>Configure</button>
               {#if pool.disabled}
                 <button class="action" disabled={busy === pool.name} onclick={() => act(pool.name, () => api.resumePool(pool.name))}>
                   Resume
@@ -141,11 +167,49 @@
               <button class="action danger" disabled={busy === pool.name} onclick={() => remove(pool.name)}>Delete</button>
             </div>
             {#if probes[pool.name]}
-              <div class="muted" style="font-size:11px; margin-top:4px">{probes[pool.name]}</div>
+              <div class="muted mt-1 text-[11px]">{probes[pool.name]}</div>
             {/if}
           </td>
         </tr>
       {/each}
     </tbody>
   </table>
+
+  {#if editing}
+    <form class="config-panel" onsubmit={saveConfiguration}>
+      <div>
+        <div class="eyebrow">Runtime configuration</div>
+        <h2 class="mt-1">Tune {editing}</h2>
+        <p class="muted mb-0">New connections use this configuration immediately; established sessions finish on the old one.</p>
+      </div>
+      <div class="config-grid">
+        <div class="field mb-0">
+          <label for="edit-mode">Pooling mode</label>
+          <select id="edit-mode" bind:value={editMode}>
+            <option value="session">session</option>
+            <option value="transaction">transaction</option>
+            <option value="statement">statement</option>
+          </select>
+        </div>
+        <div class="field mb-0">
+          <label for="edit-max-size">Backend connections</label>
+          <input id="edit-max-size" type="number" min="1" bind:value={editMaxSize} />
+        </div>
+        <div class="field mb-0">
+          <label for="edit-max-clients">Client connections</label>
+          <input id="edit-max-clients" type="number" min="1" bind:value={editMaxClients} />
+        </div>
+      </div>
+      {#if editMode === "session" && editMaxClients > editMaxSize}
+        <div class="warning mb-0">
+          Session mode reserves one backend per connected client. The excess clients will wait and receive SQLSTATE
+          53300 when the queue timeout expires.
+        </div>
+      {/if}
+      <div class="row">
+        <button class="action primary" type="submit" disabled={busy === editing}>Save configuration</button>
+        <button class="action" type="button" onclick={() => (editing = null)}>Cancel</button>
+      </div>
+    </form>
+  {/if}
 {/if}

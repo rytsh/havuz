@@ -21,12 +21,34 @@ HAVUZ="$ROOT/target/debug/havuz"
 
 # psql runs in a container so the host needs no PostgreSQL client installed.
 psql_client() {
-  docker run --rm -e PGPASSWORD=clientpass postgres:16 \
+  docker run --rm --add-host host.docker.internal:host-gateway -e PGPASSWORD=clientpass postgres:16 \
     psql -qtAX -h host.docker.internal -p "$POOL_PORT" -U svc_orders -d app_main "$@"
 }
 
 api() {
   curl -sS "http://127.0.0.1:$ADMIN_PORT$1" "${@:2}"
+}
+
+wait_trace_id() {
+  local search="$1" payload id
+  for _ in $(seq 1 30); do
+    payload="$(api "/api/v1/traces?q=$search")"
+    id="$(python3 -c 'import json,sys; rows=json.loads(sys.argv[1])["traces"]; print(rows[0]["id"] if rows else "")' "$payload")"
+    [[ -n "$id" ]] && { echo "$id"; return; }
+    sleep 0.1
+  done
+  return 1
+}
+
+assert_trace_contains() {
+  local id="$1" expected="$2" detail
+  detail="$(api "/api/v1/traces/$id")"
+  python3 - "$detail" "$expected" <<'PY'
+import json, sys
+detail, expected = json.loads(sys.argv[1]), sys.argv[2]
+cells = [cell for result in detail["result"]["sets"] for row in result["rows"] for cell in row]
+assert expected in cells, f"trace result does not contain {expected!r}: {cells!r}"
+PY
 }
 
 cleanup() {
@@ -79,6 +101,11 @@ for i in $(seq 1 "$CLIENTS"); do
   [[ "$result" == "$i" ]] || { echo "FAIL: session $i returned '$result'"; exit 1; }
 done
 
+echo "==> session-mode query trace"
+session_trace_id="$(wait_trace_id 'select%2020')" \
+  || { echo "FAIL: session query was not traced"; exit 1; }
+assert_trace_contains "$session_trace_id" "20"
+
 created="$(api /api/v1/summary | python3 -c 'import sys,json; print(json.load(sys.stdin)["pool_snapshots"][0]["created_total"])')"
 checkouts="$(api /api/v1/summary | python3 -c 'import sys,json; print(json.load(sys.stdin)["pool_snapshots"][0]["checkout_total"])')"
 
@@ -128,6 +155,11 @@ api /api/v1/users -H 'content-type: application/json' \
 echo "==> one session, many transactions"
 psql_client -c "begin; select 1; commit;" -c "begin; select 2; commit;" -c "select 3;" > /dev/null
 
+echo "==> transaction-mode query trace"
+transaction_trace_id="$(wait_trace_id 'select%203')" \
+  || { echo "FAIL: transaction query was not traced"; exit 1; }
+assert_trace_contains "$transaction_trace_id" "3"
+
 before="$(api /api/v1/summary | python3 -c 'import sys,json; print(json.load(sys.stdin)["pool_snapshots"][0]["created_total"])')"
 echo "    backend connections opened: $before"
 [[ "$before" -le "$MAX_SIZE" ]] || { echo "FAIL: transaction mode opened $before connections"; exit 1; }
@@ -141,7 +173,9 @@ echo "    backend connections opened: $before"
 
 if command -v docker > /dev/null; then
   echo "==> pgbench with named prepared statements"
-  bench="$(docker run --rm -e PGPASSWORD=clientpass postgres:16 \
+  docker run --rm --add-host host.docker.internal:host-gateway -e PGPASSWORD=hunter2 postgres:16 \
+    pgbench -q -i -U app -h host.docker.internal -p "$PG_PORT" appdb
+  bench="$(docker run --rm --add-host host.docker.internal:host-gateway -e PGPASSWORD=clientpass postgres:16 \
     pgbench -S -M prepared -c 10 -j 2 -T 5 -U svc_orders -h host.docker.internal -p "$POOL_PORT" app_main 2>&1)"
 
   if echo "$bench" | grep -qi "does not exist"; then

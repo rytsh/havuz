@@ -62,7 +62,7 @@
 {#if pools.length === 0}
   <p class="muted">No pools configured.</p>
 {:else}
-  <div class="field" style="max-width:280px">
+  <div class="field max-w-[280px]">
     <label for="pool-select">Pool</label>
     <select id="pool-select" bind:value={selected} onchange={refresh}>
       {#each pools as pool (pool.name)}
@@ -148,7 +148,7 @@
   </table>
 
   {#if group.replicas.length === 0}
-    <p class="muted" style="margin-top:10px">
+    <p class="muted mt-2.5">
       This pool has no replicas. Add targets with role <code>replica</code> to spread reads.
     </p>
   {/if}

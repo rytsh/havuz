@@ -29,6 +29,16 @@
           title: `${w.pool}: no user can reach this pool`,
           detail: "Grant a user access to it, otherwise nothing will ever connect.",
         };
+      case "split_without_replicas":
+        return {
+          title: `${w.pool}: read/write split has no replica`,
+          detail: "Add at least one replica target or turn read/write split off. All traffic currently goes to the primary.",
+        };
+      case "no_sticky_window":
+        return {
+          title: `${w.pool}: reads may be stale immediately after a write`,
+          detail: "Set a sticky-after-write window comfortably above your replication lag.",
+        };
     }
   }
 </script>

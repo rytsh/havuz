@@ -25,9 +25,10 @@ pub(crate) const POSTGRES: FamilyDescriptor = FamilyDescriptor {
         advisory_locks: true,
     },
     pool_modes: &[PoolMode::Session, PoolMode::Transaction, PoolMode::Statement],
-    // Session mode is the phase 1 default: it is the only mode we can serve
-    // correctly today, and it never silently breaks client expectations.
-    default_pool_mode: PoolMode::Session,
+    // Transaction mode is what lets persistent application clients share a
+    // smaller backend budget. Session mode remains available for workloads
+    // that rely on connection-scoped state.
+    default_pool_mode: PoolMode::Transaction,
     profiles: PROFILES,
     config_fields: FIELDS,
 };
@@ -243,5 +244,10 @@ mod tests {
                 profile.id
             );
         }
+    }
+
+    #[test]
+    fn transaction_mode_is_the_postgres_default() {
+        assert_eq!(POSTGRES.default_pool_mode, PoolMode::Transaction);
     }
 }
