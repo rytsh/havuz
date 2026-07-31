@@ -11,13 +11,13 @@
   import NotFound from "./routes/NotFound.svelte";
 
   const tabs = [
-    { path: "/", label: "Dashboard", marker: "01" },
-    { path: "/databases", label: "Databases", marker: "02" },
-    { path: "/databases/new", label: "Add database", marker: "+" },
-    { path: "/targets", label: "Targets", marker: "03" },
-    { path: "/pins", label: "Pin analysis", marker: "04" },
-    { path: "/trace", activePath: /^\/trace(?:\/.*)?$/, label: "Query trace", marker: "05" },
-    { path: "/users", label: "Users", marker: "06" },
+    { path: "/", label: "Dashboard" },
+    { path: "/databases", label: "Databases" },
+    { path: "/databases/new", label: "Add database" },
+    { path: "/targets", label: "Targets" },
+    { path: "/pins", label: "Pin analysis" },
+    { path: "/trace", activePath: /^\/trace(?:\/.*)?$/, label: "Query trace" },
+    { path: "/users", label: "Users" },
   ];
 
   const routes = {
@@ -37,16 +37,12 @@
   <aside class="sidebar">
     <div class="brand">
       <div class="brand-mark">H</div>
-      <div>
-        havuz
-        <small>PostgreSQL traffic control</small>
-      </div>
+      <div>havuz</div>
     </div>
     <nav class="nav">
       {#each tabs as t (t.path)}
         <a href={t.path} use:link use:active={{ path: t.activePath ?? t.path, className: "active" }}>
-          <span>{t.label}</span>
-          <span class="nav-marker">{t.marker}</span>
+          {t.label}
         </a>
       {/each}
     </nav>

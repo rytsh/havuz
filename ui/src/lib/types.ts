@@ -71,7 +71,8 @@ export type Warning =
   | { kind: "backends_exceed_clients"; pool: string; max_client_connections: number; max_size: number }
   | { kind: "pool_without_users"; pool: string }
   | { kind: "split_without_replicas"; pool: string }
-  | { kind: "no_sticky_window"; pool: string };
+  | { kind: "no_sticky_window"; pool: string }
+  | { kind: "read_only_not_enforced"; pool: string; users: string[] };
 
 export interface Summary {
   uptime_seconds: number;
@@ -92,6 +93,19 @@ export interface User {
   disabled: boolean;
   description: string | null;
   has_password: boolean;
+  /** Sessions this user has attached right now. */
+  live_sessions: number;
+}
+
+/** A client session currently attached to havuz. */
+export interface LiveSession {
+  id: number;
+  user: string;
+  pool: string;
+  application: string | null;
+  client_addr: string;
+  since_ms: number;
+  elapsed_us: number;
 }
 
 export interface DriverProfile {

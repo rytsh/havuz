@@ -1,7 +1,6 @@
 <script lang="ts">
   import { push } from "svelte-spa-router";
-  import { siCockroachlabs, siMysql, siOpenjdk, siPostgresql, siRedis } from "simple-icons";
-  import type { SimpleIcon } from "simple-icons";
+  import { iconFor } from "../lib/icons";
   import { api } from "../lib/api";
   import type { DriverProfile, Family, PoolMode, SchemaProperty } from "../lib/types";
   import PoolModeGuide from "../components/PoolModeGuide.svelte";
@@ -55,20 +54,6 @@
     if (family.id === "redis") return "cache";
     if (family.id === "jdbc") return "bridge";
     return "relational";
-  }
-
-  function iconFor(profile: DriverProfile): SimpleIcon {
-    const known: Record<string, SimpleIcon> = {
-      postgres: siPostgresql,
-      cockroachdb: siCockroachlabs,
-      redshift: siPostgresql,
-      yugabytedb: siPostgresql,
-      opengauss: siPostgresql,
-      mysql: siMysql,
-      redis: siRedis,
-      generic: siOpenjdk,
-    };
-    return known[profile.id] ?? siOpenjdk;
   }
 
   function pick(family: Family, profile: DriverProfile) {
@@ -152,7 +137,6 @@
 {#if !selected}
   <div class="page-heading connection-heading">
     <div>
-      <div class="eyebrow">Connection catalog</div>
       <h1>New database</h1>
       <p class="subtitle">Choose a database type. Havuz will tailor the connection and pooling options.</p>
     </div>
@@ -186,7 +170,7 @@
 
       <div class="database-catalog" class:list={layout === "list"}>
         {#each visibleCatalog as item (`${item.family.id}:${item.profile.id}`)}
-          {@const icon = iconFor(item.profile)}
+          {@const icon = iconFor(item.profile.id, item.family.id)}
           <button
             class="database-type-card"
             class:available={item.family.usable && item.profile.maturity !== "planned"}
@@ -215,12 +199,12 @@
       <button class="back-link" onclick={backToCatalog}>Back to database types</button>
       <div class="selected-database-title">
         {#if selectedProfile}
-          {@const icon = iconFor(selectedProfile)}
+          {@const icon = iconFor(selectedProfile.id, selected.id)}
           <span class="database-mark" style={`--brand:#${icon.hex}`}>
             <svg viewBox="0 0 24 24" role="img" aria-label={icon.title}><path d={icon.path}></path></svg>
           </span>
         {/if}
-        <div><div class="eyebrow">New connection</div><h1>{selectedProfile?.label ?? selected.label}</h1></div>
+        <h1>{selectedProfile?.label ?? selected.label}</h1>
       </div>
       <p class="subtitle">Configure the upstream database and the client connection budget.</p>
     </div>

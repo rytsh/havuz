@@ -26,9 +26,7 @@
 
 <div class="page-heading">
   <div>
-    <div class="eyebrow">Live telemetry</div>
     <h1>Connection overview</h1>
-    <p class="subtitle">What your applications request and what PostgreSQL actually sees.</p>
   </div>
   <button class="action" onclick={refresh}>Refresh now</button>
 </div>
@@ -73,6 +71,7 @@
   {#if summary.pool_snapshots.length === 0}
     <p class="muted">No pools are running yet. Add a database to get started.</p>
   {:else}
+    <div class="table-scroll">
     <table>
       <thead>
         <tr>
@@ -117,6 +116,7 @@
         {/each}
       </tbody>
     </table>
+    </div>
   {/if}
 {:else if !error}
   <p class="muted">Loading…</p>

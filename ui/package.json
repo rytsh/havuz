@@ -21,7 +21,6 @@
     "vite": "^6.0.11"
   },
   "dependencies": {
-    "simple-icons": "^16.27.1",
     "svelte-spa-router": "^5.1.1"
   }
 }

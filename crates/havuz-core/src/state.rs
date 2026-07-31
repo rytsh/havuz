@@ -137,6 +137,22 @@ impl State {
             if pool.routing.read_write_split && pool.routing.sticky_after_write.is_zero() {
                 out.push(Warning::NoStickyWindow { pool: name.clone() });
             }
+            // Read-only is enforced by refusing the statements that would turn
+            // `default_transaction_read_only` back off, which means reading
+            // every statement. Session mode is a byte shovel and does not, so
+            // the guarantee silently weakens to "on by default".
+            if !pool.mode.multiplexes() {
+                let mut readers: Vec<String> = self
+                    .users
+                    .iter()
+                    .filter(|(_, user)| user.read_only && user.pools.iter().any(|p| p == name))
+                    .map(|(user, _)| user.clone())
+                    .collect();
+                readers.sort();
+                if !readers.is_empty() {
+                    out.push(Warning::ReadOnlyNotEnforced { pool: name.clone(), users: readers });
+                }
+            }
         }
         out
     }
@@ -175,6 +191,13 @@ pub enum Warning {
     /// Read/write split is on but there is nothing to split onto.
     SplitWithoutReplicas {
         pool: String,
+    },
+    /// A read-only user can reach a session-mode pool, where the guarantee
+    /// cannot be held: havuz inspects no statements there, so the client can
+    /// simply turn the setting off again.
+    ReadOnlyNotEnforced {
+        pool: String,
+        users: Vec<String>,
     },
     /// Read/write split with no sticky window: a read issued straight after a
     /// write can be served stale.

@@ -68,7 +68,14 @@ impl HolderRegistry {
         let mut counts: BTreeMap<String, usize> = BTreeMap::new();
         for entry in self.entries.read().expect("backend holder registry poisoned").values() {
             if entry.public.pool == pool && entry.public.reason != "startup_wait" {
-                *counts.entry(entry.public.reason.clone()).or_default() += 1;
+                // "pinned=2" tells an operator nothing they can act on. The pin
+                // reason is the whole diagnosis, so it belongs in the message
+                // the client actually sees.
+                let label = match &entry.public.pin_reason {
+                    Some(pin) => format!("{}:{pin}", entry.public.reason),
+                    None => entry.public.reason.clone(),
+                };
+                *counts.entry(label).or_default() += 1;
             }
         }
         if counts.is_empty() {
@@ -181,7 +188,8 @@ mod tests {
         assert_eq!(holder.reason, "pinned");
         assert_eq!(holder.pin_reason.as_deref(), Some("listen"));
         assert_eq!(holder.backend_pid, Some(42));
-        assert!(registry.timeout_hint("app_main").contains("pinned=1"));
+        // The count alone would tell an operator nothing they can act on.
+        assert!(registry.timeout_hint("app_main").contains("pinned:listen=1"));
 
         handle.clear();
         assert!(registry.snapshot().is_empty());

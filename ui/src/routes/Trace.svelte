@@ -227,7 +227,7 @@
 
   function pinDetail(reason: BackendHolder["pin_reason"]): string {
     switch (reason) {
-      case "session_parameter": return "A session-level SET or RESET changed backend state. Prefer startup parameters, SET LOCAL, or transaction-scoped settings.";
+      case "session_parameter": return "A SET that cannot be replayed onto another backend: SET ROLE, SET SESSION AUTHORIZATION, a value passed as a bind parameter, or a SET issued inside an open transaction. Ordinary SETs travel with the client and do not pin.";
       case "listen": return "LISTEN/UNLISTEN makes this connection a notification target until the session ends.";
       case "temp_table": return "A temporary table belongs to this backend session and cannot move to another connection.";
       case "advisory_lock": return "A session advisory lock is held. Use pg_advisory_xact_lock when transaction scope is sufficient.";
@@ -254,9 +254,7 @@
 
 <div class="page-heading">
   <div>
-    <div class="eyebrow">Wire-level observability</div>
     <h1>Query trace</h1>
-    <p class="subtitle">Every query, who issued it, where it ran, how long it waited, and what PostgreSQL returned.</p>
   </div>
   <div class="row">
     <span class="badge">{data?.retention_days ?? 7} day retention</span>
@@ -321,7 +319,6 @@
 
 <div class="trace-section-heading">
   <div>
-    <div class="eyebrow">Live</div>
     <h2>Running now</h2>
   </div>
   <span class="live-count">{visibleActive.length}</span>
@@ -352,7 +349,6 @@
 
 <div class="trace-section-heading">
   <div>
-    <div class="eyebrow">Pool blockers</div>
     <h2>Backend holders</h2>
   </div>
   <span class="live-count" class:has-blockers={visibleHolders.length > 0}>{visibleHolders.length}</span>
@@ -381,7 +377,6 @@
 
 <div class="trace-section-heading">
   <div>
-    <div class="eyebrow">SQLite history</div>
     <h2>Completed queries</h2>
   </div>
   <span class="muted text-xs">Showing {historyStart}-{historyEnd} of {historyTotal}</span>
@@ -395,6 +390,7 @@
 </div>
 
 {#if data && data.traces.length > 0}
+  <div class="table-scroll">
   <table class="trace-table">
     <thead>
       <tr><th>Time</th><th>Query</th><th>Caller</th><th>Pool / target</th><th>Wait</th><th>Total</th><th>Result</th><th></th></tr>
@@ -413,19 +409,20 @@
               >{copied === `row-${trace.id}` ? "Copied" : "Copy"}</button>
             </div>
           </td>
-          <td><strong>{trace.user}</strong><div class="muted text-[11px]">{trace.application ?? trace.client_addr}</div></td>
-          <td>{trace.pool}<div class="muted text-[11px]">{trace.target ?? "—"}</div></td>
+          <td><strong>{trace.user}</strong><div class="muted text-xs">{trace.application ?? trace.client_addr}</div></td>
+          <td>{trace.pool}<div class="muted text-xs">{trace.target ?? "—"}</div></td>
           <td>{formatMicros(trace.wait_us)}</td>
           <td><strong>{formatMicros(trace.duration_us)}</strong></td>
           <td>
             <span class="badge" class:ok={trace.status === "succeeded"} class:danger={trace.status === "failed"}>{trace.status}</span>
-            <div class="muted mt-1 text-[11px]">{trace.command_tag ?? trace.error_code ?? "—"}</div>
+            <div class="muted mt-1 text-xs">{trace.command_tag ?? trace.error_code ?? "—"}</div>
           </td>
           <td><button class="action" disabled={loadingDetail}>Inspect</button></td>
         </tr>
       {/each}
     </tbody>
   </table>
+  </div>
 {:else}
   <div class="trace-empty">No completed query matches these filters.</div>
 {/if}
@@ -460,8 +457,7 @@
     >
       <div class="trace-detail-head">
         <div>
-          <div class="eyebrow">Trace #{detail.id}</div>
-          <h2>Query result</h2>
+          <h2>Query result #{detail.id}</h2>
         </div>
         <div class="row">
           <button class="action" onclick={() => detail && copyText(detail.sql, "detail-query")}>{copied === "detail-query" ? "Copied" : "Copy query"}</button>

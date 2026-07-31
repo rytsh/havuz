@@ -244,6 +244,211 @@ if command -v docker > /dev/null; then
 fi
 
 # ---------------------------------------------------------------------------
+# Session parameters. An ordinary SET must survive being moved to another
+# backend without costing the session its place in the pool. This is what makes
+# transaction mode usable with a real driver, all of which SET on connect.
+# ---------------------------------------------------------------------------
+
+echo "==> session parameters travel with the client"
+
+# One statement per connection, so the SET and the SELECT that reads it back are
+# guaranteed to be separate checkouts.
+observed="$(psql_client -t -A -c "SET search_path TO pg_catalog" -c "SHOW search_path" | tail -1)"
+[[ "$observed" == "pg_catalog" ]] || {
+  echo "FAIL: search_path did not follow the client across checkouts (got '$observed')"
+  exit 1
+}
+
+# And it must not leak to the next client.
+observed="$(psql_client -t -A -c "SHOW search_path" | tail -1)"
+[[ "$observed" != "pg_catalog" ]] || {
+  echo "FAIL: one client's search_path leaked into the next session"
+  exit 1
+}
+echo "    search_path followed its client and did not leak to the next one"
+
+# ---------------------------------------------------------------------------
+# The bug this all exists for. Every driver issues two or three SETs on
+# connect; while those pinned, a small pool was owned outright by the first few
+# clients and everyone else timed out with "backend slots are held without a
+# running query (pinned=N)".
+# ---------------------------------------------------------------------------
+
+echo "==> $CLIENTS clients with a driver preamble over max_size=$MAX_SIZE"
+api /api/v1/pins -X DELETE > /dev/null
+before="$(api /api/v1/summary | python3 -c 'import sys,json; print(json.load(sys.stdin)["pool_snapshots"][0]["created_total"])')"
+
+pids=()
+for i in $(seq 1 "$CLIENTS"); do
+  psql_client \
+    -c "SET application_name = 'client-$i'" \
+    -c "SET extra_float_digits = 3" \
+    -c "SET search_path TO public" \
+    -c "select $i;" > "$WORK/preamble$i.out" 2>&1 &
+  pids+=($!)
+done
+failed=0
+for pid in "${pids[@]}"; do wait "$pid" || failed=$((failed + 1)); done
+[[ "$failed" -eq 0 ]] || {
+  echo "FAIL: $failed of $CLIENTS clients could not complete a driver preamble"
+  cat "$WORK"/preamble*.out | grep -i "error\|fatal" | head -5
+  exit 1
+}
+
+after="$(api /api/v1/summary | python3 -c 'import sys,json; print(json.load(sys.stdin)["pool_snapshots"][0]["created_total"])')"
+timeouts="$(api /api/v1/summary | python3 -c 'import sys,json; print(json.load(sys.stdin)["pool_snapshots"][0]["timeout_total"])')"
+opened=$((after - before))
+echo "    $CLIENTS clients, $opened new backend connection(s), $timeouts timeout(s)"
+[[ "$opened" -le "$MAX_SIZE" ]] || {
+  echo "FAIL: a driver preamble still costs a backend per client ($opened opened)"
+  exit 1
+}
+
+pins="$(api /api/v1/pins)"
+python3 - "$pins" <<'PY'
+import json, sys
+report = json.loads(sys.argv[1])
+by_reason = {r["reason"]: r["count"] for r in report["by_reason"]}
+assert by_reason.get("session_parameter", 0) == 0, \
+    f"an ordinary SET must no longer pin: {by_reason}"
+assert report["pinned_sessions"] == 0, f"nothing here should pin: {report}"
+PY
+echo "    no session was pinned"
+
+# ---------------------------------------------------------------------------
+# Read-only users. Enforced by setting default_transaction_read_only and
+# refusing the statements that would turn it back off, so the refusing is
+# PostgreSQL's and covers writes hidden inside functions.
+# ---------------------------------------------------------------------------
+
+echo "==> read-only user"
+api /api/v1/users -H 'content-type: application/json' \
+  -d '{"name":"svc_ro","password":"ropass","pools":["app_main"],"read_only":true}' > /dev/null
+
+psql_ro() {
+  docker run --rm --add-host host.docker.internal:host-gateway -e PGPASSWORD=ropass postgres:16 \
+    psql -qtAX -h host.docker.internal -p "$POOL_PORT" -U svc_ro -d app_main "$@"
+}
+
+[[ "$(psql_ro -c "select 1;" | tail -1)" == "1" ]] || { echo "FAIL: a read-only user cannot read"; exit 1; }
+[[ "$(psql_ro -c "show default_transaction_read_only;" | tail -1)" == "on" ]] \
+  || { echo "FAIL: the read-only setting did not reach the backend"; exit 1; }
+
+if psql_ro -c "create table e2e_ro_probe (id int);" > "$WORK/ro_write.out" 2>&1; then
+  echo "FAIL: a read-only user performed a write"
+  exit 1
+fi
+grep -q "read-only" "$WORK/ro_write.out" || {
+  echo "FAIL: the write was refused for the wrong reason:"; cat "$WORK/ro_write.out"; exit 1
+}
+
+# Every way out of the setting has to be closed, or it is only a default.
+for escape in "SET default_transaction_read_only = off" "RESET ALL" "BEGIN READ WRITE" "SET TRANSACTION READ WRITE"; do
+  if psql_ro -c "$escape" > "$WORK/ro_escape.out" 2>&1; then
+    echo "FAIL: '$escape' was allowed, so read-only is not enforced"
+    exit 1
+  fi
+done
+echo "    reads allowed, writes refused, and the setting cannot be turned off"
+
+# ---------------------------------------------------------------------------
+# Disabling and disconnecting a user. Disabling alone only refuses the next
+# handshake, which is not what an operator revoking access means.
+# ---------------------------------------------------------------------------
+
+echo "==> disable and disconnect"
+
+ro_sessions() {
+  api /api/v1/users \
+    | python3 -c 'import sys,json; print(next(u["live_sessions"] for u in json.load(sys.stdin)["users"] if u["name"]=="svc_ro"))'
+}
+
+# An idle session: one statement, a pause, then another. psql sits blocked on
+# its own stdin during the pause and does not read the socket, so the second
+# statement is what makes libpq surface what arrived meanwhile.
+(echo "select 1;"; sleep 6; echo "select 2;") | docker run --rm -i \
+  --add-host host.docker.internal:host-gateway -e PGPASSWORD=ropass postgres:16 \
+  psql -qtAX -h host.docker.internal -p "$POOL_PORT" -U svc_ro -d app_main \
+  > "$WORK/kicked.out" 2>&1 &
+KICK_CLIENT=$!
+
+for _ in $(seq 1 40); do
+  live="$(ro_sessions)"
+  [[ "$live" -ge 1 ]] && break
+  sleep 0.25
+done
+[[ "$live" -ge 1 ]] || { echo "FAIL: the live session was never registered"; exit 1; }
+
+kicked="$(api /api/v1/users/svc_ro -X PATCH -H 'content-type: application/json' \
+  -d '{"disabled":true,"kick":true}' | python3 -c 'import sys,json; print(json.load(sys.stdin)["kicked"])')"
+[[ "$kicked" -ge 1 ]] || { echo "FAIL: disabling reported $kicked kicked sessions"; exit 1; }
+
+# The real assertion. A kick that only sets a flag would leave this at 1.
+for _ in $(seq 1 40); do
+  live="$(ro_sessions)"
+  [[ "$live" -eq 0 ]] && break
+  sleep 0.25
+done
+[[ "$live" -eq 0 ]] || { echo "FAIL: the session was flagged but never actually ended"; exit 1; }
+
+wait "$KICK_CLIENT" 2>/dev/null || true
+# libpq reports this either as the FATAL havuz sent or as the socket closing
+# underneath it, depending on where it was when the message landed. Either way
+# the client learns it was disconnected rather than hanging.
+grep -qiE "administrator command|server closed the connection|connection to server" "$WORK/kicked.out" || {
+  echo "FAIL: the disconnected client never noticed:"; cat "$WORK/kicked.out"; exit 1
+}
+
+# And a disabled user cannot come back.
+if psql_ro -c "select 1;" > /dev/null 2>&1; then
+  echo "FAIL: a disabled user reconnected"
+  exit 1
+fi
+echo "    session ended with 57P01 and the user cannot reconnect"
+
+# Re-enabling restores access, so this is a revocation and not a deletion.
+api /api/v1/users/svc_ro -X PATCH -H 'content-type: application/json' -d '{"disabled":false}' > /dev/null
+[[ "$(psql_ro -c "select 42;" | tail -1)" == "42" ]] || { echo "FAIL: re-enabling did not restore access"; exit 1; }
+
+# ---------------------------------------------------------------------------
+# Per-user connection cap.
+# ---------------------------------------------------------------------------
+
+echo "==> per-user connection limit"
+api /api/v1/users/svc_ro -X PATCH -H 'content-type: application/json' \
+  -d '{"max_client_connections":1}' > /dev/null
+
+(echo "select 1;"; sleep 6) | docker run --rm -i --add-host host.docker.internal:host-gateway \
+  -e PGPASSWORD=ropass postgres:16 \
+  psql -qtAX -h host.docker.internal -p "$POOL_PORT" -U svc_ro -d app_main \
+  > "$WORK/cap_holder.out" 2>&1 &
+CAP_HOLDER=$!
+
+for _ in $(seq 1 40); do
+  live="$(api /api/v1/users | python3 -c 'import sys,json; print(next(u["live_sessions"] for u in json.load(sys.stdin)["users"] if u["name"]=="svc_ro"))')"
+  [[ "$live" -ge 1 ]] && break
+  sleep 0.25
+done
+
+if psql_ro -c "select 1;" > "$WORK/cap_refused.out" 2>&1; then
+  echo "FAIL: the per-user connection cap was not enforced"
+  kill "$CAP_HOLDER" 2>/dev/null || true
+  exit 1
+fi
+grep -q "too many connections" "$WORK/cap_refused.out" || {
+  echo "FAIL: the second connection failed for the wrong reason:"; cat "$WORK/cap_refused.out"
+  kill "$CAP_HOLDER" 2>/dev/null || true
+  exit 1
+}
+wait "$CAP_HOLDER" 2>/dev/null || true
+
+# The slot is freed again when the session ends.
+[[ "$(psql_ro -c "select 7;" | tail -1)" == "7" ]] || { echo "FAIL: a closed session did not free its slot"; exit 1; }
+echo "    a second connection was refused and the slot was freed on release"
+
+api /api/v1/users/svc_ro -X DELETE > /dev/null
+
+# ---------------------------------------------------------------------------
 # Pin detection. Nothing else reports this, so nothing else can be compared
 # against; the assertion is that we see exactly what the client did.
 # ---------------------------------------------------------------------------
@@ -252,7 +457,11 @@ echo "==> pin detection"
 api /api/v1/pins -X DELETE > /dev/null
 
 psql_client -c "select 1;" > /dev/null                            # clean
-psql_client -c "SET application_name = 'orders-api'" > /dev/null  # pins
+psql_client -c "SET application_name = 'orders-api'" > /dev/null  # replayable: clean
+# The backend's own service account, so the statement succeeds and the pin is
+# the only thing being measured. Client names are havuz users, not database
+# roles, and SET ROLE resolves against the database.
+psql_client -c "SET ROLE app" > /dev/null                         # pins
 psql_client -c "LISTEN chan" > /dev/null                          # pins
 
 pins="$(api /api/v1/pins)"
@@ -261,16 +470,18 @@ import json, sys
 report = json.loads(sys.argv[1])
 by_reason = {r["reason"]: r["count"] for r in report["by_reason"]}
 
-assert by_reason["session_parameter"] == 1, f"SET was not detected: {by_reason}"
+assert by_reason.get("session_parameter") == 1, \
+    f"SET ROLE must pin and a plain SET must not: {by_reason}"
 assert by_reason["listen"] == 1, f"LISTEN was not detected: {by_reason}"
-assert report["clean_sessions"] >= 1, "a clean session should have been counted"
+assert report["clean_sessions"] >= 2, \
+    f"the plain SET is replayable, so its session is clean: {report}"
 assert report["offenders"], "the report must name who did it"
 
 offender = report["offenders"][0]
 assert offender["user"] == "svc_orders", offender
-assert offender["actionable"], "SET and LISTEN are both fixable by the application"
+assert offender["actionable"], "SET ROLE and LISTEN are both fixable by the application"
 print(f"    pin rate {report['pin_rate']*100:.0f}%: "
-      f"{by_reason['session_parameter']} SET, {by_reason['listen']} LISTEN, "
+      f"{by_reason['session_parameter']} SET ROLE, {by_reason['listen']} LISTEN, "
       f"attributed to {offender['user']}/{offender['application']}")
 PY
 

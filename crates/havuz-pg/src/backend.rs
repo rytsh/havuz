@@ -6,6 +6,7 @@
 //! havuz would need a separate pool per role and the fan-in would collapse to
 //! the number of roles.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -54,6 +55,10 @@ pub struct PgBackend {
     /// Global prepared statement names this connection has parsed. Lives with
     /// the connection because that is exactly what it describes.
     statements: BackendStatements,
+    /// Session parameters currently in force, as the statements that produced
+    /// them. Lives with the connection for the same reason: it describes this
+    /// backend, not the client that happens to be holding it.
+    applied_params: BTreeMap<String, String>,
 }
 
 impl std::fmt::Debug for PgBackend {
@@ -81,6 +86,20 @@ impl PgBackend {
 
     pub fn parameters(&self) -> &[(String, String)] {
         &self.parameters
+    }
+
+    /// Session parameters this connection currently has, keyed by name.
+    ///
+    /// Empty means "the backend defaults", which is what a freshly opened or
+    /// freshly reset connection has.
+    pub fn applied_params(&self) -> &BTreeMap<String, String> {
+        &self.applied_params
+    }
+
+    /// Record the parameters now in force, after applying a delta or after
+    /// watching a client's own `SET` succeed.
+    pub fn set_applied_params(&mut self, params: BTreeMap<String, String>) {
+        self.applied_params = params;
     }
 
     pub fn secret_key(&self) -> Option<i32> {
@@ -234,6 +253,10 @@ impl BackendConn for PgBackend {
         // prepared statement. Keeping the cache would make us skip replays the
         // backend can no longer honour.
         self.statements.clear();
+
+        // Both DISCARD ALL and RESET ALL return every session parameter to its
+        // default, so this connection now matches a freshly opened one.
+        self.applied_params.clear();
 
         Ok(if self.broken { ResetOutcome::Discard } else { ResetOutcome::Cleaned })
     }
@@ -470,6 +493,7 @@ impl BackendConnector for PgConnector {
             broken: false,
             supports_discard_all: self.config.supports_discard_all,
             statements: BackendStatements::new(),
+            applied_params: BTreeMap::new(),
         })
     }
 

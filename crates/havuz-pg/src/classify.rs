@@ -5,9 +5,16 @@
 //! demotes the pool back to session mode for that client. This module finds
 //! them.
 //!
+//! "Leaves a trace" is not the same as "cannot be shared". A session parameter
+//! leaves a trace with a name, so it can be remembered and reproduced on the
+//! next backend; [`crate::params`] does that, and this module asks it rather
+//! than pinning on sight. What is left here is the state that has no name we
+//! could replay — a temp table, a `LISTEN` registration, an advisory lock, a
+//! connection that has entered a streaming sub-protocol.
+//!
 //! The output feeds the product's most useful telemetry: not "your pool is
-//! full" but "`svc_orders` issues `SET application_name` on connect, which is
-//! why your 100 clients are still using 100 backends".
+//! full" but "`svc_orders` opens a holdable cursor on connect, which is why
+//! your 100 clients are still using 100 backends".
 //!
 //! Two deliberate non-goals:
 //!
@@ -106,13 +113,13 @@ fn statement_pin_reason(statement: &str) -> Option<PinReason> {
     let words: Vec<&str> = upper.split_whitespace().collect();
 
     match words.first().copied() {
-        // `SET LOCAL` is rolled back with the transaction, so it is free.
-        // Everything else outlives it.
-        Some("SET") => match words.get(1).copied() {
-            Some("LOCAL") => None,
-            // `SET TRANSACTION` applies to the current transaction only.
-            Some("TRANSACTION") => None,
-            _ => Some(PinReason::SessionParameter),
+        // A session parameter is not hidden state: it has a name, so it can be
+        // remembered and reproduced on the next backend. Only the spellings
+        // that cannot be replayed — `SET ROLE`, a value that lives in a `Bind`,
+        // an unrecognised shape — are still worth a pin. See `params`.
+        Some("SET") | Some("RESET") => match crate::params::classify_set(normalized) {
+            crate::params::SetAction::Pin(reason) => Some(reason),
+            _ => None,
         },
 
         // Both make this connection the delivery target for notifications.
@@ -140,9 +147,6 @@ fn statement_pin_reason(statement: &str) -> Option<PinReason> {
 
         // COPY switches the connection into a streaming sub-protocol.
         Some("COPY") => Some(PinReason::BulkTransfer),
-
-        // Changes the effective role for the rest of the session.
-        Some("RESET") => Some(PinReason::SessionParameter),
 
         Some("START") if words.get(1).copied() == Some("REPLICATION") => Some(PinReason::Replication),
 
@@ -174,7 +178,7 @@ fn mentions_session_advisory_lock(sql: &str) -> bool {
 ///
 /// Quotes, dollar quoting and comments are respected so a semicolon inside a
 /// string literal does not split anything.
-fn split_statements(sql: &str) -> Vec<&str> {
+pub(crate) fn split_statements(sql: &str) -> Vec<&str> {
     let bytes = sql.as_bytes();
     let mut out = Vec::new();
     let mut start = 0;
@@ -265,7 +269,7 @@ fn dollar_tag_len(bytes: &[u8]) -> Option<usize> {
 
 /// Drop leading whitespace and comments so `/* app */ SET x = 1` is still seen
 /// as a `SET`.
-fn strip_leading_noise(sql: &str) -> &str {
+pub(crate) fn strip_leading_noise(sql: &str) -> &str {
     let mut rest = sql.trim_start();
     loop {
         if let Some(after) = rest.strip_prefix("--") {
@@ -409,7 +413,7 @@ pub fn starts_read_only_transaction(sql: &str) -> bool {
 ///
 /// Keeps the surrounding structure so keyword scanning still works, but removes
 /// any chance of matching a keyword that only appears inside a literal.
-fn strip_literals(sql: &str) -> String {
+pub(crate) fn strip_literals(sql: &str) -> String {
     let bytes = sql.as_bytes();
     let mut out = String::with_capacity(sql.len());
     let mut i = 0;
@@ -509,15 +513,31 @@ mod tests {
     // --- the statements that cost us multiplexing ---
 
     #[test]
-    fn set_pins_but_set_local_does_not() {
-        assert_eq!(sql_pin_reason("SET application_name = 'app'"), Some(PinReason::SessionParameter));
-        assert_eq!(sql_pin_reason("set search_path to public"), Some(PinReason::SessionParameter));
-        assert_eq!(sql_pin_reason("SET ROLE readonly"), Some(PinReason::SessionParameter));
+    fn an_ordinary_set_is_tracked_rather_than_pinned() {
+        // These are what every driver sends on connect. Pinning on them meant a
+        // pool of two backends was owned forever by the first two clients.
+        assert_eq!(sql_pin_reason("SET application_name = 'app'"), None);
+        assert_eq!(sql_pin_reason("set search_path to public"), None);
+        assert_eq!(sql_pin_reason("SET extra_float_digits = 3"), None);
+        assert_eq!(sql_pin_reason("RESET search_path"), None);
+        assert_eq!(sql_pin_reason("RESET ALL"), None);
 
-        // Rolled back with the transaction, so it is free.
+        // Rolled back with the transaction, so it was never our problem.
         assert_eq!(sql_pin_reason("SET LOCAL statement_timeout = '5s'"), None);
         assert_eq!(sql_pin_reason("set local work_mem = '64MB'"), None);
         assert_eq!(sql_pin_reason("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"), None);
+    }
+
+    #[test]
+    fn only_a_set_we_could_not_reproduce_still_pins() {
+        // Changing the effective role is a permission change; replaying it
+        // would turn a bug in the replay path into a privilege leak.
+        assert_eq!(sql_pin_reason("SET ROLE readonly"), Some(PinReason::SessionParameter));
+        assert_eq!(sql_pin_reason("SET SESSION AUTHORIZATION 'bob'"), Some(PinReason::SessionParameter));
+        // The value lives in a Bind, not in the statement text.
+        assert_eq!(sql_pin_reason("SET application_name = $1"), Some(PinReason::SessionParameter));
+        // A shape we do not recognise is one we have not thought about.
+        assert_eq!(sql_pin_reason("SET application_name 'x'"), Some(PinReason::SessionParameter));
     }
 
     #[test]
@@ -604,12 +624,12 @@ mod tests {
     #[test]
     fn leading_comments_do_not_hide_a_pinning_statement() {
         assert_eq!(
-            sql_pin_reason("/* app: orders-api */ SET application_name = 'x'"),
-            Some(PinReason::SessionParameter),
+            sql_pin_reason("/* app: orders-api */ CREATE TEMP TABLE t (id int)"),
+            Some(PinReason::TempTable),
             "ORMs routinely prefix statements with a comment"
         );
         assert_eq!(sql_pin_reason("-- comment\nLISTEN chan"), Some(PinReason::Listen));
-        assert_eq!(sql_pin_reason("/* a */ /* b */\n  SET x = 1"), Some(PinReason::SessionParameter));
+        assert_eq!(sql_pin_reason("/* a */ /* b */\n  SET ROLE admin"), Some(PinReason::SessionParameter));
         assert_eq!(sql_pin_reason("/* unterminated"), None);
     }
 
@@ -625,9 +645,10 @@ mod tests {
     #[test]
     fn any_statement_in_a_batch_can_pin_it() {
         assert_eq!(sql_pin_reason("SELECT 1; SELECT 2"), None);
+        assert_eq!(sql_pin_reason("SELECT 1; SET application_name = 'x'; SELECT 2"), None);
         assert_eq!(
-            sql_pin_reason("SELECT 1; SET application_name = 'x'; SELECT 2"),
-            Some(PinReason::SessionParameter),
+            sql_pin_reason("SELECT 1; LISTEN chan; SELECT 2"),
+            Some(PinReason::Listen),
             "a pin anywhere in the batch pins the connection"
         );
     }
@@ -651,8 +672,10 @@ mod tests {
         assert_eq!(classify(&simple_query("SELECT 1")), ClientIntent::SyncPoint);
         assert_eq!(
             classify(&simple_query("SET application_name = 'x'")),
-            ClientIntent::Pins(PinReason::SessionParameter)
+            ClientIntent::SyncPoint,
+            "a replayable SET is an ordinary statement now"
         );
+        assert_eq!(classify(&simple_query("LISTEN chan")), ClientIntent::Pins(PinReason::Listen));
 
         assert_eq!(classify(&parse_message("s1", "SELECT $1")), ClientIntent::Pipelined);
         assert_eq!(
@@ -825,17 +848,14 @@ mod tests {
     }
 
     #[test]
-    fn the_realistic_orm_startup_sequence_is_diagnosed() {
-        // This is the sequence that quietly turns transaction mode into session
-        // mode for a large share of real deployments.
+    fn the_realistic_orm_startup_sequence_no_longer_costs_multiplexing() {
+        // This is the sequence that used to turn transaction mode into session
+        // mode for a large share of real deployments: three statements every
+        // driver sends on connect, each one previously a permanent pin.
         let driver_preamble =
             ["SET application_name = 'orders-api'", "SET extra_float_digits = 3", "SET timezone = 'UTC'"];
         for sql in driver_preamble {
-            assert_eq!(
-                sql_pin_reason(sql),
-                Some(PinReason::SessionParameter),
-                "{sql} must be reported so operators can turn it off"
-            );
+            assert_eq!(sql_pin_reason(sql), None, "{sql} is replayable, so it must not cost a backend");
         }
     }
 }

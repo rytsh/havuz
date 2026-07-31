@@ -39,6 +39,15 @@
           title: `${w.pool}: reads may be stale immediately after a write`,
           detail: "Set a sticky-after-write window comfortably above your replication lag.",
         };
+      case "read_only_not_enforced":
+        return {
+          title: `${w.pool}: read-only is not enforced in session mode`,
+          detail:
+            `${w.users.join(", ")} ${w.users.length === 1 ? "is" : "are"} marked read-only, but this pool runs in ` +
+            `session mode, where havuz forwards bytes without reading statements. The setting is applied as a ` +
+            `default and the client can turn it off again. Move the pool to transaction mode, or enforce it with ` +
+            `database privileges instead.`,
+        };
     }
   }
 </script>

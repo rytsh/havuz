@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use axum::extract::{Path, Query, State};
 use axum::response::IntoResponse;
-use axum::routing::{delete, get, post};
+use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use havuz_core::state::{PoolConfig, PoolLimits, RoutingConfig, Target, UserConfig, Warning};
 use havuz_pg::ScramVerifier;
@@ -30,7 +30,9 @@ pub fn router(state: AdminState) -> Router {
         .route("/pools/{name}/probe", post(probe_pool))
         .route("/pools/{name}/targets", get(pool_targets))
         .route("/users", get(list_users).post(create_user))
-        .route("/users/{name}", delete(delete_user))
+        .route("/users/{name}", patch(update_user).delete(delete_user))
+        .route("/users/{name}/kick", post(kick_user))
+        .route("/sessions", get(list_sessions))
         .route("/config", get(get_config))
         .route("/summary", get(get_summary))
         .route("/pins", get(get_pins).delete(reset_pins))
@@ -393,10 +395,16 @@ struct UserView {
     disabled: bool,
     description: Option<String>,
     has_password: bool,
+    /// Sessions this user has attached right now.
+    live_sessions: u64,
 }
 
 async fn list_users(State(state): State<AdminState>) -> impl IntoResponse {
     let current = state.store.load();
+    // Live session counts turn the page from a list of records into something
+    // an operator can act on: disabling a user with 40 connections attached
+    // means something quite different from disabling one with none.
+    let live = state.family.sessions().counts_by_user();
     let users: Vec<_> = current
         .users
         .iter()
@@ -408,9 +416,109 @@ async fn list_users(State(state): State<AdminState>) -> impl IntoResponse {
             disabled: u.disabled,
             description: u.description.clone(),
             has_password: current.secrets.contains(&havuz_secrets::user_verifier(name)),
+            live_sessions: live.get(name).copied().unwrap_or(0),
         })
         .collect();
     Json(json!({ "users": users }))
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateUser {
+    /// Absent means "leave alone". Present-but-empty is rejected by
+    /// validation, because a user with no grants could never connect.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pools: Option<Vec<String>>,
+    #[serde(default)]
+    max_client_connections: Option<u32>,
+    #[serde(default)]
+    read_only: Option<bool>,
+    #[serde(default)]
+    disabled: Option<bool>,
+    #[serde(default)]
+    description: Option<Option<String>>,
+    /// Replace the password. The plaintext is turned into a verifier here and
+    /// never stored.
+    #[serde(default)]
+    password: Option<String>,
+    /// End this user's live sessions as part of the same request.
+    ///
+    /// Disabling a user only refuses the *next* handshake, so an operator
+    /// revoking access during an incident almost always wants this too.
+    #[serde(default)]
+    kick: bool,
+}
+
+async fn update_user(
+    State(state): State<AdminState>,
+    Path(name): Path<String>,
+    Json(body): Json<UpdateUser>,
+) -> Result<impl IntoResponse, ApiError> {
+    if body.password.as_ref().is_some_and(|p| p.is_empty()) {
+        return Err(ApiError::BadRequest("password must not be empty".into()));
+    }
+    if body.pools.as_ref().is_some_and(|p| p.is_empty()) {
+        return Err(ApiError::BadRequest("a user needs at least one pool grant; delete the user instead".into()));
+    }
+
+    let verifier = body.password.as_deref().map(|p| ScramVerifier::from_password(p).encode());
+    let master_key = state.master_key.clone();
+
+    let found = state
+        .store
+        .update({
+            let name = name.clone();
+            move |s| {
+                let Some(user) = s.users.get_mut(&name) else { return false };
+                if let Some(pools) = body.pools {
+                    user.pools = pools;
+                }
+                if let Some(max) = body.max_client_connections {
+                    user.max_client_connections = max;
+                }
+                if let Some(read_only) = body.read_only {
+                    user.read_only = read_only;
+                }
+                if let Some(disabled) = body.disabled {
+                    user.disabled = disabled;
+                }
+                if let Some(description) = body.description {
+                    user.description = description;
+                }
+                if let Some(verifier) = verifier {
+                    let _ = s.secrets.put(&master_key, havuz_secrets::user_verifier(&name), &verifier);
+                }
+                true
+            }
+        })
+        .await?;
+
+    if !found {
+        return Err(ApiError::NotFound(format!("user '{name}'")));
+    }
+
+    // Only after the change is durable. Kicking first would drop sessions that
+    // a failed validation then leaves entitled to reconnect.
+    let kicked = if body.kick { state.family.sessions().kick_user(&name) } else { 0 };
+
+    Ok(Json(json!({ "updated": name, "kicked": kicked })))
+}
+
+/// End every live session belonging to a user.
+///
+/// Graceful by construction: each session stops at its next statement
+/// boundary, because ending one mid-response would return a half-read backend
+/// to the pool. A client running a long query goes when that query finishes.
+async fn kick_user(State(state): State<AdminState>, Path(name): Path<String>) -> Result<impl IntoResponse, ApiError> {
+    if !state.store.load().users.contains_key(&name) {
+        return Err(ApiError::NotFound(format!("user '{name}'")));
+    }
+    let kicked = state.family.sessions().kick_user(&name);
+    Ok(Json(json!({ "user": name, "kicked": kicked })))
+}
+
+/// Who is connected right now.
+async fn list_sessions(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(json!({ "sessions": state.family.sessions().snapshot() }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -881,6 +989,126 @@ mod tests {
         let (_, listed) = get(&app, "/api/v1/users").await;
         assert_eq!(listed["users"][0]["has_password"], true);
         assert!(!listed.to_string().contains("hunter2"));
+    }
+
+    #[tokio::test]
+    async fn editing_a_user_changes_only_what_was_sent() {
+        let (app, state) = app();
+        post(&app, "/api/v1/pools", pool_payload()).await;
+        post(
+            &app,
+            "/api/v1/users",
+            json!({ "name": "svc_orders", "password": "hunter2", "pools": ["app_main"], "read_only": true }),
+        )
+        .await;
+
+        let (status, body) = patch(&app, "/api/v1/users/svc_orders", json!({ "disabled": true })).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+
+        let user = state.store.load().users.get("svc_orders").cloned().unwrap();
+        assert!(user.disabled);
+        assert!(user.read_only, "an absent field means leave it alone, not reset it");
+        assert_eq!(user.pools, vec!["app_main".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn editing_a_user_can_rotate_the_password_without_storing_it() {
+        let (app, state) = app();
+        post(&app, "/api/v1/pools", pool_payload()).await;
+        post(&app, "/api/v1/users", json!({ "name": "svc", "password": "old", "pools": ["app_main"] })).await;
+        let before = state.store.load().secrets.get(&state.master_key, &havuz_secrets::user_verifier("svc")).unwrap();
+
+        let (status, _) = patch(&app, "/api/v1/users/svc", json!({ "password": "new" })).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let after = state.store.load().secrets.get(&state.master_key, &havuz_secrets::user_verifier("svc")).unwrap();
+        assert_ne!(before, after, "the verifier must actually change");
+        assert!(!after.contains("new"), "the password itself is never stored");
+    }
+
+    #[tokio::test]
+    async fn a_user_cannot_be_edited_into_a_state_it_could_never_connect_from() {
+        let (app, _) = app();
+        post(&app, "/api/v1/pools", pool_payload()).await;
+        post(&app, "/api/v1/users", json!({ "name": "svc", "password": "p", "pools": ["app_main"] })).await;
+
+        // Zero grants means every handshake fails. Deleting is the honest way
+        // to say that.
+        let (status, _) = patch(&app, "/api/v1/users/svc", json!({ "pools": [] })).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // And a grant to a pool that does not exist is rejected by validation.
+        let (status, _) = patch(&app, "/api/v1/users/svc", json!({ "pools": ["ghost"] })).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let (status, _) = patch(&app, "/api/v1/users/svc", json!({ "password": "" })).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn editing_an_unknown_user_is_a_404() {
+        let (app, _) = app();
+        let (status, _) = patch(&app, "/api/v1/users/ghost", json!({ "disabled": true })).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let (status, _) = post(&app, "/api/v1/users/ghost/kick", json!({})).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn kicking_reports_how_many_sessions_it_ended() {
+        let (app, state) = app();
+        post(&app, "/api/v1/pools", pool_payload()).await;
+        post(&app, "/api/v1/users", json!({ "name": "svc", "password": "p", "pools": ["app_main"] })).await;
+
+        // Nobody is connected yet, and saying so is more useful than an error.
+        let (status, body) = post(&app, "/api/v1/users/svc/kick", json!({})).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["kicked"], 0);
+
+        let sessions = state.family.sessions();
+        let _a = sessions.register("svc", "app_main", None, "10.0.0.1:5000", 0).unwrap();
+        let _b = sessions.register("svc", "app_main", None, "10.0.0.2:5000", 0).unwrap();
+        let _other = sessions.register("someone_else", "app_main", None, "10.0.0.3:5000", 0).unwrap();
+
+        let (_, listed) = get(&app, "/api/v1/users").await;
+        let svc = listed["users"].as_array().unwrap().iter().find(|u| u["name"] == "svc").unwrap();
+        assert_eq!(svc["live_sessions"], 2, "the page must show what disabling this user would interrupt");
+
+        let (_, body) = post(&app, "/api/v1/users/svc/kick", json!({})).await;
+        assert_eq!(body["kicked"], 2, "and only this user's sessions");
+    }
+
+    #[tokio::test]
+    async fn disabling_a_user_can_end_its_sessions_in_the_same_request() {
+        // Disabling only refuses the next handshake. An operator revoking
+        // access during an incident means now.
+        let (app, state) = app();
+        post(&app, "/api/v1/pools", pool_payload()).await;
+        post(&app, "/api/v1/users", json!({ "name": "svc", "password": "p", "pools": ["app_main"] })).await;
+
+        let sessions = state.family.sessions();
+        let live = sessions.register("svc", "app_main", None, "10.0.0.1:5000", 0).unwrap();
+
+        let (status, body) = patch(&app, "/api/v1/users/svc", json!({ "disabled": true, "kick": true })).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["kicked"], 1);
+        assert!(state.store.load().users["svc"].disabled);
+        assert!(live.signal().is_kicked());
+    }
+
+    #[tokio::test]
+    async fn live_sessions_are_listed_for_an_operator() {
+        let (app, state) = app();
+        let sessions = state.family.sessions();
+        let _live = sessions.register("svc", "app_main", Some("orders-api"), "10.0.0.1:5000", 0).unwrap();
+
+        let (status, body) = get(&app, "/api/v1/sessions").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["sessions"][0]["user"], "svc");
+        assert_eq!(body["sessions"][0]["pool"], "app_main");
+        assert_eq!(body["sessions"][0]["application"], "orders-api");
+        assert_eq!(body["sessions"][0]["client_addr"], "10.0.0.1:5000");
     }
 
     #[tokio::test]

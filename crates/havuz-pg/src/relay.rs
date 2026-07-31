@@ -21,6 +21,7 @@ use bytes::{Buf, Bytes, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::protocol::Message;
+use crate::sessions::KickSignal;
 use crate::stream::MaybeTls;
 use crate::trace::{TraceContext, TraceSpan, TraceStore};
 
@@ -41,11 +42,14 @@ pub struct RelayStats {
     pub client_terminated: bool,
     /// The backend hung up. Whatever the reason, it cannot go back in the pool.
     pub backend_closed: bool,
+    /// An operator ended this session. The relay stopped wherever it was, so
+    /// the backend's framing position is unknown and it must not be recycled.
+    pub kicked: bool,
 }
 
 /// Shovel bytes between a client and its backend until either side is done.
 pub async fn session_relay(client: &mut MaybeTls, backend: &mut MaybeTls) -> io::Result<RelayStats> {
-    session_relay_inner(client, backend, None).await
+    session_relay_inner(client, backend, None, KickSignal::never()).await
 }
 
 pub async fn session_relay_traced(
@@ -55,15 +59,22 @@ pub async fn session_relay_traced(
     context: &TraceContext,
     target: String,
     backend_pid: Option<u32>,
+    kick: KickSignal,
 ) -> io::Result<RelayStats> {
-    session_relay_inner(client, backend, Some(SessionTrace::new(traces.clone(), context.clone(), target, backend_pid)))
-        .await
+    session_relay_inner(
+        client,
+        backend,
+        Some(SessionTrace::new(traces.clone(), context.clone(), target, backend_pid)),
+        kick,
+    )
+    .await
 }
 
 async fn session_relay_inner(
     client: &mut MaybeTls,
     backend: &mut MaybeTls,
     mut trace: Option<SessionTrace>,
+    mut kick: KickSignal,
 ) -> io::Result<RelayStats> {
     // Split so the two directions can be driven concurrently without aliasing
     // the same stream.
@@ -77,6 +88,16 @@ async fn session_relay_inner(
 
     loop {
         tokio::select! {
+            // Session mode has no statement boundaries to wait for: this is a
+            // byte shovel, and the backend may be mid-response at any instant.
+            // So a kick here cannot leave the connection reusable, and the
+            // caller discards it. That is the price of ending a session that
+            // owns its backend outright — one reconnect, not a poisoned pool.
+            _ = kick.kicked() => {
+                stats.kicked = true;
+                break;
+            }
+
             // `read` is cancel-safe, so losing this branch to the other one
             // cannot drop bytes. The writes happen inside the branch body,
             // where nothing can cancel them.

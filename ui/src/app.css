@@ -26,7 +26,7 @@
   --color-positive: var(--positive);
   --color-warning: var(--warning);
   --color-negative: var(--negative);
-  --font-sans: "IBM Plex Sans", "Segoe UI", ui-sans-serif, system-ui, sans-serif;
+  --font-sans: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
   --font-mono: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
 }
 
@@ -80,7 +80,7 @@
   }
 
   h2 {
-    @apply mb-3 mt-8 text-sm font-semibold uppercase tracking-[0.12em] text-muted;
+    @apply mb-3 mt-8 text-sm font-semibold text-ink;
   }
 
   code {
@@ -93,20 +93,18 @@
     @apply min-h-screen lg:grid lg:grid-cols-[240px_minmax(0,1fr)];
   }
 
+  /* Solid, not translucent. A backdrop blur here is decoration: nothing
+     meaningful ever shows through a sidebar. */
   .sidebar {
-    @apply sticky top-0 z-20 border-b border-line bg-panel/95 px-3 py-3 backdrop-blur lg:h-screen lg:border-b-0 lg:border-r lg:px-4 lg:py-6;
+    @apply sticky top-0 z-20 border-b border-line bg-panel px-3 py-3 lg:h-screen lg:border-b-0 lg:border-r lg:px-4 lg:py-6;
   }
 
   .brand {
-    @apply flex items-center gap-3 px-2 pb-3 text-base font-semibold tracking-[-0.02em] lg:pb-8;
+    @apply flex items-center gap-3 px-2 pb-3 text-base font-semibold lg:pb-8;
   }
 
   .brand-mark {
-    @apply grid size-9 shrink-0 place-items-center rounded-lg bg-accent font-mono text-sm font-bold text-canvas shadow-[0_0_32px_color-mix(in_srgb,var(--accent)_25%,transparent)];
-  }
-
-  .brand small {
-    @apply block text-[10px] font-normal uppercase tracking-[0.12em] text-muted;
+    @apply grid size-9 shrink-0 place-items-center rounded-md bg-accent font-mono text-sm font-bold text-canvas;
   }
 
   .nav {
@@ -114,35 +112,30 @@
   }
 
   .nav a {
-    @apply flex w-full cursor-pointer items-center justify-between rounded-md border-0 bg-transparent px-2.5 py-2 text-left text-xs text-muted transition-colors hover:bg-panel-raised hover:text-ink lg:mb-1 lg:text-[13px];
+    @apply flex w-full cursor-pointer items-center rounded-md border-0 bg-transparent px-2.5 py-2 text-left text-xs text-muted transition-colors hover:bg-panel-raised hover:text-ink lg:mb-0.5 lg:text-[13px];
   }
 
   .nav a.active {
     @apply bg-panel-raised font-medium text-ink shadow-[inset_2px_0_0_var(--accent)];
   }
 
-  .nav-marker {
-    @apply hidden font-mono text-[9px] text-muted/70 sm:inline;
-  }
-
   .sidebar-foot {
-    @apply mt-5 hidden items-center gap-2 border-t border-line px-2 pt-4 text-[10px] uppercase tracking-[0.1em] text-muted lg:absolute lg:bottom-6 lg:left-4 lg:right-4 lg:flex;
+    @apply mt-5 hidden items-center gap-2 border-t border-line px-2 pt-4 text-xs text-muted lg:absolute lg:bottom-6 lg:left-4 lg:right-4 lg:flex;
   }
 
   .status-dot {
-    @apply size-1.5 rounded-full bg-positive shadow-[0_0_8px_var(--positive)];
+    @apply size-1.5 rounded-full bg-positive;
   }
 
+  /* No horizontal scrolling here. A wide table must scroll inside its own
+     container (`.table-scroll`); letting it scroll the page instead drags the
+     heading, the filters and the pagination sideways with it. */
   main {
-    @apply min-w-0 overflow-x-auto px-4 py-6 sm:px-6 lg:px-10 lg:py-9 xl:px-12;
+    @apply min-w-0 overflow-x-clip px-4 py-6 sm:px-6 lg:px-10 lg:py-9 xl:px-12;
   }
 
   .page-heading {
     @apply mb-7 flex flex-wrap items-end justify-between gap-4;
-  }
-
-  .eyebrow {
-    @apply mb-1 font-mono text-[10px] font-medium uppercase tracking-[0.2em] text-accent;
   }
 
   .subtitle {
@@ -157,25 +150,24 @@
     @apply mb-7 grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-6;
   }
 
+  /* A number and its name. The border does the separating; a shadow would only
+     make it float. */
   .card {
-    @apply relative overflow-hidden rounded-lg border border-line bg-panel px-4 py-4 shadow-[0_12px_40px_rgba(0,0,0,0.08)];
+    @apply rounded-lg border border-line bg-panel px-4 py-4;
   }
 
   .card .label {
-    @apply text-[10px] font-medium uppercase tracking-[0.14em] text-muted;
+    @apply text-xs font-medium text-muted;
   }
 
   .card .value {
-    @apply mt-1 font-mono text-2xl font-semibold tabular-nums tracking-[-0.04em] sm:text-3xl;
+    @apply mt-1 font-mono text-2xl font-semibold tabular-nums sm:text-3xl;
   }
 
+  /* The one card that is currently a problem. Marked by colour on the number
+     and the border, which is the whole hierarchy it needs. */
   .card.hero {
-    @apply border-accent/70 bg-[linear-gradient(145deg,color-mix(in_srgb,var(--accent)_12%,var(--panel)),var(--panel))];
-  }
-
-  .card.hero::after {
-    content: "";
-    @apply absolute -right-8 -top-8 size-20 rounded-full bg-accent/15 blur-xl;
+    @apply border-accent;
   }
 
   .card.hero .value {
@@ -183,7 +175,14 @@
   }
 
   .card .hint {
-    @apply mt-1 text-[11px] leading-snug text-muted;
+    @apply mt-1 text-xs leading-snug text-muted;
+  }
+
+  /* Every table lives in one of these. Tables carry a min-width so their
+     columns stay readable, which means something has to absorb the overflow —
+     and it has to be the table, not the page. */
+  .table-scroll {
+    @apply w-full max-w-full overflow-x-auto;
   }
 
   table {
@@ -196,7 +195,7 @@
   }
 
   th {
-    @apply bg-panel-raised/60 text-[9px] font-semibold uppercase tracking-[0.14em] text-muted;
+    @apply bg-panel-raised/60 text-xs font-semibold text-muted;
   }
 
   tbody tr {
@@ -208,7 +207,7 @@
   }
 
   .badge {
-    @apply inline-flex items-center rounded-full border border-line px-2 py-0.5 font-mono text-[10px] text-muted;
+    @apply inline-flex items-center rounded border border-line px-1.5 py-0.5 font-mono text-xs text-muted;
   }
 
   .badge.ok {
@@ -281,7 +280,7 @@
   }
 
   .family-card {
-    @apply cursor-pointer rounded-lg border border-line bg-panel p-4 text-left text-ink transition-all hover:-translate-y-0.5 hover:border-accent/70 disabled:cursor-not-allowed disabled:opacity-40;
+    @apply cursor-pointer rounded-lg border border-line bg-panel p-4 text-left text-ink transition-colors hover:border-accent disabled:cursor-not-allowed disabled:opacity-40;
   }
 
   .family-card .name {
@@ -301,7 +300,7 @@
   }
 
   .connection-picker {
-    @apply overflow-hidden rounded-xl border border-line bg-panel shadow-[0_24px_70px_rgba(0,0,0,0.18)];
+    @apply overflow-hidden rounded-lg border border-line bg-panel;
   }
 
   .connection-toolbar {
@@ -313,7 +312,7 @@
   }
 
   .view-switch button {
-    @apply cursor-pointer bg-panel-raised px-3 py-2 font-mono text-[10px] uppercase tracking-wider text-muted transition hover:text-ink;
+    @apply cursor-pointer bg-panel-raised px-3 py-2 text-xs text-muted transition-colors hover:text-ink;
   }
 
   .view-switch button + button {
@@ -337,7 +336,7 @@
   }
 
   .catalog-count {
-    @apply ml-auto pb-2 font-mono text-[10px] uppercase tracking-wider text-muted;
+    @apply ml-auto pb-2 text-xs text-muted;
   }
 
   .catalog-layout {
@@ -353,11 +352,11 @@
   }
 
   .catalog-categories button.active {
-    @apply bg-accent/10 font-semibold text-accent;
+    @apply bg-panel-raised font-medium text-ink;
   }
 
   .catalog-categories small {
-    @apply font-mono text-[9px] opacity-70;
+    @apply font-mono text-xs text-muted;
   }
 
   .database-catalog {
@@ -373,7 +372,7 @@
   }
 
   .database-type-card.available {
-    @apply cursor-pointer opacity-100 hover:-translate-y-0.5 hover:border-accent/70 hover:bg-accent/5 hover:shadow-[0_10px_30px_rgba(0,0,0,0.16)];
+    @apply cursor-pointer opacity-100 hover:border-accent hover:bg-panel-raised;
   }
 
   .database-catalog.list .database-type-card {
@@ -381,7 +380,7 @@
   }
 
   .database-mark {
-    @apply flex size-10 shrink-0 items-center justify-center rounded-xl border border-line bg-panel-raised;
+    @apply flex size-10 shrink-0 items-center justify-center rounded-md border border-line bg-panel-raised;
   }
 
   .database-mark svg {
@@ -402,7 +401,7 @@
   }
 
   .database-card-copy small {
-    @apply font-mono text-[9px] uppercase tracking-wider text-muted;
+    @apply text-xs text-muted;
   }
 
   .database-type-card > .badge {
@@ -414,7 +413,7 @@
   }
 
   .back-link {
-    @apply mb-4 cursor-pointer font-mono text-[10px] uppercase tracking-wider text-muted transition hover:text-accent;
+    @apply mb-4 cursor-pointer text-xs text-muted transition-colors hover:text-ink;
   }
 
   .back-link::before {
@@ -434,7 +433,7 @@
   }
 
   .form-section {
-    @apply grid gap-6 rounded-xl border border-line bg-panel p-5 lg:grid-cols-[220px_1fr] lg:p-7;
+    @apply grid gap-6 rounded-lg border border-line bg-panel p-5 lg:grid-cols-[220px_1fr] lg:p-7;
   }
 
   .form-section-heading {
@@ -442,7 +441,7 @@
   }
 
   .form-section-heading > span {
-    @apply mt-0.5 font-mono text-[10px] text-accent;
+    @apply mt-0.5 font-mono text-xs text-muted;
   }
 
   .form-section-heading h2 {
@@ -470,7 +469,7 @@
   }
 
   .config-panel {
-    @apply mt-5 grid gap-5 rounded-lg border border-accent/30 bg-panel p-5 shadow-[0_18px_50px_rgba(0,0,0,0.12)];
+    @apply mt-5 grid gap-5 rounded-lg border border-line bg-panel p-5;
   }
 
   .config-panel h2 {
@@ -502,7 +501,7 @@
   }
 
   .mode-guide-head span {
-    @apply font-mono text-[8px] uppercase tracking-wider text-accent;
+    @apply text-xs text-muted;
   }
 
   .mode-guide p {
@@ -510,7 +509,7 @@
   }
 
   .mode-guide small {
-    @apply block text-[10px] leading-relaxed text-muted/80;
+    @apply block text-xs leading-relaxed text-muted;
   }
 
   .trace-filters {
@@ -527,7 +526,7 @@
   }
 
   .live-count {
-    @apply grid size-7 place-items-center rounded-full border border-accent/40 bg-accent/10 font-mono text-xs text-accent;
+    @apply grid size-7 place-items-center rounded-md border border-line bg-panel-raised font-mono text-xs text-muted;
   }
 
   .live-count.has-blockers {
@@ -557,7 +556,7 @@
 
   .pressure-head span,
   .pressure-meta {
-    @apply font-mono text-[9px] text-muted;
+    @apply font-mono text-xs text-muted;
   }
 
   .pressure-bar {
@@ -565,7 +564,7 @@
   }
 
   .pressure-bar i {
-    @apply block h-full rounded-full bg-accent transition-all;
+    @apply block h-full rounded-full bg-accent transition-[width];
   }
 
   .pressure-grid article.hot .pressure-bar i {
@@ -601,7 +600,7 @@
   }
 
   .active-trace {
-    @apply rounded-lg border border-accent/30 bg-[linear-gradient(135deg,color-mix(in_srgb,var(--accent)_7%,var(--panel)),var(--panel))] p-4 shadow-[0_16px_50px_rgba(0,0,0,0.1)];
+    @apply rounded-lg border border-line bg-panel-raised p-4;
   }
 
   .active-trace-top {
@@ -618,7 +617,7 @@
   }
 
   .trace-meta {
-    @apply mt-3 flex flex-wrap gap-x-4 gap-y-1 font-mono text-[10px] text-muted;
+    @apply mt-3 flex flex-wrap gap-x-4 gap-y-1 font-mono text-xs text-muted;
   }
 
   .trace-empty {
@@ -626,7 +625,7 @@
   }
 
   .trace-table {
-    @apply min-w-[1100px];
+    @apply min-w-[1000px];
   }
 
   .history-summary {
@@ -634,7 +633,7 @@
   }
 
   .trace-pagination {
-    @apply mt-3 flex flex-wrap items-center justify-end gap-4 border-t border-line pt-3 font-mono text-[10px] uppercase tracking-wider text-muted;
+    @apply mt-3 flex flex-wrap items-center justify-end gap-4 border-t border-line pt-3 text-xs text-muted;
   }
 
   .trace-pagination label {
@@ -650,7 +649,7 @@
   }
 
   .history-summary span {
-    @apply text-[9px] font-medium uppercase tracking-[0.13em] text-muted;
+    @apply text-xs font-medium text-muted;
   }
 
   .history-summary strong {
@@ -661,8 +660,11 @@
     @apply text-negative;
   }
 
+  /* The SQL column is the one that would grow without bound, so it is capped
+     and the text truncated. The full statement is one click away in the
+     detail panel. */
   .trace-query-cell {
-    @apply flex max-w-[430px] items-center gap-2;
+    @apply flex w-[clamp(220px,32vw,430px)] items-center gap-2;
   }
 
   .trace-sql {
@@ -670,15 +672,15 @@
   }
 
   .copy-button {
-    @apply shrink-0 cursor-pointer rounded border border-transparent bg-transparent px-1.5 py-1 font-mono text-[9px] uppercase tracking-wider text-muted transition hover:border-line hover:bg-panel-raised hover:text-accent;
+    @apply shrink-0 cursor-pointer rounded border border-transparent bg-transparent px-1.5 py-1 text-xs text-muted transition hover:border-line hover:bg-panel-raised hover:text-accent;
   }
 
   .trace-detail-backdrop {
-    @apply fixed inset-0 z-50 flex items-end justify-end bg-canvas/75 p-0 backdrop-blur-sm sm:p-4;
+    @apply fixed inset-0 z-50 flex items-end justify-end bg-canvas/80 p-0 sm:p-4;
   }
 
   .trace-detail {
-    @apply h-[94vh] w-full overflow-y-auto border border-line bg-panel p-5 shadow-2xl sm:max-w-4xl sm:rounded-xl lg:p-7;
+    @apply h-[94vh] w-full overflow-y-auto border border-line bg-panel p-5 sm:max-w-4xl sm:rounded-lg lg:p-7;
   }
 
   .trace-detail-head {
@@ -694,7 +696,7 @@
   }
 
   .trace-detail-metrics span {
-    @apply text-[9px] uppercase tracking-[0.14em] text-muted;
+    @apply text-xs text-muted;
   }
 
   .trace-detail-metrics strong {
@@ -702,7 +704,7 @@
   }
 
   .result-heading {
-    @apply mb-2 mt-6 flex items-center justify-between text-xs font-semibold uppercase tracking-[0.12em] text-muted;
+    @apply mb-2 mt-6 flex items-center justify-between text-xs font-semibold text-muted;
   }
 
   .result-scroll {
@@ -723,6 +725,20 @@
 
   .result-table td.null-cell {
     @apply italic text-muted;
+  }
+
+  /* An inline editor opened from a table row. */
+  .edit-panel {
+    @apply rounded-lg border border-line bg-panel-raised/40 p-4;
+  }
+
+  .edit-panel .field:last-of-type {
+    @apply mb-4;
+  }
+
+  /* A disabled user is still listed, but should not read as active. */
+  tbody tr.dimmed td:not(:last-child) {
+    @apply opacity-55;
   }
 
   .muted {

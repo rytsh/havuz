@@ -16,9 +16,17 @@
 //! **No reset between transactions.** Recycling with `DISCARD ALL` after every
 //! transaction would add a round trip to every single one and undo most of the
 //! benefit. It is unnecessary because anything that dirties a connection —
-//! `SET`, `LISTEN`, temp tables, advisory locks — is classified as a pin, and a
-//! pinned connection is never shared. The reset happens once, when the client
-//! finally goes away.
+//! `LISTEN`, temp tables, advisory locks — is classified as a pin, and a pinned
+//! connection is never shared. The reset happens once, when the client finally
+//! goes away.
+//!
+//! **Session parameters move with the client, not with the backend.** `SET` is
+//! the exception to the rule above, and it is the exception that decides
+//! whether transaction mode works at all: every driver sends two or three on
+//! connect, so pinning on them meant a pool of two backends was permanently
+//! owned by the first two clients. Instead each client carries the parameters
+//! it asked for, each backend remembers the ones it has, and a checkout that
+//! finds a difference sends the delta first. See [`crate::params`].
 //!
 //! **A backend is only borrowed when there is work.** An idle client holds
 //! nothing. That is the entire source of the fan-in.
@@ -31,10 +39,12 @@ use crate::backend::PgConnector;
 use crate::classify::{classify, route_intent, ClientIntent, RouteIntent};
 use crate::group::PoolGroup;
 use crate::holder::HolderHandle;
+use crate::params::{self, ClientParams, SetAction};
 use crate::prepared::{ClientStatements, Rewrite};
 use crate::protocol::{sqlstate, Message, TransactionStatus};
 use crate::relay::RelayStats;
 use crate::routing::{PrimaryReason, Route, SessionRouting};
+use crate::sessions::KickSignal;
 use crate::stream::MaybeTls;
 use crate::trace::{TraceContext, TraceSpan, TraceStore};
 
@@ -51,6 +61,27 @@ pub struct TxnOutcome {
     pub checkouts: u64,
     /// Exchanges a replica handled.
     pub to_replica: u64,
+    /// Checkouts that had to carry session parameters over to a backend that
+    /// did not already have them. This is what replacing the pin costs, so it
+    /// is worth being able to see.
+    pub param_syncs: u64,
+}
+
+/// How a session is allowed to behave, beyond what its statements ask for.
+#[derive(Debug, Clone, Default)]
+pub struct SessionPolicy {
+    /// Refuse anything that would let this session write. The writes
+    /// themselves are refused by PostgreSQL; this only closes the statements
+    /// that would turn the setting back off.
+    pub read_only: bool,
+    /// Resolves when an operator ends this session.
+    pub kick: KickSignal,
+}
+
+impl Default for KickSignal {
+    fn default() -> Self {
+        Self::never()
+    }
 }
 
 /// Relay a client session in transaction mode.
@@ -58,25 +89,31 @@ pub async fn transaction_relay(
     client: &mut MaybeTls,
     group: &PoolGroup,
     state: &mut SessionState,
+    params: &mut ClientParams,
 ) -> ProtoResult<TxnOutcome> {
-    transaction_relay_inner(client, group, state, None, None).await
+    transaction_relay_inner(client, group, state, params, SessionPolicy::default(), None, None).await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn transaction_relay_traced(
     client: &mut MaybeTls,
     group: &PoolGroup,
     state: &mut SessionState,
+    params: &mut ClientParams,
+    policy: SessionPolicy,
     traces: &std::sync::Arc<TraceStore>,
     context: &TraceContext,
     holder: &HolderHandle,
 ) -> ProtoResult<TxnOutcome> {
-    transaction_relay_inner(client, group, state, Some((traces, context)), Some(holder)).await
+    transaction_relay_inner(client, group, state, params, policy, Some((traces, context)), Some(holder)).await
 }
 
 async fn transaction_relay_inner(
     client: &mut MaybeTls,
     group: &PoolGroup,
     state: &mut SessionState,
+    params: &mut ClientParams,
+    mut policy: SessionPolicy,
     tracing: Option<(&std::sync::Arc<TraceStore>, &TraceContext)>,
     holder: Option<&HolderHandle>,
 ) -> ProtoResult<TxnOutcome> {
@@ -85,6 +122,7 @@ async fn transaction_relay_inner(
     let mut exchanges = 0u64;
     let mut checkouts = 0u64;
     let mut to_replica = 0u64;
+    let mut param_syncs = 0u64;
     let mut statements = ClientStatements::new();
     let mut routing = SessionRouting::new();
     let mut current_route = Route::Primary(PrimaryReason::SplitDisabled);
@@ -100,12 +138,63 @@ async fn transaction_relay_inner(
     loop {
         // Read one client message. While this is pending we hold no backend
         // unless a transaction is open or the session is pinned.
-        let msg = match Message::read(client).await {
-            Ok(msg) => msg,
-            Err(_) => break,
+        //
+        // This is also the one place a kick may take effect. Anywhere else the
+        // backend could be halfway through a response, and dropping the relay
+        // there would return a connection with unread bytes to the pool — the
+        // next client would receive the tail of this one's result set. Waiting
+        // until the client is between statements costs an operator the time of
+        // one query and keeps the pool intact.
+        let msg = tokio::select! {
+            biased;
+            _ = policy.kick.kicked() => {
+                let _ = Message::fatal(
+                    sqlstate::ADMIN_SHUTDOWN,
+                    "terminating connection due to administrator command",
+                )
+                .write(client)
+                .await;
+                break;
+            }
+            read = Message::read(client) => match read {
+                Ok(msg) => msg,
+                Err(_) => break,
+            },
         };
 
         let intent = classify(&msg);
+
+        // A read-only user gets `default_transaction_read_only`, and PostgreSQL
+        // does the actual refusing. That only holds while the client cannot
+        // turn the setting back off, so the statements that would are answered
+        // here and never forwarded.
+        if policy.read_only {
+            if let Some(sql) = param_sql(&msg) {
+                if params::defeats_read_only(&sql) {
+                    let detail = "this user is read-only; the session cannot be made writable";
+                    let _ = Message::error_response("ERROR", sqlstate::READ_ONLY_SQL_TRANSACTION, detail)
+                        .write(client)
+                        .await;
+                    let _ = Message::ready_for_query(if state.in_transaction() {
+                        TransactionStatus::Failed
+                    } else {
+                        TransactionStatus::Idle
+                    })
+                    .write(client)
+                    .await;
+                    if let Some((traces, context)) = tracing {
+                        traces.record_failure(
+                            context,
+                            &sql,
+                            std::time::Duration::ZERO,
+                            sqlstate::READ_ONLY_SQL_TRANSACTION,
+                            detail,
+                        );
+                    }
+                    continue;
+                }
+            }
+        }
 
         if intent == ClientIntent::Terminate {
             stats.client_terminated = true;
@@ -120,6 +209,13 @@ async fn transaction_relay_inner(
 
         if let ClientIntent::Pins(reason) = intent {
             state.observe(FlowEvent::MustPin(reason));
+        }
+
+        // Note what this message would do to the session's parameters. Staged
+        // rather than applied: the server has not seen it yet, and a statement
+        // that errors changes nothing.
+        if let Some(sql) = param_sql(&msg) {
+            stage_params(params, state, &sql);
         }
 
         if trace_span.is_none() {
@@ -161,7 +257,7 @@ async fn transaction_relay_inner(
             }
 
             match acquired {
-                Ok(checkout) => {
+                Ok(mut checkout) => {
                     checkouts += 1;
                     if matches!(current_route, Route::Replica(_)) {
                         to_replica += 1;
@@ -169,6 +265,35 @@ async fn transaction_relay_inner(
                     if let Some(span) = trace_span.as_mut() {
                         span.assign(group.target_label(current_route), checkout.backend_pid());
                     }
+
+                    // This backend may have been someone else's a microsecond
+                    // ago. Carry the client's session parameters over before
+                    // its statement runs against the wrong search_path.
+                    match sync_params(&mut checkout, params).await {
+                        Ok(ParamSync::Unchanged) => {}
+                        Ok(ParamSync::Applied) => param_syncs += 1,
+                        Ok(ParamSync::Refused(detail)) => {
+                            // The delta is a multi-statement simple query, so
+                            // an implicit transaction rolled all of it back.
+                            // The backend is clean and goes back to the pool;
+                            // it is the request that cannot be honoured.
+                            let message = format!("cannot apply session parameters: {detail}");
+                            if let Some(span) = trace_span.take() {
+                                span.fail(sqlstate::INVALID_PARAMETER_VALUE, &message);
+                            }
+                            let _ = Message::fatal(sqlstate::INVALID_PARAMETER_VALUE, &message).write(client).await;
+                            return Err(ProtoError::backend(message));
+                        }
+                        Err(e) => {
+                            // An I/O failure leaves the framing position
+                            // unknown, so this connection cannot be reused.
+                            checkout.discard();
+                            group.router().record_result(current_route, false);
+                            let _ = Message::fatal(sqlstate::CANNOT_CONNECT_NOW, &e.to_string()).write(client).await;
+                            return Err(e);
+                        }
+                    }
+
                     held = Some(checkout);
                 }
                 Err(e) => {
@@ -283,10 +408,10 @@ async fn transaction_relay_inner(
         // Pump the answer through until the server says it is ready again.
         let client_bytes_before = stats.to_client;
         match pump_until_ready(client, checkout, &mut stats, trace_span.as_mut()).await {
-            Ok(status) => {
+            Ok(end) => {
                 exchanges += 1;
                 group.router().record_result(current_route, true);
-                match status {
+                match end.status {
                     TransactionStatus::Idle => {
                         state.observe(FlowEvent::Idle);
                         routing.end_transaction();
@@ -297,6 +422,7 @@ async fn transaction_relay_inner(
                         routing.begin_transaction(current_route);
                     }
                 }
+                settle_params(params, checkout, end.errored);
                 update_holder(holder, state, group, current_route, checkout);
                 if let Some(span) = trace_span.take() {
                     span.succeed();
@@ -338,6 +464,23 @@ async fn transaction_relay_inner(
                         span.assign(group.target_label(current_route), checkout.backend_pid());
                     }
 
+                    // The replay lands on a different backend, so it needs the
+                    // client's parameters just as much as the original did.
+                    match sync_params(&mut checkout, params).await {
+                        Ok(ParamSync::Unchanged) => {}
+                        Ok(ParamSync::Applied) => param_syncs += 1,
+                        Ok(ParamSync::Refused(detail)) => {
+                            let message = format!("cannot apply session parameters: {detail}");
+                            let _ = Message::fatal(sqlstate::INVALID_PARAMETER_VALUE, &message).write(client).await;
+                            return Err(ProtoError::backend(message));
+                        }
+                        Err(e) => {
+                            checkout.discard();
+                            let _ = Message::fatal(sqlstate::CANNOT_CONNECT_NOW, &e.to_string()).write(client).await;
+                            return Err(e);
+                        }
+                    }
+
                     for buffered in &exchange {
                         let outgoing = match rewrite_prepared(buffered, &mut statements, &checkout) {
                             Ok(Rewrite::Unchanged) => buffered.clone(),
@@ -374,10 +517,10 @@ async fn transaction_relay_inner(
                         .map_err(|e| ProtoError::backend(format!("replaying exchange: {e}")))?;
 
                     match pump_until_ready(client, &mut checkout, &mut stats, trace_span.as_mut()).await {
-                        Ok(status) => {
+                        Ok(end) => {
                             exchanges += 1;
                             group.router().record_result(current_route, true);
-                            match status {
+                            match end.status {
                                 TransactionStatus::Idle => {
                                     state.observe(FlowEvent::Idle);
                                     routing.end_transaction();
@@ -387,6 +530,7 @@ async fn transaction_relay_inner(
                                     routing.begin_transaction(current_route);
                                 }
                             }
+                            settle_params(params, &mut checkout, end.errored);
                             update_holder(holder, state, group, current_route, &checkout);
                             if let Some(span) = trace_span.take() {
                                 span.succeed();
@@ -436,7 +580,139 @@ async fn transaction_relay_inner(
         }
     }
 
-    Ok(TxnOutcome { stats, exchanges, pinned: state.pin(), checkouts, to_replica })
+    Ok(TxnOutcome { stats, exchanges, pinned: state.pin(), checkouts, to_replica, param_syncs })
+}
+
+/// Everything one client message would do to the session's parameters.
+///
+/// Only `Query` and `Parse` carry statement text. A `Bind` names a statement
+/// whose `Parse` was already staged, so reading it again would count the same
+/// `SET` twice.
+fn param_sql(msg: &Message) -> Option<String> {
+    match msg.tag {
+        b'Q' => {
+            let end = msg.body.iter().position(|byte| *byte == 0).unwrap_or(msg.body.len());
+            Some(String::from_utf8_lossy(&msg.body[..end]).into_owned())
+        }
+        b'P' => {
+            let mut parts = msg.body.splitn(3, |byte| *byte == 0);
+            parts.next()?;
+            Some(String::from_utf8_lossy(parts.next()?).into_owned())
+        }
+        _ => None,
+    }
+}
+
+/// Stage what a statement would do, without believing it yet.
+fn stage_params(params: &mut ClientParams, state: &mut SessionState, sql: &str) {
+    let actions = params::actions_for_sql(sql);
+    if actions.is_empty() {
+        return;
+    }
+
+    // A `SET` inside an explicit transaction may be undone by a `ROLLBACK` we
+    // cannot see coming, and nothing on the wire distinguishes a transaction
+    // that committed from one that did not. Rather than guess, pin: `SET LOCAL`
+    // is the idiom for changing a parameter inside a transaction anyway, and it
+    // is free.
+    if state.in_transaction() {
+        state.observe(FlowEvent::MustPin(PinReason::SessionParameter));
+        return;
+    }
+
+    for action in actions {
+        // `classify` has already turned an unreplayable statement into a pin;
+        // staging it here would only double-count the observation.
+        if !matches!(action, SetAction::Pin(_)) {
+            params.stage(action);
+        }
+    }
+}
+
+/// Believe — or forget — the staged parameter changes now that the server has
+/// answered.
+fn settle_params(params: &mut ClientParams, checkout: &mut Checkout<PgConnector>, errored: bool) {
+    if !params.has_pending() {
+        return;
+    }
+    if errored {
+        // A single statement that fails applies nothing, and a batch is an
+        // implicit transaction, so a failure anywhere in it rolls all of it
+        // back. Either way the client's parameters are what they were.
+        params.discard_pending();
+        return;
+    }
+    params.commit_pending();
+    // The client's own `SET` reached this backend directly, so it is now in
+    // step with the client without us having replayed anything.
+    checkout.set_applied_params(params.desired().clone());
+}
+
+/// Outcome of bringing a backend in line with a client's session parameters.
+pub(crate) enum ParamSync {
+    /// The backend already matched. The common case once a client settles onto
+    /// a pool, and the reason this is not a round trip per transaction.
+    Unchanged,
+    /// The delta was applied.
+    Applied,
+    /// The server refused it. Nothing was applied, so the backend is still
+    /// clean; it is the client's request that cannot be honoured.
+    Refused(String),
+}
+
+/// Carry a client's session parameters onto the backend it just borrowed.
+///
+/// Sent as one simple query, so a delta of any size costs a single round trip,
+/// and only when there is a delta at all.
+///
+/// The replies are consumed rather than forwarded. The client did not ask for
+/// these statements, and the `ParameterStatus` messages they produce describe
+/// changes it never made — including the resets that undo the *previous*
+/// client's parameters.
+pub(crate) async fn sync_params(checkout: &mut Checkout<PgConnector>, params: &ClientParams) -> ProtoResult<ParamSync> {
+    let statements = params.delta(checkout.applied_params());
+    if statements.is_empty() {
+        return Ok(ParamSync::Unchanged);
+    }
+
+    let sql = statements.join("; ");
+    let mut body = Vec::with_capacity(sql.len() + 1);
+    body.extend_from_slice(sql.as_bytes());
+    body.push(0);
+
+    let stream = checkout.stream_mut();
+    stream
+        .write_all(&Message::new(b'Q', bytes::Bytes::from(body)).encode())
+        .await
+        .map_err(|e| ProtoError::backend(format!("applying session parameters: {e}")))?;
+    stream.flush().await.map_err(|e| ProtoError::backend(format!("applying session parameters: {e}")))?;
+
+    let mut failure = None;
+    loop {
+        let reply = Message::read(checkout.stream_mut())
+            .await
+            .map_err(|e| ProtoError::backend(format!("applying session parameters: {e}")))?;
+        match reply.tag {
+            // ReadyForQuery: the whole batch has been answered.
+            b'Z' => break,
+            b'E' => {
+                failure = reply
+                    .error_fields()
+                    .into_iter()
+                    .find(|(field, _)| *field == b'M')
+                    .map(|(_, text)| text)
+                    .or_else(|| Some("backend rejected the parameter".into()));
+            }
+            _ => continue,
+        }
+    }
+
+    if let Some(detail) = failure {
+        return Ok(ParamSync::Refused(format!("{detail} (while running: {sql})")));
+    }
+
+    checkout.set_applied_params(params.desired().clone());
+    Ok(ParamSync::Applied)
 }
 
 fn update_holder(
@@ -611,19 +887,31 @@ async fn close_statement(checkout: &mut Checkout<PgConnector>, global_name: &str
     }
 }
 
+/// How an exchange ended.
+struct ExchangeEnd {
+    status: TransactionStatus,
+    /// The server reported an error. Since a lone statement that fails applies
+    /// nothing, and a batch is an implicit transaction that rolls back as a
+    /// unit, this means the exchange changed no session state.
+    errored: bool,
+}
+
 /// Copy backend output to the client until `ReadyForQuery`.
 async fn pump_until_ready(
     client: &mut MaybeTls,
     checkout: &mut Checkout<PgConnector>,
     stats: &mut RelayStats,
     mut trace: Option<&mut TraceSpan>,
-) -> ProtoResult<TransactionStatus> {
+) -> ProtoResult<ExchangeEnd> {
+    let mut errored = false;
+
     loop {
         let msg = Message::read(checkout.stream_mut())
             .await
             .map_err(|e| ProtoError::backend(format!("reading from backend: {e}")))?;
 
         let status = msg.transaction_status();
+        errored |= msg.tag == b'E';
         if let Some(span) = trace.as_mut() {
             span.observe(&msg);
         }
@@ -636,7 +924,7 @@ async fn pump_until_ready(
 
         if let Some(status) = status {
             client.flush().await.map_err(ProtoError::Io)?;
-            return Ok(status);
+            return Ok(ExchangeEnd { status, errored });
         }
 
         // `CopyInResponse` and `CopyBothResponse` hand the connection over to a
@@ -645,7 +933,7 @@ async fn pump_until_ready(
         // backend will not be shared.
         if matches!(msg.tag, b'G' | b'W') {
             client.flush().await.map_err(ProtoError::Io)?;
-            return Ok(TransactionStatus::InTransaction);
+            return Ok(ExchangeEnd { status: TransactionStatus::InTransaction, errored });
         }
     }
 }
@@ -676,6 +964,10 @@ mod tests {
         /// Statements this server actually executed. The only way to prove a
         /// read reached a replica rather than the primary.
         queries: Arc<AtomicUsize>,
+        /// The text of those statements, per backend connection. Session
+        /// parameters are only really carried over if the replay lands on the
+        /// backend that did not have them, and this is what shows that.
+        log: Arc<std::sync::Mutex<Vec<String>>>,
     }
 
     impl FakeServer {
@@ -684,14 +976,17 @@ mod tests {
             let addr = listener.local_addr().unwrap();
             let connections = Arc::new(AtomicUsize::new(0));
             let queries = Arc::new(AtomicUsize::new(0));
+            let log = Arc::new(std::sync::Mutex::new(Vec::new()));
             let counter = connections.clone();
             let query_counter = queries.clone();
+            let query_log = log.clone();
 
             tokio::spawn(async move {
                 loop {
                     let Ok((mut socket, _)) = listener.accept().await else { return };
                     counter.fetch_add(1, Ordering::Relaxed);
                     let query_counter = query_counter.clone();
+                    let query_log = query_log.clone();
 
                     tokio::spawn(async move {
                         // Startup: read the packet, answer AuthenticationOk and
@@ -721,8 +1016,10 @@ mod tests {
                             match msg.tag {
                                 b'X' => return,
                                 b'Q' => {
-                                    let sql = String::from_utf8_lossy(&msg.body).to_uppercase();
+                                    let text = String::from_utf8_lossy(&msg.body).trim_end_matches('\0').to_string();
+                                    let sql = text.to_uppercase();
                                     query_counter.fetch_add(1, Ordering::Relaxed);
+                                    query_log.lock().unwrap().push(text);
                                     if sql.starts_with("BEGIN") {
                                         in_txn = true;
                                     } else if sql.starts_with("COMMIT") || sql.starts_with("ROLLBACK") {
@@ -731,9 +1028,19 @@ mod tests {
                                     let status =
                                         if in_txn { TransactionStatus::InTransaction } else { TransactionStatus::Idle };
                                     let mut out = Vec::new();
-                                    out.extend_from_slice(
-                                        &Message::new(b'C', Bytes::from_static(b"SELECT 1\0")).encode(),
-                                    );
+                                    // A statement the fake is told to reject, so
+                                    // the failure paths can be exercised without
+                                    // a real server.
+                                    if sql.contains("BOOM") {
+                                        out.extend_from_slice(
+                                            &Message::error_response("ERROR", "42601", "syntax error at or near boom")
+                                                .encode(),
+                                        );
+                                    } else {
+                                        out.extend_from_slice(
+                                            &Message::new(b'C', Bytes::from_static(b"SELECT 1\0")).encode(),
+                                        );
+                                    }
                                     out.extend_from_slice(&Message::ready_for_query(status).encode());
                                     if socket.write_all(&out).await.is_err() {
                                         return;
@@ -753,7 +1060,7 @@ mod tests {
                 }
             });
 
-            Self { addr, connections, queries }
+            Self { addr, connections, queries, log }
         }
 
         fn opened(&self) -> usize {
@@ -762,6 +1069,11 @@ mod tests {
 
         fn queries(&self) -> usize {
             self.queries.load(Ordering::Relaxed)
+        }
+
+        /// Every statement this server ran, in order.
+        fn log(&self) -> Vec<String> {
+            self.log.lock().unwrap().clone()
         }
 
         fn pool(&self, max_size: u32) -> Arc<PoolGroup> {
@@ -833,6 +1145,15 @@ mod tests {
 
     /// Drive a client session against the relay and return its outcome.
     async fn run_session(group: Arc<PoolGroup>, script: Vec<Message>) -> (TxnOutcome, Vec<u8>) {
+        run_session_with(group, ClientParams::new(), script).await
+    }
+
+    /// Drive a client session that arrived with startup parameters.
+    async fn run_session_with(
+        group: Arc<PoolGroup>,
+        mut params: ClientParams,
+        script: Vec<Message>,
+    ) -> (TxnOutcome, Vec<u8>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -840,7 +1161,7 @@ mod tests {
             let (socket, _) = listener.accept().await.unwrap();
             let mut client = MaybeTls::Plain(socket);
             let mut state = SessionState::new(PoolMode::Transaction);
-            transaction_relay(&mut client, &group, &mut state).await.unwrap()
+            transaction_relay(&mut client, &group, &mut state, &mut params).await.unwrap()
         });
 
         let mut client = TcpStream::connect(addr).await.unwrap();
@@ -950,7 +1271,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_set_statement_pins_the_session_for_good() {
+    async fn a_set_statement_does_not_cost_the_backend() {
         let server = FakeServer::start().await;
         let pool = server.pool(3);
 
@@ -965,9 +1286,377 @@ mod tests {
         )
         .await;
 
-        assert_eq!(outcome.pinned, Some(PinReason::SessionParameter));
-        assert_eq!(outcome.checkouts, 1, "once pinned the backend is never given back, so later statements reuse it");
+        assert_eq!(outcome.pinned, None, "a session parameter has a name, so it can travel instead of pinning");
+        assert_eq!(outcome.checkouts, 3, "the backend goes back after every statement, SET included");
         assert_eq!(outcome.exchanges, 3);
+    }
+
+    #[tokio::test]
+    async fn the_scenario_this_was_built_for_a_driver_preamble_over_a_tiny_pool() {
+        // Every driver sends two or three SETs on connect. While those pinned,
+        // a pool of two was owned forever by the first two clients and every
+        // other client timed out — the pooler was unusable in exactly the
+        // configuration it exists for.
+        let server = FakeServer::start().await;
+        let pool = server.pool(2);
+
+        let mut tasks = Vec::new();
+        for i in 0..20 {
+            let pool = pool.clone();
+            tasks.push(tokio::spawn(async move {
+                run_session(
+                    pool,
+                    vec![
+                        query(&format!("SET application_name = 'client-{i}'")),
+                        query("SET extra_float_digits = 3"),
+                        query("SELECT 1"),
+                        Message::terminate(),
+                    ],
+                )
+                .await
+            }));
+        }
+
+        for task in tasks {
+            let (outcome, _) = task.await.unwrap();
+            assert_eq!(outcome.pinned, None);
+            assert_eq!(outcome.exchanges, 3);
+        }
+
+        assert!(server.opened() <= 2, "20 clients with a driver preamble opened {} backends", server.opened());
+    }
+
+    #[tokio::test]
+    async fn a_session_parameter_follows_the_client_onto_the_next_backend() {
+        let server = FakeServer::start().await;
+        let pool = server.pool(2);
+
+        // Two clients, each holding a backend, so the second session is
+        // guaranteed to land on a connection that never saw the first one's
+        // SET. Without replay its SELECT would run under the wrong search_path.
+        let (first, _) =
+            run_session(pool.clone(), vec![query("SET search_path TO app"), query("SELECT 1"), Message::terminate()])
+                .await;
+        assert_eq!(first.pinned, None);
+
+        let (second, _) =
+            run_session(pool.clone(), vec![query("SET search_path TO other"), query("SELECT 2"), Message::terminate()])
+                .await;
+        assert_eq!(second.pinned, None);
+
+        let log = server.log();
+        assert!(
+            log.iter().any(|sql| sql == "SET search_path TO app"),
+            "the client's own statement reaches the backend: {log:?}"
+        );
+        assert!(
+            log.iter().filter(|sql| sql.contains("search_path")).count() >= 2,
+            "each client's search_path must be in force for its own SELECT: {log:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_client_never_inherits_another_clients_parameters() {
+        let server = FakeServer::start().await;
+        // A single backend, so the second client is certain to get the one the
+        // first client left its search_path on.
+        let pool = server.pool(1);
+
+        run_session(pool.clone(), vec![query("SET search_path TO app"), Message::terminate()]).await;
+        let (second, _) = run_session(pool.clone(), vec![query("SELECT 1"), Message::terminate()]).await;
+
+        assert_eq!(second.param_syncs, 1, "the second client asked for nothing, so the first one's SET must be undone");
+        assert!(
+            server.log().iter().any(|sql| sql == "RESET search_path"),
+            "leaking a search_path between clients is a correctness bug, not a performance one: {:?}",
+            server.log()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_backend_that_already_matches_costs_no_round_trip() {
+        let server = FakeServer::start().await;
+        let pool = server.pool(1);
+
+        let (outcome, _) = run_session(
+            pool.clone(),
+            vec![
+                query("SET search_path TO app"),
+                query("SELECT 1"),
+                query("SELECT 2"),
+                query("SELECT 3"),
+                Message::terminate(),
+            ],
+        )
+        .await;
+
+        assert_eq!(outcome.checkouts, 4);
+        assert_eq!(
+            outcome.param_syncs, 0,
+            "the client keeps landing on the backend it just used, so there is nothing to carry over"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_parameters_reach_the_backend() {
+        // Previously read during the handshake and thrown away, which is why a
+        // connection string that set search_path silently did nothing.
+        let server = FakeServer::start().await;
+        let pool = server.pool(1);
+
+        let params = ClientParams::from_startup(&[
+            ("user".into(), "svc_orders".into()),
+            ("options".into(), "-c search_path=app".into()),
+        ]);
+        let (outcome, _) = run_session_with(pool.clone(), params, vec![query("SELECT 1"), Message::terminate()]).await;
+
+        assert_eq!(outcome.param_syncs, 1);
+        assert!(server.log().iter().any(|sql| sql == "SET search_path = 'app'"), "got {:?}", server.log());
+    }
+
+    #[tokio::test]
+    async fn a_set_that_the_server_rejects_is_never_replayed() {
+        // Believing a SET before the server accepts it would leave us
+        // reapplying a value the client does not have — and failing every
+        // checkout from then on.
+        let server = FakeServer::start().await;
+        let pool = server.pool(1);
+
+        let (outcome, _) =
+            run_session(pool.clone(), vec![query("SET search_path TO boom"), query("SELECT 1"), Message::terminate()])
+                .await;
+
+        assert_eq!(outcome.pinned, None);
+        assert_eq!(outcome.param_syncs, 0, "a failed SET changed nothing, so there is nothing to carry");
+        assert!(!server.log().iter().any(|sql| sql.starts_with("RESET")), "and nothing to undo either");
+    }
+
+    #[tokio::test]
+    async fn a_set_inside_an_open_transaction_still_pins() {
+        // A ROLLBACK would undo it, and nothing on the wire distinguishes a
+        // transaction that committed from one that did not. SET LOCAL is the
+        // idiom here and it is free.
+        let server = FakeServer::start().await;
+        let pool = server.pool(3);
+
+        let (outcome, _) = run_session(
+            pool.clone(),
+            vec![query("BEGIN"), query("SET search_path TO app"), query("ROLLBACK"), Message::terminate()],
+        )
+        .await;
+
+        assert_eq!(outcome.pinned, Some(PinReason::SessionParameter));
+    }
+
+    // --- read-only users and kicks ---
+
+    /// Drive a session under a policy, returning the client socket so the test
+    /// can keep talking after the script.
+    async fn open_policy_session(
+        group: Arc<PoolGroup>,
+        policy: SessionPolicy,
+    ) -> (TcpStream, tokio::task::JoinHandle<ProtoResult<TxnOutcome>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let relay = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut client = MaybeTls::Plain(socket);
+            let mut state = SessionState::new(PoolMode::Transaction);
+            let mut params = ClientParams::new();
+            if policy.read_only {
+                params.enforce_read_only();
+            }
+            transaction_relay_inner(&mut client, &group, &mut state, &mut params, policy, None, None).await
+        });
+
+        (TcpStream::connect(addr).await.unwrap(), relay)
+    }
+
+    /// Send one simple query and collect reply tags up to ReadyForQuery.
+    async fn exchange(client: &mut TcpStream, sql: &str) -> Vec<u8> {
+        client.write_all(&query(sql).encode()).await.unwrap();
+        let mut tags = Vec::new();
+        loop {
+            let reply = Message::read(client).await.unwrap();
+            tags.push(reply.tag);
+            if reply.tag == b'Z' {
+                return tags;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_read_only_user_gets_the_guc_and_postgres_does_the_refusing() {
+        // havuz does not decide what a write is. It sets the parameter and lets
+        // the server apply its own rules, which is the only way a write hidden
+        // inside a function is caught.
+        let server = FakeServer::start().await;
+        let pool = server.pool(2);
+
+        let (mut client, relay) =
+            open_policy_session(pool.clone(), SessionPolicy { read_only: true, kick: KickSignal::never() }).await;
+
+        exchange(&mut client, "SELECT 1").await;
+        drop(client);
+        relay.await.unwrap().unwrap();
+
+        assert!(
+            server.log().iter().any(|sql| sql == "SET default_transaction_read_only = 'on'"),
+            "the backend must be told before the client's statement runs: {:?}",
+            server.log()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_read_only_user_cannot_make_its_session_writable() {
+        // The setting is only a default, so every statement that would override
+        // it has to be answered by havuz and never forwarded.
+        let server = FakeServer::start().await;
+        let pool = server.pool(2);
+
+        let (mut client, relay) =
+            open_policy_session(pool.clone(), SessionPolicy { read_only: true, kick: KickSignal::never() }).await;
+
+        for escape in [
+            "SET default_transaction_read_only = off",
+            "RESET ALL",
+            "BEGIN READ WRITE",
+            "SET TRANSACTION READ WRITE",
+            "SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE",
+        ] {
+            let tags = exchange(&mut client, escape).await;
+            assert_eq!(tags, vec![b'E', b'Z'], "{escape:?} must be refused, got {tags:?}");
+        }
+
+        // An ordinary read is untouched.
+        assert_eq!(exchange(&mut client, "SELECT 1").await, vec![b'C', b'Z']);
+        drop(client);
+        relay.await.unwrap().unwrap();
+
+        let log = server.log();
+        assert!(
+            !log.iter().any(|sql| sql.to_uppercase().contains("READ WRITE")),
+            "no escape attempt may reach the backend: {log:?}"
+        );
+        assert!(!log.iter().any(|sql| sql == "RESET ALL"), "RESET ALL would clear the setting: {log:?}");
+    }
+
+    #[tokio::test]
+    async fn an_idle_session_is_kicked_as_soon_as_it_is_signalled() {
+        let server = FakeServer::start().await;
+        let pool = server.pool(2);
+        let registry = crate::sessions::SessionRegistry::new();
+        let session = registry.register("svc_orders", "app_main", None, "127.0.0.1:5000", 0).unwrap();
+
+        let (mut client, relay) =
+            open_policy_session(pool.clone(), SessionPolicy { read_only: false, kick: session.signal() }).await;
+
+        // Establish that the session is working before ending it.
+        assert_eq!(exchange(&mut client, "SELECT 1").await, vec![b'C', b'Z']);
+
+        assert_eq!(registry.kick_user("svc_orders"), 1);
+
+        // The client learns why it was disconnected rather than seeing the
+        // socket simply vanish.
+        let goodbye = tokio::time::timeout(Duration::from_secs(2), Message::read(&mut client))
+            .await
+            .expect("a kicked client must be told promptly")
+            .expect("and told, not dropped");
+        let fields = goodbye.error_fields();
+        assert_eq!(goodbye.tag, b'E');
+        assert!(fields.iter().any(|(f, v)| *f == b'C' && v == "57P01"), "got {fields:?}");
+        assert!(fields.iter().any(|(f, v)| *f == b'M' && v.contains("administrator command")), "got {fields:?}");
+
+        relay.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_kick_never_returns_a_half_read_backend_to_the_pool() {
+        // The whole reason a kick is graceful. If it aborted mid-response, the
+        // Checkout would go back on the shelf with unread bytes and the next
+        // client would receive the tail of this one's result set.
+        let server = FakeServer::start().await;
+        let pool = server.pool(1);
+        let registry = crate::sessions::SessionRegistry::new();
+        let session = registry.register("svc_orders", "app_main", None, "127.0.0.1:5000", 0).unwrap();
+
+        let (mut client, relay) =
+            open_policy_session(pool.clone(), SessionPolicy { read_only: false, kick: session.signal() }).await;
+        exchange(&mut client, "SELECT 1").await;
+
+        registry.kick_user("svc_orders");
+        let _ = Message::read(&mut client).await;
+        relay.await.unwrap().unwrap();
+
+        // The single backend survived, so a later client reuses it rather than
+        // paying for a reconnect against a connection we poisoned.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let snapshot = pool.combined_pool_snapshot();
+        assert_eq!(snapshot.discarded_total, 0, "the backend was at a message boundary and stayed usable");
+        assert_eq!(snapshot.idle, 1);
+
+        let (outcome, _) = run_session(pool.clone(), vec![query("SELECT 2"), Message::terminate()]).await;
+        assert_eq!(outcome.exchanges, 1);
+        assert_eq!(server.opened(), 1, "the kick cost nobody a reconnect");
+    }
+
+    #[tokio::test]
+    async fn a_session_kicked_before_it_speaks_still_goes() {
+        // The flag is latched, so a kick that lands while the client is silent
+        // is not lost.
+        let server = FakeServer::start().await;
+        let pool = server.pool(1);
+        let registry = crate::sessions::SessionRegistry::new();
+        let session = registry.register("svc_orders", "app_main", None, "127.0.0.1:5000", 0).unwrap();
+        registry.kick_user("svc_orders");
+
+        let (mut client, relay) =
+            open_policy_session(pool.clone(), SessionPolicy { read_only: false, kick: session.signal() }).await;
+
+        let goodbye = tokio::time::timeout(Duration::from_secs(2), Message::read(&mut client))
+            .await
+            .expect("an already-kicked session must not wait for input")
+            .unwrap();
+        assert_eq!(goodbye.tag, b'E');
+        relay.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_unkicked_session_is_never_disturbed() {
+        let server = FakeServer::start().await;
+        let pool = server.pool(2);
+        let registry = crate::sessions::SessionRegistry::new();
+        let mine = registry.register("svc_orders", "app_main", None, "a", 0).unwrap();
+        let _theirs = registry.register("svc_reports", "app_main", None, "b", 0).unwrap();
+
+        let (mut client, relay) =
+            open_policy_session(pool.clone(), SessionPolicy { read_only: false, kick: mine.signal() }).await;
+
+        // Kicking a different user must leave this session alone.
+        assert_eq!(registry.kick_user("svc_reports"), 1);
+        assert_eq!(exchange(&mut client, "SELECT 1").await, vec![b'C', b'Z']);
+        assert_eq!(exchange(&mut client, "SELECT 2").await, vec![b'C', b'Z']);
+
+        drop(client);
+        let outcome = relay.await.unwrap().unwrap();
+        assert_eq!(outcome.exchanges, 2);
+    }
+
+    #[tokio::test]
+    async fn changing_the_effective_role_still_pins() {
+        let server = FakeServer::start().await;
+        let pool = server.pool(3);
+
+        let (outcome, _) =
+            run_session(pool.clone(), vec![query("SET ROLE readonly"), query("SELECT 1"), Message::terminate()]).await;
+
+        assert_eq!(
+            outcome.pinned,
+            Some(PinReason::SessionParameter),
+            "replaying a permission change would make a replay bug a privilege leak"
+        );
+        assert_eq!(outcome.checkouts, 1);
     }
 
     #[tokio::test]
@@ -1023,7 +1712,7 @@ mod tests {
             let (socket, _) = listener.accept().await.unwrap();
             let mut client = MaybeTls::Plain(socket);
             let mut state = SessionState::new(PoolMode::Transaction);
-            transaction_relay(&mut client, &pool, &mut state).await.unwrap()
+            transaction_relay(&mut client, &pool, &mut state, &mut ClientParams::new()).await.unwrap()
         });
 
         let mut client = TcpStream::connect(addr).await.unwrap();
@@ -1191,7 +1880,7 @@ mod tests {
             let (socket, _) = listener.accept().await.unwrap();
             let mut client = MaybeTls::Plain(socket);
             let mut state = SessionState::new(PoolMode::Transaction);
-            transaction_relay(&mut client, &relay_pool, &mut state).await.unwrap()
+            transaction_relay(&mut client, &relay_pool, &mut state, &mut ClientParams::new()).await.unwrap()
         });
 
         // Occupy one backend so the next checkout is forced onto a second one.
@@ -1260,7 +1949,7 @@ mod tests {
             let (socket, _) = listener.accept().await.unwrap();
             let mut client = MaybeTls::Plain(socket);
             let mut state = SessionState::new(PoolMode::Transaction);
-            transaction_relay(&mut client, &pool, &mut state).await.unwrap()
+            transaction_relay(&mut client, &pool, &mut state, &mut ClientParams::new()).await.unwrap()
         });
 
         let mut client = TcpStream::connect(addr).await.unwrap();
@@ -1345,7 +2034,7 @@ mod tests {
             let (socket, _) = listener.accept().await.unwrap();
             let mut client = MaybeTls::Plain(socket);
             let mut state = SessionState::new(PoolMode::Transaction);
-            transaction_relay(&mut client, &group, &mut state).await.unwrap()
+            transaction_relay(&mut client, &group, &mut state, &mut ClientParams::new()).await.unwrap()
         });
 
         async fn exchange(c: &mut TcpStream, m: Message) {

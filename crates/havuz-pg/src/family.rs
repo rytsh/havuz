@@ -25,6 +25,7 @@ use crate::holder::HolderRegistry;
 use crate::protocol::{sqlstate, Message};
 use crate::scram::ScramVerifier;
 use crate::session::{complete_startup, AuthDenial, Authenticator, ClientHandshake, HandshakeOutcome};
+use crate::sessions::SessionRegistry;
 use crate::trace::{TraceContext, TraceError, TraceStore};
 
 const CANCEL_TIMEOUT: Duration = Duration::from_secs(3);
@@ -43,6 +44,7 @@ pub struct PgFamily {
     listener_routes: RwLock<HashMap<u16, String>>,
     live_clients: Arc<AtomicU64>,
     max_clients: AtomicU64,
+    sessions: Arc<SessionRegistry>,
     handshake: ClientHandshake<StateAuthenticator>,
 }
 
@@ -105,8 +107,14 @@ impl PgFamily {
             listener_routes: RwLock::new(HashMap::new()),
             live_clients: Arc::new(AtomicU64::new(0)),
             max_clients: AtomicU64::new(u64::MAX),
+            sessions: SessionRegistry::new(),
             handshake: ClientHandshake::new(authenticator),
         })
+    }
+
+    /// Who is connected right now, and the only way to disconnect them.
+    pub fn sessions(&self) -> &Arc<SessionRegistry> {
+        &self.sessions
     }
 
     pub fn cancels(&self) -> &Arc<CancelRegistry> {
@@ -384,7 +392,7 @@ impl ProtocolFamily for PgFamily {
         let forced_pool = self.listener_routes.read().expect("listener routes poisoned").get(&local_port).cloned();
         let (mut client, outcome) = self.handshake.run_for_pool(io, peer, forced_pool.as_deref()).await?;
 
-        let (identity, _params) = match outcome {
+        let (identity, startup_params) = match outcome {
             HandshakeOutcome::Cancel { process_id, secret_key } => {
                 // Unauthenticated by design: the key pair is the credential.
                 // An unknown key cancels nothing, which is the whole point of
@@ -411,6 +419,37 @@ impl ProtocolFamily for PgFamily {
             return Err(ProtoError::NoRoute(identity.pool));
         };
 
+        // What this user is allowed to do, read once at connect time. Changing
+        // it later takes effect on the next connection — and, for anything
+        // urgent, on a kick.
+        let (read_only, session_limit) = self
+            .state
+            .load()
+            .users
+            .get(&identity.user)
+            .map(|user| (user.read_only, user.max_client_connections))
+            .unwrap_or((false, 0));
+
+        // The per-user connection budget. Counted here rather than at accept
+        // time because that is the first point the user is known.
+        let session = match self.sessions.register(
+            &identity.user,
+            &identity.pool,
+            identity.application_name.as_deref(),
+            &identity.peer.to_string(),
+            session_limit,
+        ) {
+            Ok(session) => session,
+            Err(havuz_pg_too_many) => {
+                let text = format!(
+                    "too many connections for user \"{}\" (limit {})",
+                    havuz_pg_too_many.user, havuz_pg_too_many.limit
+                );
+                let _ = Message::fatal(sqlstate::TOO_MANY_CONNECTIONS, &text).write(&mut client).await;
+                return Err(ProtoError::backend(text));
+            }
+        };
+
         let mode = self.pool_mode(&identity.pool);
         let trace_context = TraceContext {
             pool: identity.pool.clone(),
@@ -427,12 +466,20 @@ impl ProtocolFamily for PgFamily {
         let checkout_started = Instant::now();
         let acquire = group.primary().acquire();
         tokio::pin!(acquire);
+        let mut startup_kick = session.signal();
         let checkout_result = tokio::select! {
             result = &mut acquire => result,
             disconnected = client.wait_for_disconnect() => {
                 return Err(ProtoError::Io(disconnected.err().unwrap_or_else(|| {
                     std::io::Error::new(std::io::ErrorKind::ConnectionAborted, "client disconnected while waiting for a backend")
                 })));
+            }
+            // A client queued behind an exhausted pool holds no backend, so it
+            // is the cheapest possible thing to kick.
+            _ = startup_kick.kicked() => {
+                let text = "terminating connection due to administrator command";
+                let _ = Message::fatal(sqlstate::ADMIN_SHUTDOWN, text).write(&mut client).await;
+                return Err(ProtoError::backend(text));
             }
         };
         let mut checkout = match checkout_result {
@@ -466,6 +513,21 @@ impl ProtocolFamily for PgFamily {
 
         complete_startup(&mut client, checkout.parameters(), cancel_key.process_id, cancel_key.secret_key).await?;
 
+        // The client's own startup parameters. They never reached a backend
+        // before this: the handshake read them, used `application_name` for
+        // logging and dropped the rest, so a connection string carrying
+        // `?options=-c search_path%3Dapp` silently did nothing.
+        let mut params = crate::params::ClientParams::from_startup(&startup_params);
+
+        // Enforced by PostgreSQL, not by guessing which statements are writes:
+        // no classifier can see the INSERT inside a SELECT that calls a
+        // function, and `default_transaction_read_only` does not have to.
+        if read_only {
+            params.enforce_read_only();
+        }
+
+        let policy = crate::txn::SessionPolicy { read_only, kick: session.signal() };
+
         let outcome = if mode.multiplexes() {
             // Transaction mode: the startup checkout has done its job (the
             // client needed a real backend's parameters), so give it straight
@@ -479,6 +541,8 @@ impl ProtocolFamily for PgFamily {
                 &mut client,
                 &group,
                 &mut state,
+                &mut params,
+                policy,
                 &self.traces,
                 &trace_context,
                 &holder,
@@ -503,6 +567,25 @@ impl ProtocolFamily for PgFamily {
             // Session mode: bytes are shovelled in both directions, with just
             // enough framing awareness to stop the client's Terminate from
             // reaching — and killing — a backend we want to reuse.
+            //
+            // The backend is exclusive here, so there is nothing to multiplex,
+            // but the client's startup parameters still have to be applied:
+            // this connection came out of a pool and carries whoever used it
+            // last.
+            match crate::txn::sync_params(&mut checkout, &params).await {
+                Ok(crate::txn::ParamSync::Unchanged | crate::txn::ParamSync::Applied) => {}
+                Ok(crate::txn::ParamSync::Refused(detail)) => {
+                    let text = format!("cannot apply session parameters: {detail}");
+                    let _ = Message::fatal(sqlstate::INVALID_PARAMETER_VALUE, &text).write(&mut client).await;
+                    return Err(ProtoError::backend(text));
+                }
+                Err(e) => {
+                    checkout.discard();
+                    let _ = Message::fatal(sqlstate::CANNOT_CONNECT_NOW, &e.to_string()).write(&mut client).await;
+                    return Err(e);
+                }
+            }
+
             let backend_pid = checkout.backend_pid();
             let target =
                 group.target_label(crate::routing::Route::Primary(crate::routing::PrimaryReason::SplitDisabled));
@@ -514,13 +597,18 @@ impl ProtocolFamily for PgFamily {
                 &trace_context,
                 target,
                 backend_pid,
+                session.signal(),
             )
             .await;
             self.cancels.unregister(cancel_key);
 
             let (to_backend, to_client) = match relay {
                 Ok(stats) => {
-                    if stats.backend_closed {
+                    // A kicked byte shovel stops wherever it was, so the
+                    // backend's framing position is unknown. Resetting it would
+                    // mean reading replies to a statement that may still be
+                    // interleaved with the last response.
+                    if stats.backend_closed || stats.kicked {
                         checkout.discard();
                     }
                     (stats.to_backend, stats.to_client)

@@ -13,7 +13,7 @@
    */
   const advice: Record<PinReason, string> = {
     session_parameter:
-      "A SET outside a transaction. Usually a driver option — asyncpg, JDBC and Npgsql all set server settings on connect. Use SET LOCAL, or move the setting to the pool's backend connection.",
+      "A SET havuz cannot replay onto another backend. Ordinary SETs are carried over automatically and cost nothing; this is one of the exceptions — SET ROLE, SET SESSION AUTHORIZATION, a value supplied through a bind parameter, or a SET issued inside an open transaction. Use SET LOCAL inside transactions, and set the role on the pool's backend account rather than per session.",
     listen: "LISTEN makes the connection a notification target, so it can never be shared. Use a dedicated connection outside the pool for listeners.",
     temp_table: "Temporary tables live in a per-connection schema. Consider an unlogged table, or a CTE.",
     advisory_lock: "Session-level advisory locks outlive the transaction. pg_advisory_xact_lock does not, and is safe here.",
@@ -100,6 +100,7 @@
     {/if}
 
     <h2>By reason</h2>
+    <div class="table-scroll">
     <table>
       <thead>
         <tr><th>Reason</th><th>Sessions</th><th>What to do</th></tr>
@@ -114,6 +115,7 @@
         {/each}
       </tbody>
     </table>
+    </div>
 
     <h2>
       By client
@@ -126,6 +128,7 @@
     {#if visible.length === 0}
       <p class="muted">Nothing actionable. Every remaining pin comes from something that cannot be avoided.</p>
     {:else}
+      <div class="table-scroll">
       <table>
         <thead>
           <tr>
@@ -151,6 +154,7 @@
           {/each}
         </tbody>
       </table>
+      </div>
     {/if}
 
     {#if report.truncated}

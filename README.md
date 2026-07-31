@@ -92,20 +92,31 @@ ui/                Svelte + Vite dashboard (22 kB gzipped).
 ### The feature that does not exist elsewhere
 
 Transaction-mode pooling degrades silently. A pool configured for 100 clients
-over 3 backends will happily run as 100-over-100 if the application issues `SET
-application_name` on connect, and every pooler dashboard in existence will show
-a healthy pool the whole time.
+over 3 backends will happily run as 100-over-100, and every pooler dashboard in
+existence will show a healthy pool the whole time.
 
-havuz classifies every statement that leaves something behind on a connection —
-`SET`, `LISTEN`, temp tables, session advisory locks, `PREPARE`, holdable
-cursors — and reports who did it:
+The usual cause is `SET`. Every driver sends two or three on connect — asyncpg,
+JDBC, Npgsql and most ORMs all do — and a pooler that pins on them hands the
+whole pool to the first few clients that connect.
+
+**havuz carries session parameters instead of pinning on them.** Each client
+keeps the parameters it asked for, each backend remembers the ones it has, and a
+checkout that finds a difference sends the delta before the client's statement.
+A client that lands back on the backend it just used pays nothing. Startup
+parameters, including `?options=-c search_path%3Dapp`, are applied the same way.
+
+What is left over genuinely cannot move: `LISTEN`, temp tables, session advisory
+locks, `PREPARE`, holdable cursors, and the handful of `SET` spellings that
+cannot be replayed — `SET ROLE`, `SET SESSION AUTHORIZATION`, a value passed as
+a bind parameter, or a `SET` inside an open transaction that a `ROLLBACK` might
+undo. Those pin, and havuz reports who did it:
 
 ```
 GET /api/v1/pins
 
 pin rate 50%: 2 pinned / 2 clean
-  session_parameter  2   svc_orders/orders-api
-  listen             1   svc_orders/notifier
+  listen             2   svc_orders/notifier
+  temp_table         1   svc_reports/etl
 ```
 
 That is a sentence an operator can act on, rather than "your pool is full".
@@ -163,8 +174,8 @@ looking for `BEGIN` and `COMMIT` means reimplementing the server's rules about
 implicit transactions, aborted blocks and savepoints, and being wrong
 occasionally. There is also no reset between transactions: that would add a
 round trip to every one of them, and it is unnecessary because anything that
-dirties a connection is classified as a pin, and pinned connections are never
-shared.
+dirties a connection is either carried over with the client (session
+parameters) or classified as a pin, and pinned connections are never shared.
 
 **The data path has its own codec.** `tokio-postgres` is a client library: it
 parses, buffers and reinterprets. A pooler relays frames. Putting a client

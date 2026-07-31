@@ -1,4 +1,14 @@
-import type { Family, GroupSnapshot, PinReport, Pool, Summary, TraceDetail, TraceResponse, User } from "./types";
+import type {
+  Family,
+  GroupSnapshot,
+  LiveSession,
+  PinReport,
+  Pool,
+  Summary,
+  TraceDetail,
+  TraceResponse,
+  User,
+} from "./types";
 
 /**
  * Bearer token for a remote admin listener.
@@ -78,7 +88,15 @@ export const api = {
     ),
 
   createUser: (body: unknown) => request<{ name: string }>("/api/v1/users", { method: "POST", body: JSON.stringify(body) }),
+  updateUser: (name: string, body: unknown) =>
+    request<{ updated: string; kicked: number }>(`/api/v1/users/${encodeURIComponent(name)}`, {
+      method: "PATCH",
+      body: JSON.stringify(body),
+    }),
   deleteUser: (name: string) => request<unknown>(`/api/v1/users/${encodeURIComponent(name)}`, { method: "DELETE" }),
+  kickUser: (name: string) =>
+    request<{ user: string; kicked: number }>(`/api/v1/users/${encodeURIComponent(name)}/kick`, { method: "POST" }),
+  sessions: () => request<{ sessions: LiveSession[] }>("/api/v1/sessions").then((r) => r.sessions),
 };
 
 /** Human-readable fan-in, e.g. `33.3x`. */

@@ -406,6 +406,12 @@ pub mod sqlstate {
     pub const CANNOT_CONNECT_NOW: &str = "57P03";
     pub const PROTOCOL_VIOLATION: &str = "08P01";
     pub const ADMIN_SHUTDOWN: &str = "57P01";
+    /// Raised when a session parameter the client asked for cannot be applied
+    /// to the backend it landed on.
+    pub const INVALID_PARAMETER_VALUE: &str = "22023";
+    /// What PostgreSQL itself raises for a write in a read-only transaction.
+    /// havuz reuses it when refusing a statement that would escape `read_only`.
+    pub const READ_ONLY_SQL_TRANSACTION: &str = "25006";
 }
 
 #[cfg(test)]

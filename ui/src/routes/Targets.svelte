@@ -53,7 +53,6 @@
 </script>
 
 <h1>Targets</h1>
-<p class="subtitle">Replica health, replication lag, and where statements actually went.</p>
 
 {#if error}
   <div class="error">{error}</div>
@@ -103,6 +102,7 @@
   </div>
 
   <h2>Targets</h2>
+  <div class="table-scroll">
   <table>
     <thead>
       <tr>
@@ -146,6 +146,7 @@
       {/each}
     </tbody>
   </table>
+  </div>
 
   {#if group.replicas.length === 0}
     <p class="muted mt-2.5">
@@ -155,6 +156,7 @@
 
   {#if nonZeroReasons.length > 0}
     <h2>Why statements went to the primary</h2>
+    <div class="table-scroll">
     <table>
       <thead>
         <tr><th>Reason</th><th>Count</th><th>Meaning</th></tr>
@@ -169,5 +171,6 @@
         {/each}
       </tbody>
     </table>
+    </div>
   {/if}
 {/if}

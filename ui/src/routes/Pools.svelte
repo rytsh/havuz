@@ -91,7 +91,6 @@
 </script>
 
 <h1>Databases</h1>
-<p class="subtitle">Configured pools and the connection budget each one enforces.</p>
 
 {#if error}
   <div class="error">{error}</div>
@@ -102,6 +101,7 @@
 {#if pools.length === 0}
   <p class="muted">Nothing configured yet. Use “Add database”.</p>
 {:else}
+  <div class="table-scroll">
   <table>
     <thead>
       <tr>
@@ -122,7 +122,7 @@
         <tr>
           <td>
             <strong>{pool.name}</strong>
-            <div class="muted text-[11px]">{pool.database} as {pool.backend_user}</div>
+            <div class="muted text-xs">{pool.database} as {pool.backend_user}</div>
           </td>
           <td>
             {#if pool.listen_port}
@@ -134,7 +134,7 @@
           <td>
             {pool.family}
             {#if pool.profile && pool.profile !== pool.family}
-              <div class="muted text-[11px]">{pool.profile}</div>
+              <div class="muted text-xs">{pool.profile}</div>
             {/if}
           </td>
           <td class="muted">{pool.targets.map((t) => `${t.host}:${t.port}`).join(", ")}</td>
@@ -179,19 +179,19 @@
               <button class="action danger" disabled={busy === pool.name} onclick={() => remove(pool.name)}>Delete</button>
             </div>
             {#if probes[pool.name]}
-              <div class="muted mt-1 text-[11px]">{probes[pool.name]}</div>
+              <div class="muted mt-1 text-xs">{probes[pool.name]}</div>
             {/if}
           </td>
         </tr>
       {/each}
     </tbody>
   </table>
+  </div>
 
   {#if editing}
     <form class="config-panel" onsubmit={saveConfiguration}>
       <div>
-        <div class="eyebrow">Runtime configuration</div>
-        <h2 class="mt-1">Tune {editing}</h2>
+        <h2 class="mt-0">Tune {editing}</h2>
         <p class="muted mb-0">New connections use this configuration immediately; established sessions finish on the old one.</p>
       </div>
       <div class="config-grid">

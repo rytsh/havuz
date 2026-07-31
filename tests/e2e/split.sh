@@ -27,13 +27,13 @@ HAVUZ="$ROOT/target/release/havuz"
 # `pg_is_in_recovery()` is the perfect probe: it asks the server which server it
 # is. `t` means the statement was served by the standby.
 where() {
-  docker run --rm -e PGPASSWORD=clientpass postgres:16 \
+  docker run --rm --add-host host.docker.internal:host-gateway -e PGPASSWORD=clientpass postgres:16 \
     psql -qtAX -h host.docker.internal -p "$POOL_PORT" -U svc_orders -d app_main \
     -c "select pg_is_in_recovery();" 2>&1
 }
 
 psql_pool() {
-  docker run --rm -e PGPASSWORD=clientpass postgres:16 \
+  docker run --rm --add-host host.docker.internal:host-gateway -e PGPASSWORD=clientpass postgres:16 \
     psql -qtAX -h host.docker.internal -p "$POOL_PORT" -U svc_orders -d app_main "$@" 2>&1
 }
 
