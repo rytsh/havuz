@@ -17,6 +17,8 @@
   let user = $state("");
   let status = $state("");
   let minDuration = $state("");
+  let page = $state(0);
+  let pageSize = $state(50);
 
   const pools = $derived(
     [...new Set([...(data?.active ?? []).map((trace) => trace.pool), ...(data?.traces ?? []).map((trace) => trace.pool)])].sort(),
@@ -45,9 +47,13 @@
     data?.traces.length ? Math.round(data.traces.reduce((sum, trace) => sum + trace.duration_us, 0) / data.traces.length) : 0,
   );
   const totalRows = $derived((data?.traces ?? []).reduce((sum, trace) => sum + trace.row_count, 0));
+  const historyTotal = $derived(data?.pagination.total ?? 0);
+  const totalPages = $derived(Math.max(1, Math.ceil(historyTotal / pageSize)));
+  const historyStart = $derived(historyTotal === 0 ? 0 : page * pageSize + 1);
+  const historyEnd = $derived(Math.min(historyTotal, page * pageSize + (data?.traces.length ?? 0)));
 
   function queryParams(): URLSearchParams {
-    const value = new URLSearchParams({ limit: "200" });
+    const value = new URLSearchParams({ limit: String(pageSize), offset: String(page * pageSize) });
     if (search) value.set("q", search);
     if (pool) value.set("pool", pool);
     if (user) value.set("user", user);
@@ -58,7 +64,13 @@
 
   async function refresh() {
     try {
-      data = await api.traces(queryParams());
+      const response = await api.traces(queryParams());
+      if (page > 0 && response.traces.length === 0 && response.pagination.total > 0) {
+        page = Math.max(0, Math.ceil(response.pagination.total / pageSize) - 1);
+        data = await api.traces(queryParams());
+      } else {
+        data = response;
+      }
       error = null;
     } catch (cause) {
       error = cause instanceof Error ? cause.message : String(cause);
@@ -145,6 +157,7 @@
     try {
       await api.clearTraces();
       detail = null;
+      page = 0;
       await refresh();
     } catch (cause) {
       error = cause instanceof Error ? cause.message : String(cause);
@@ -155,6 +168,7 @@
 
   function applyFilters(event: Event) {
     event.preventDefault();
+    page = 0;
     refresh();
   }
 
@@ -164,6 +178,17 @@
     user = "";
     status = "";
     minDuration = "";
+    page = 0;
+    refresh();
+  }
+
+  function changePage(next: number) {
+    page = Math.min(Math.max(0, next), totalPages - 1);
+    refresh();
+  }
+
+  function changePageSize() {
+    page = 0;
     refresh();
   }
 
@@ -185,7 +210,7 @@
       case "session_mode":
         return {
           title: "Reserved by session mode",
-          detail: "This client owns one backend until it disconnects, even when it is not running a query.",
+          detail: "This is not a query pin. Session mode reserves one backend by design until the client disconnects.",
         };
       case "idle_in_transaction":
         return {
@@ -195,8 +220,22 @@
       case "pinned":
         return {
           title: `Pinned: ${holder.pin_reason ?? "unknown"}`,
-          detail: "Session-scoped state prevents this backend from being shared until the client disconnects.",
+          detail: pinDetail(holder.pin_reason),
         };
+    }
+  }
+
+  function pinDetail(reason: BackendHolder["pin_reason"]): string {
+    switch (reason) {
+      case "session_parameter": return "A session-level SET or RESET changed backend state. Prefer startup parameters, SET LOCAL, or transaction-scoped settings.";
+      case "listen": return "LISTEN/UNLISTEN makes this connection a notification target until the session ends.";
+      case "temp_table": return "A temporary table belongs to this backend session and cannot move to another connection.";
+      case "advisory_lock": return "A session advisory lock is held. Use pg_advisory_xact_lock when transaction scope is sufficient.";
+      case "server_side_prepare": return "SQL PREPARE created session state. Protocol-level prepared statements do not require this pin.";
+      case "holdable_cursor": return "A WITH HOLD cursor survives COMMIT and remains attached to this backend.";
+      case "bulk_transfer": return "COPY or another streaming operation keeps the backend attached until the stream or session ends.";
+      case "replication": return "Replication mode is a long-lived backend-specific stream.";
+      default: return "Session-scoped state prevents this backend from being shared until the client disconnects.";
     }
   }
 
@@ -221,7 +260,7 @@
   </div>
   <div class="row">
     <span class="badge">{data?.retention_days ?? 7} day retention</span>
-    <button class="action" disabled={!data?.traces.length} onclick={exportHistory}>Export history CSV</button>
+    <button class="action" disabled={!data?.traces.length} onclick={exportHistory}>Export page CSV</button>
     <button class="action danger" disabled={clearing} onclick={clearHistory}>Clear history</button>
   </div>
 </div>
@@ -345,7 +384,7 @@
     <div class="eyebrow">SQLite history</div>
     <h2>Completed queries</h2>
   </div>
-  <span class="muted text-xs">Latest {data?.traces.length ?? 0} records</span>
+  <span class="muted text-xs">Showing {historyStart}-{historyEnd} of {historyTotal}</span>
 </div>
 
 <div class="history-summary">
@@ -390,6 +429,23 @@
 {:else}
   <div class="trace-empty">No completed query matches these filters.</div>
 {/if}
+
+<div class="trace-pagination">
+  <label>
+    Rows
+    <select bind:value={pageSize} onchange={changePageSize}>
+      <option value={25}>25</option>
+      <option value={50}>50</option>
+      <option value={100}>100</option>
+      <option value={200}>200</option>
+    </select>
+  </label>
+  <span>Page {page + 1} of {totalPages}</span>
+  <div class="row">
+    <button class="action" disabled={page === 0} onclick={() => changePage(page - 1)}>Previous</button>
+    <button class="action" disabled={page + 1 >= totalPages} onclick={() => changePage(page + 1)}>Next</button>
+  </div>
+</div>
 
 {#if detail}
   <div class="trace-detail-backdrop" role="presentation" onclick={closeDetail}>

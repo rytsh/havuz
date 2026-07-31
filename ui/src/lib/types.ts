@@ -270,6 +270,7 @@ export interface TraceResponse {
   holders: BackendHolder[];
   pool_snapshots: PoolSnapshot[];
   traces: TraceSummary[];
+  pagination: { total: number; limit: number; offset: number };
   retention_days: number;
   result_limits: { rows: number; bytes: number };
 }

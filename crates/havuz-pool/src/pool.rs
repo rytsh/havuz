@@ -2,7 +2,7 @@
 
 use std::collections::VecDeque;
 use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -180,9 +180,10 @@ impl<C: BackendConnector> Pool<C> {
 
         let started = Instant::now();
         self.inner.counters.waiting.fetch_add(1, Ordering::Relaxed);
+        let waiting = WaitingGuard(&self.inner.counters.waiting);
         let permit =
             tokio::time::timeout(self.inner.limits.queue_timeout, self.inner.permits.clone().acquire_owned()).await;
-        self.inner.counters.waiting.fetch_sub(1, Ordering::Relaxed);
+        drop(waiting);
 
         let permit = match permit {
             Ok(Ok(permit)) => permit,
@@ -359,6 +360,14 @@ impl<C: BackendConnector> Pool<C> {
                 pool.reap();
             }
         });
+    }
+}
+
+struct WaitingGuard<'a>(&'a AtomicU64);
+
+impl Drop for WaitingGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -629,6 +638,19 @@ mod tests {
         drop(held);
         assert_eq!(waiter.await.unwrap().unwrap(), Some(1), "the freed backend is handed straight over");
         assert_eq!(connector.opened.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_checkout_removes_it_from_the_waiting_count() {
+        let connector = TestConnector::new();
+        let mut lim = limits(1);
+        lim.queue_timeout = Duration::from_secs(5);
+        let pool = Pool::new("app_main", connector, lim);
+        let _held = pool.acquire().await.unwrap();
+
+        assert!(tokio::time::timeout(Duration::from_millis(20), pool.acquire()).await.is_err());
+        assert_eq!(pool.snapshot().waiting, 0);
+        assert_eq!(pool.snapshot().timeout_total, 0, "caller cancellation is not a pool timeout");
     }
 
     #[tokio::test]

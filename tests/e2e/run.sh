@@ -156,6 +156,31 @@ for pid in "${pids[@]}"; do wait "$pid"; done
 timeouts="$(api /api/v1/summary | python3 -c 'import sys,json; print(json.load(sys.stdin)["pool_snapshots"][0]["timeout_total"])')"
 [[ "$timeouts" -eq 0 ]] || { echo "FAIL: $timeouts clients were rejected"; exit 1; }
 
+echo "==> startup checkout timeout is written to history"
+pids=()
+for i in $(seq 1 "$MAX_SIZE"); do
+  psql_client -c "select pg_sleep(7);" > "$WORK/holder$i.out" 2>&1 &
+  pids+=($!)
+done
+sleep 1
+if psql_client -c "select 99;" > "$WORK/timeout.out" 2>&1; then
+  echo "FAIL: connection succeeded while every session-mode backend was reserved"
+  exit 1
+fi
+for pid in "${pids[@]}"; do wait "$pid"; done
+
+timeout_trace_id="$(wait_trace_id 'connection%20checkout')" \
+  || { echo "FAIL: startup checkout timeout was not traced"; exit 1; }
+timeout_detail="$(api "/api/v1/traces/$timeout_trace_id")"
+python3 - "$timeout_detail" <<'PY'
+import json, sys
+detail = json.loads(sys.argv[1])
+assert detail["status"] == "failed", detail
+assert detail["error_code"] == "53300", detail
+assert detail["execution_us"] == 0, detail
+assert detail["wait_us"] == detail["duration_us"], detail
+PY
+
 # ---------------------------------------------------------------------------
 # Transaction mode: the same pool, but now a single client session may hand its
 # backend back between transactions.

@@ -562,12 +562,17 @@ async fn get_traces(
     State(state): State<AdminState>,
     Query(filter): Query<havuz_pg::TraceFilter>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let traces = state.family.traces().list(&filter).map_err(|error| ApiError::Internal(error.to_string()))?;
+    let trace_store = state.family.traces();
+    let traces = trace_store.list(&filter).map_err(|error| ApiError::Internal(error.to_string()))?;
+    let total = trace_store.count(&filter).map_err(|error| ApiError::Internal(error.to_string()))?;
+    let limit = filter.limit.unwrap_or(100).clamp(1, 500);
+    let offset = filter.offset.unwrap_or(0);
     Ok(Json(json!({
-        "active": state.family.traces().active(),
+        "active": trace_store.active(),
         "holders": state.family.holders().snapshot(),
         "pool_snapshots": state.family.snapshots(),
         "traces": traces,
+        "pagination": { "total": total, "limit": limit, "offset": offset },
         "retention_days": havuz_pg::trace::RETENTION_DAYS,
         "result_limits": {
             "rows": havuz_pg::trace::MAX_RESULT_ROWS,
@@ -1094,13 +1099,15 @@ mod tests {
         let mut span = state.family.traces().begin(&context, "select 42");
         span.assign("primary/127.0.0.1:5432", Some(4242));
 
-        let (status, active) = get(&app, "/api/v1/traces?pool=app_main&user=svc_orders").await;
+        let (status, active) = get(&app, "/api/v1/traces?pool=app_main&user=svc_orders&limit=1&offset=0").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(active["active"][0]["sql"], "select 42");
         assert_eq!(active["active"][0]["backend_pid"], 4242);
         assert_eq!(active["holders"][0]["reason"], "idle_in_transaction");
         assert_eq!(active["holders"][0]["backend_pid"], 4242);
         assert!(active["pool_snapshots"].is_array());
+        assert_eq!(active["pagination"]["limit"], 1);
+        assert_eq!(active["pagination"]["offset"], 0);
 
         span.succeed();
         let mut history = serde_json::Value::Null;
@@ -1112,6 +1119,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         let id = history["traces"][0]["id"].as_u64().expect("completed trace id");
+        assert_eq!(history["pagination"]["total"], 1);
         let (status, detail) = get(&app, &format!("/api/v1/traces/{id}")).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(detail["user"], "svc_orders");

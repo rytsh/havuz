@@ -274,6 +274,64 @@ impl TraceStore {
         rows.collect()
     }
 
+    pub fn count(&self, filter: &TraceFilter) -> Result<u64, rusqlite::Error> {
+        let connection = self.connection.lock().expect("trace database poisoned");
+        connection.query_row(
+            "SELECT COUNT(*)
+             FROM query_traces
+             WHERE (?1 IS NULL OR pool = ?1)
+               AND (?2 IS NULL OR user_name = ?2)
+               AND (?3 IS NULL OR status = ?3)
+               AND (?4 IS NULL OR sql_text LIKE '%' || ?4 || '%' OR application LIKE '%' || ?4 || '%')
+               AND duration_us >= ?5",
+            params![
+                filter.pool.as_deref(),
+                filter.user.as_deref(),
+                filter.status.as_deref(),
+                filter.q.as_deref(),
+                filter.min_duration_ms.unwrap_or(0).saturating_mul(1_000) as i64,
+            ],
+            |row| row.get(0),
+        )
+    }
+
+    pub fn record_failure(
+        &self,
+        context: &TraceContext,
+        operation: impl Into<String>,
+        waited: Duration,
+        code: impl Into<String>,
+        message: impl Into<String>,
+    ) {
+        let duration_us = waited.as_micros() as u64;
+        let completed = CompletedTrace {
+            summary: TraceSummary {
+                id: self.next_id.fetch_add(1, Ordering::Relaxed),
+                started_at_ms: now_ms().saturating_sub(waited.as_millis() as i64),
+                duration_us,
+                wait_us: duration_us,
+                execution_us: 0,
+                pool: context.pool.clone(),
+                user: context.user.clone(),
+                application: context.application.clone(),
+                client_addr: context.client_addr.clone(),
+                sql: operation.into(),
+                status: "failed".into(),
+                target: None,
+                backend_pid: None,
+                command_tag: None,
+                row_count: 0,
+                result_truncated: false,
+                error_code: Some(code.into()),
+                error_message: Some(message.into()),
+            },
+            result: QueryResult::default(),
+        };
+        if self.completed_tx.send(completed).is_err() {
+            tracing::error!("query trace writer stopped");
+        }
+    }
+
     pub fn get(&self, id: u64) -> Result<Option<TraceDetail>, rusqlite::Error> {
         let connection = self.connection.lock().expect("trace database poisoned");
         connection
@@ -710,6 +768,33 @@ mod tests {
             .unwrap()
             .is_empty());
         assert_eq!(store.clear().unwrap(), 1);
+    }
+
+    #[test]
+    fn history_count_and_offset_support_pagination() {
+        let store = TraceStore::memory();
+        for sql in ["select 1", "select 2", "select 3"] {
+            store.begin(&context(), sql).succeed();
+        }
+        wait_for_history(&store);
+
+        let filter = TraceFilter { limit: Some(1), offset: Some(1), ..Default::default() };
+        assert_eq!(store.count(&filter).unwrap(), 3);
+        assert_eq!(store.list(&filter).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn failures_before_a_query_are_persisted() {
+        let store = TraceStore::memory();
+        store.record_failure(&context(), "connection checkout", Duration::from_secs(5), "53300", "pool exhausted");
+        wait_for_history(&store);
+
+        let trace = &store.list(&TraceFilter::default()).unwrap()[0];
+        assert_eq!(trace.sql, "connection checkout");
+        assert_eq!(trace.status, "failed");
+        assert_eq!(trace.wait_us, 5_000_000);
+        assert_eq!(trace.execution_us, 0);
+        assert_eq!(trace.error_code.as_deref(), Some("53300"));
     }
 
     #[test]

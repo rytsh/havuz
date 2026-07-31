@@ -50,6 +50,28 @@ impl MaybeTls {
             MaybeTls::ServerTls(s) => s.get_ref().0.set_nodelay(nodelay),
         }
     }
+
+    /// Wait for the underlying client socket to close without consuming any
+    /// PostgreSQL or TLS bytes that may already be pipelined.
+    pub async fn wait_for_disconnect(&self) -> io::Result<()> {
+        let stream = match self {
+            MaybeTls::Plain(stream) => stream,
+            MaybeTls::ClientTls(stream) => stream.get_ref().0,
+            MaybeTls::ServerTls(stream) => stream.get_ref().0,
+        };
+        let mut byte = [0u8; 1];
+        loop {
+            stream.readable().await?;
+            match stream.peek(&mut byte).await {
+                Ok(0) => return Ok(()),
+                // Data belongs to the protocol. Leave it untouched and let the
+                // competing operation finish; peeking again would busy-loop.
+                Ok(_) => return std::future::pending().await,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+                Err(error) => return Err(error),
+            }
+        }
+    }
 }
 
 impl std::fmt::Debug for MaybeTls {
@@ -133,5 +155,17 @@ mod tests {
         let stream = MaybeTls::Plain(TcpStream::connect(addr).await.unwrap());
         assert_eq!(stream.peer_addr().unwrap(), addr);
         drop(accept.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn disconnect_can_be_observed_without_reading_protocol_bytes() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let stream = MaybeTls::Plain(server);
+
+        drop(client);
+        tokio::time::timeout(std::time::Duration::from_secs(1), stream.wait_for_disconnect()).await.unwrap().unwrap();
     }
 }

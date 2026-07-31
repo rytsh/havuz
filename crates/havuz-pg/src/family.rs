@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use havuz_core::state::{PoolConfig, State};
@@ -424,7 +424,18 @@ impl ProtocolFamily for PgFamily {
         // The startup checkout always comes from the primary: the client needs
         // a real backend's parameters, and the primary is the one target every
         // pool is guaranteed to have.
-        let mut checkout = match group.primary().acquire().await {
+        let checkout_started = Instant::now();
+        let acquire = group.primary().acquire();
+        tokio::pin!(acquire);
+        let checkout_result = tokio::select! {
+            result = &mut acquire => result,
+            disconnected = client.wait_for_disconnect() => {
+                return Err(ProtoError::Io(disconnected.err().unwrap_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::ConnectionAborted, "client disconnected while waiting for a backend")
+                })));
+            }
+        };
+        let mut checkout = match checkout_result {
             Ok(checkout) => checkout,
             Err(e) => {
                 let (code, text) = match &e {
@@ -434,8 +445,15 @@ impl ProtocolFamily for PgFamily {
                     havuz_pool::PoolError::Unavailable { .. } => (sqlstate::CANNOT_CONNECT_NOW, e.to_string()),
                     havuz_pool::PoolError::Connect { .. } => (sqlstate::CANNOT_CONNECT_NOW, e.to_string()),
                 };
+                self.traces.record_failure(
+                    &trace_context,
+                    "connection checkout",
+                    checkout_started.elapsed(),
+                    code,
+                    &text,
+                );
                 let _ = Message::fatal(code, &text).write(&mut client).await;
-                return Err(ProtoError::backend(e.to_string()));
+                return Err(ProtoError::backend(text));
             }
         };
 
