@@ -1,0 +1,21 @@
+[package]
+name = "havuz-pool"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Protocol-agnostic connection pool engine."
+
+[dependencies]
+havuz-core = { workspace = true }
+havuz-proto = { workspace = true }
+
+serde = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time", "test-util"] }
+async-trait = { workspace = true }
+serde_json = { workspace = true }

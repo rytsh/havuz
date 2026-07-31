@@ -1,0 +1,50 @@
+# havuz bootstrap configuration.
+#
+# Only process-level settings live here: listen addresses, TLS material and
+# where state is kept. Pools and users are managed through the dashboard or the
+# admin API and stored in `state.json`, because they change at runtime and
+# restarting a pooler to add a database is not acceptable.
+#
+# Start with:  HAVUZ_MASTER_KEY=$(havuz keygen) havuz run --config havuz.toml
+
+[server]
+# Clients connect here with their normal PostgreSQL driver. The pool they reach
+# is chosen by the database name in their connection string:
+#   postgresql://svc_orders:***@havuz:5432/app_main
+listen = "0.0.0.0:5432"
+
+# 0 means one worker per core.
+workers = 0
+
+# Hard ceiling across all pools, enforced at accept time. Protects the process
+# from file descriptor exhaustion before per-pool limits get a chance to apply.
+max_client_connections = 1000
+
+[server.tls]
+# Both must be set, or neither. Without them havuz declines SSLRequest and
+# clients fall back to plaintext, exactly as they would against a Postgres
+# built without TLS.
+# cert = "/etc/havuz/tls/server.crt"
+# key  = "/etc/havuz/tls/server.key"
+require_client_cert = false
+
+[admin]
+# The HTTP API and the dashboard. Loopback by default on purpose: this endpoint
+# can repoint a pool at another database.
+listen = "127.0.0.1:7432"
+
+# On a non-loopback address havuz refuses to start without authentication.
+# auth = { type = "bearer", token_env = "HAVUZ_ADMIN_TOKEN" }
+
+# Serve the embedded dashboard. Disable for headless deployments.
+ui = true
+
+[state]
+# Holds state.json, which contains sealed credentials. Written with mode 0600.
+dir = "./data"
+
+[log]
+# `tracing` directives, e.g. "info,havuz_pg=debug". RUST_LOG overrides this.
+filter = "info"
+json = false
+log_connections = false

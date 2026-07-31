@@ -1,0 +1,43 @@
+# PostgreSQL matrix for the end-to-end suite.
+#
+# Kept out of `cargo test` on purpose: unit tests must stay runnable without a
+# database, or people stop running them.
+#
+#   docker compose -f tests/e2e/docker-compose.yml up -d
+#   ./tests/e2e/run.sh
+#   docker compose -f tests/e2e/docker-compose.yml down -v
+
+services:
+  pg16:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: hunter2
+      POSTGRES_DB: appdb
+      # SCRAM is the only backend authentication havuz implements. md5 is
+      # refused rather than half-supported.
+      POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256"
+    ports:
+      - "15432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d appdb"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  pg17:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: hunter2
+      POSTGRES_DB: appdb
+      POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256"
+    ports:
+      - "15433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d appdb"]
+      interval: 2s
+      timeout: 3s
+      retries: 20

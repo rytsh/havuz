@@ -1,0 +1,38 @@
+[package]
+name = "havuz-admin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Admin HTTP API and dashboard for havuz."
+
+[features]
+default = []
+# Bake ui/dist into the binary. Off by default so a Rust-only build never
+# depends on a Node toolchain having run first.
+embed-ui = ["dep:rust-embed"]
+
+[dependencies]
+havuz-core = { workspace = true }
+havuz-pg = { workspace = true }
+havuz-pool = { workspace = true }
+havuz-proto = { workspace = true }
+havuz-registry = { workspace = true }
+havuz-secrets = { workspace = true }
+
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+mime_guess = { workspace = true }
+rust-embed = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
+tower = { workspace = true, features = ["util"] }
+http-body-util = "0.1"
+tempfile = "3"

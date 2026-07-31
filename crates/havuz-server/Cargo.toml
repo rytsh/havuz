@@ -1,0 +1,29 @@
+[package]
+name = "havuz-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "havuz connection pooler."
+
+[[bin]]
+name = "havuz"
+path = "src/main.rs"
+
+[features]
+default = []
+embed-ui = ["havuz-admin/embed-ui"]
+
+[dependencies]
+havuz-admin = { workspace = true }
+havuz-core = { workspace = true }
+havuz-pg = { workspace = true }
+havuz-pool = { workspace = true }
+havuz-proto = { workspace = true }
+havuz-secrets = { workspace = true }
+
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros", "signal", "fs"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+axum = { workspace = true }

@@ -1,0 +1,19 @@
+/target
+**/*.rs.bk
+
+# UI
+node_modules/
+ui/dist/
+.pnpm-store/
+
+# runtime state (contains encrypted secrets)
+/data/
+*.havuz-state.json
+*.havuz-state.json.tmp
+
+# local env
+.env
+.env.*
+!.env.example
+
+.DS_Store
