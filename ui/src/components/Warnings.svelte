@@ -39,6 +39,14 @@
           title: `${w.pool}: reads may be stale immediately after a write`,
           detail: "Set a sticky-after-write window comfortably above your replication lag.",
         };
+      case "users_without_backend_role":
+        return {
+          title: `${w.pool}: ${w.users.join(", ")} cannot connect`,
+          detail:
+            `This pool authenticates every client as itself and has no service account to fall back on, but ` +
+            `${w.users.join(", ")} ${w.users.length === 1 ? "is" : "are"} not marked as having a database role of ` +
+            `their own. Tick "Connect to the database as this user" on the Users page, or give the pool a backend user.`,
+        };
       case "read_only_not_enforced":
         return {
           title: `${w.pool}: read-only is not enforced in session mode`,

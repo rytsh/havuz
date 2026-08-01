@@ -18,7 +18,8 @@ pub mod tls;
 
 pub use config::{AdminAuth, AdminConfig, Bootstrap, BootstrapError, LogConfig, ServerConfig, ServerTls, StatePaths};
 pub use state::{
-    Listener, PoolConfig, PoolLimits, RoutingConfig, State, StateError, Target, TargetRole, UserConfig, Warning,
+    Listener, PoolConfig, PoolLimits, RoutingConfig, State, StateError, Target, TargetRole, TraceLevel, UserConfig,
+    Warning,
 };
 pub use store::{StateStore, StoreError};
 pub use tls::{SslMode, TlsError};

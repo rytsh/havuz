@@ -75,6 +75,12 @@ pub struct Capabilities {
     pub tls: bool,
     pub scram_sha256: bool,
     pub md5_auth: bool,
+    /// Backend connections can be opened as the connecting client rather than
+    /// as a shared service account. Needs a handshake that can ask the client
+    /// for a password havuz is able to replay upstream, which is not something
+    /// every family's driver offers. False means `backend_auth = per_user` is
+    /// refused rather than silently ignored.
+    pub per_user_auth: bool,
     /// Extended query protocol with named prepared statements. If true, a
     /// transaction-mode pool needs a statement rewriter to be usable.
     pub prepared_statements: bool,
@@ -94,6 +100,7 @@ impl Capabilities {
         tls: false,
         scram_sha256: false,
         md5_auth: false,
+        per_user_auth: false,
         prepared_statements: false,
         cancel_request: false,
         bulk_copy: false,
@@ -302,6 +309,9 @@ const JDBC: FamilyDescriptor = FamilyDescriptor {
         tls: true,
         scram_sha256: true,
         md5_auth: false,
+        // The sidecar holds one JDBC URL with one set of credentials in it, so
+        // there is nowhere to put a client's own.
+        per_user_auth: false,
         // The client's prepared statements become the driver's. What is absent
         // is havuz's own rewriting, which exists to move a statement between
         // backends and has nothing to move it between here.

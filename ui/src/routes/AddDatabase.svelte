@@ -2,7 +2,15 @@
   import { push } from "svelte-spa-router";
   import { iconFor } from "../lib/icons";
   import { api } from "../lib/api";
-  import type { BackendAuth, DriverProfile, Family, FieldRole, PoolMode, SchemaProperty } from "../lib/types";
+  import type {
+    BackendAuth,
+    DriverProfile,
+    Family,
+    FieldRole,
+    PoolMode,
+    SchemaProperty,
+    TraceLevel,
+  } from "../lib/types";
   import PoolModeGuide from "../components/PoolModeGuide.svelte";
 
   let families = $state<Family[]>([]);
@@ -20,6 +28,14 @@
   let maxClients = $state(100);
   let listenPort = $state<number | undefined>(undefined);
   let backendAuth = $state<BackendAuth>("shared");
+
+  // Asked as two questions because they are two decisions. Whether to record at
+  // all is an operational one; how much to keep is a data-protection one, and
+  // collapsing them into a single list hides the second behind the first.
+  let tracing = $state<"on" | "off">("on");
+  let traceDepth = $state<Exclude<TraceLevel, "off">>("statements");
+  const traceLevel = $derived<TraceLevel>(tracing === "off" ? "off" : traceDepth);
+
   let search = $state("");
   let category = $state("relational");
   let layout = $state<"grid" | "list">("grid");
@@ -63,6 +79,8 @@
     profileId = profile.id;
     mode = family.default_pool_mode;
     backendAuth = "shared";
+    tracing = "on";
+    traceDepth = "statements";
     // Seed defaults straight from the schema so the form starts valid.
     const seeded: Record<string, unknown> = {};
     for (const key of family.schema["x-havuz-order"] ?? []) {
@@ -91,8 +109,20 @@
     return order.map((key) => [key, family.schema.properties[key]] as [string, SchemaProperty]);
   }
 
+  /**
+   * Credential fields the backend identity choice makes optional.
+   *
+   * Under per-user auth every client connects with its own password, so the
+   * service account is a fallback for probes and unmigrated users rather than
+   * the way in. Mirrors the same relaxation the admin API applies, so the form
+   * never blocks a submission the server would have accepted.
+   */
+  const relaxedRoles: FieldRole[] = ["user", "password"];
+
   function isRequired(family: Family, key: string): boolean {
-    return (family.schema.required ?? []).includes(key);
+    if (!(family.schema.required ?? []).includes(key)) return false;
+    const role = family.schema.properties[key]?.["x-havuz-role"];
+    return !(backendAuth === "per_user" && role !== undefined && relaxedRoles.includes(role));
   }
 
   /**
@@ -120,6 +150,7 @@
       mode,
       listen_port: listenPort,
       backend_auth: backendAuth,
+      trace: traceLevel,
       limits: { max_size: maxSize, max_client_connections: maxClients },
       settings,
     };
@@ -289,23 +320,27 @@
 
     <PoolModeGuide {mode} />
 
-    <div class="field">
-      <label for="backend-auth">Backend identity</label>
-      <div class="help">
-        Who Havuz connects to the database as. A shared service account is what makes one backend connection reusable by
-        any client. Connecting as each user instead gives you <code>pg_stat_activity.usename</code>, row-level security
-        and real <code>GRANT</code> enforcement, at the cost of a separate set of connections per user.
+    {#if selected.capabilities.per_user_auth}
+      <div class="field">
+        <label for="backend-auth">Backend identity</label>
+        <div class="help">
+          Who Havuz connects to the database as. A shared service account is what makes one backend connection reusable
+          by any client. Connecting as each user instead gives you <code>pg_stat_activity.usename</code>, row-level
+          security and real <code>GRANT</code> enforcement, at the cost of a separate set of connections per user.
+        </div>
+        <select id="backend-auth" bind:value={backendAuth}>
+          <option value="shared">One shared service account</option>
+          <option value="per_user">Each user, with its own credentials</option>
+        </select>
       </div>
-      <select id="backend-auth" bind:value={backendAuth}>
-        <option value="shared">One shared service account</option>
-        <option value="per_user">Each user, with its own credentials</option>
-      </select>
-    </div>
+    {/if}
 
     {#if backendAuth === "per_user"}
       <div class="help notice">
         Requires client-facing TLS: Havuz has to ask each client for its password, and will only do so over an encrypted
         connection. Users keep using the service account until you switch them over individually on the Users page.
+        The service account itself is optional here — leave it blank and only users connecting as themselves get in,
+        at the cost of health probes and <em>Test connection</em>, which have no client credential to borrow.
       </div>
     {/if}
 
@@ -345,6 +380,52 @@
         <div class="hint">{maxClients} clients served by at most {maxSize} backend connections.</div>
       {/if}
     </div>
+      </div>
+    </section>
+
+    <section class="form-section">
+      <div class="form-section-heading">
+        <span>03</span>
+        <div><h2>Query tracing</h2><p>What havuz keeps about the traffic through this pool.</p></div>
+      </div>
+      <div class="form-fields wide">
+
+    <div class="field">
+      <label for="trace">Record queries</label>
+      <div class="help">
+        A pooler that cannot say which statement waited, on which backend, and for how long is a black box in the
+        middle of your database traffic. Turning this off makes the pool invisible on the <strong>Query trace</strong>
+        screen — no history, and no entry under "running now" either.
+      </div>
+      <select id="trace" bind:value={tracing}>
+        <option value="on">Yes, record queries from this pool</option>
+        <option value="off">No, record nothing</option>
+      </select>
+    </div>
+
+    {#if tracing === "on"}
+      <div class="field">
+        <label for="trace-depth">How much to keep</label>
+        <div class="help">
+          Statements are diagnostics: the SQL, how long it waited, where it ran and what it returned a count of.
+          Result data is a sample of your production rows, kept in a second file with a retention of its own — useful
+          when you are chasing a wrong answer rather than a slow one, and worth choosing deliberately.
+        </div>
+        <select id="trace-depth" bind:value={traceDepth}>
+          <option value="statements">Queries only — the SQL, timings, target and outcome</option>
+          <option value="full">Queries and their results — plus a sample of the rows returned</option>
+        </select>
+      </div>
+
+      {#if traceDepth === "full"}
+        <div class="help notice">
+          Row values are captured verbatim, up to a per-query cap the <strong>Query trace</strong> screen states
+          exactly. Bind parameters are never recorded, but anything a query <em>returns</em> is — including personal
+          data and anything a client selected out of a credentials table. You can change this later on the
+          <strong>Databases</strong> page without recreating the pool.
+        </div>
+      {/if}
+    {/if}
       </div>
     </section>
 

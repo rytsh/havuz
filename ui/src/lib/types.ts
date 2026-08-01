@@ -47,6 +47,15 @@ export interface PoolLimits {
 /** Whose credentials backend connections are opened with. */
 export type BackendAuth = "shared" | "per_user";
 
+/**
+ * How much of a pool's traffic reaches the query trace store.
+ *
+ * Not a boolean, because keeping *what ran* and keeping *what came back* are
+ * different decisions: the first is diagnostics, the second is a sample of
+ * production data with a life of its own.
+ */
+export type TraceLevel = "off" | "statements" | "full";
+
 export interface Pool {
   name: string;
   family: string;
@@ -55,6 +64,7 @@ export interface Pool {
   database: string;
   backend_user: string;
   backend_auth: BackendAuth;
+  trace: TraceLevel;
   /** The port clients reach this pool on. Pools may share one. */
   listen_port: number;
   /** Whether a password is stored. The password itself is never served. */
@@ -97,7 +107,8 @@ export type Warning =
   | { kind: "pool_without_users"; pool: string }
   | { kind: "split_without_replicas"; pool: string }
   | { kind: "no_sticky_window"; pool: string }
-  | { kind: "read_only_not_enforced"; pool: string; users: string[] };
+  | { kind: "read_only_not_enforced"; pool: string; users: string[] }
+  | { kind: "users_without_backend_role"; pool: string; users: string[] };
 
 export interface Summary {
   uptime_seconds: number;
@@ -161,10 +172,11 @@ export interface SchemaProperty {
   "x-havuz-secret"?: boolean;
   "x-havuz-labels"?: { value: string; label: string }[];
   /**
-   * Present on the handful of fields the pooler itself needs. The form does
-   * not act on it beyond grouping: the server reads the values back through
-   * the same roles, so nothing here has to know that Postgres spells the
-   * backend account `username`.
+   * Present on the handful of fields the pooler itself needs. The form uses it
+   * for grouping and to tell which fields the backend identity choice makes
+   * optional; the server reads the values back through the same roles, so
+   * nothing here has to know that Postgres spells the backend account
+   * `username`.
    */
   "x-havuz-role"?: FieldRole;
 }
@@ -175,6 +187,21 @@ export interface FamilySchema {
   "x-havuz-order": string[];
 }
 
+/** What the family's wire protocol and driver actually support. */
+export interface Capabilities {
+  tls: boolean;
+  scram_sha256: boolean;
+  md5_auth: boolean;
+  /** Backend connections can be opened as the connecting client. */
+  per_user_auth: boolean;
+  prepared_statements: boolean;
+  cancel_request: boolean;
+  bulk_copy: boolean;
+  reports_transaction_status: boolean;
+  listen_notify: boolean;
+  advisory_locks: boolean;
+}
+
 export interface Family {
   id: string;
   label: string;
@@ -182,6 +209,7 @@ export interface Family {
   maturity: string;
   usable: boolean;
   default_port: number;
+  capabilities: Capabilities;
   pool_modes: PoolMode[];
   default_pool_mode: PoolMode;
   profiles: DriverProfile[];
@@ -316,7 +344,11 @@ export interface TraceResultSet {
 }
 
 export interface TraceDetail extends TraceSummary {
-  result: { sets: TraceResultSet[] };
+  result: {
+    sets: TraceResultSet[];
+    /** The pool records statements only, so no sets is "not kept", not "none". */
+    omitted: boolean;
+  };
 }
 
 export interface TraceResponse {

@@ -92,9 +92,11 @@ done
 echo "==> configuring pool and user"
 # No target, database or account at the top level: the server reads them out of
 # the connection form through the roles the registry declares.
+# `trace: full` because this script asserts on captured result rows. The default
+# is `statements`, which records everything except them.
 api /api/v1/pools -H 'content-type: application/json' -d "{
   \"name\": \"app_main\", \"family\": \"postgres\", \"mode\": \"session\",
-  \"listen_port\": $DEDICATED_PORT,
+  \"listen_port\": $DEDICATED_PORT, \"trace\": \"full\",
   \"settings\": {\"host\": \"127.0.0.1\", \"port\": $PG_PORT, \"database\": \"appdb\",
                  \"username\": \"app\", \"password\": \"hunter2\", \"sslmode\": \"disable\"},
   \"limits\": {\"max_size\": $MAX_SIZE, \"max_client_connections\": 100}}" > /dev/null
@@ -200,7 +202,7 @@ if psql_on "$POOL_PORT" -c "select 1;" > /dev/null 2>&1; then
 fi
 api /api/v1/pools -H 'content-type: application/json' -d "{
   \"name\": \"app_main\", \"family\": \"postgres\", \"mode\": \"transaction\",
-  \"listen_port\": $POOL_PORT,
+  \"listen_port\": $POOL_PORT, \"trace\": \"full\",
   \"settings\": {\"host\": \"127.0.0.1\", \"port\": $PG_PORT, \"database\": \"appdb\",
                  \"username\": \"app\", \"password\": \"hunter2\", \"sslmode\": \"disable\"},
   \"limits\": {\"max_size\": $MAX_SIZE, \"max_client_connections\": 100}}" > /dev/null
@@ -214,6 +216,31 @@ echo "==> transaction-mode query trace"
 transaction_trace_id="$(wait_trace_id 'select%203')" \
   || { echo "FAIL: transaction query was not traced"; exit 1; }
 assert_trace_contains "$transaction_trace_id" "3"
+
+echo "==> trace level is honoured per pool"
+api /api/v1/pools/app_main -X PATCH -H 'content-type: application/json' \
+  -d '{"trace":"statements"}' > /dev/null
+psql_client -c "select 987654;" > /dev/null
+statements_trace_id="$(wait_trace_id 'select%20987654')" \
+  || { echo "FAIL: lowering the level to statements stopped tracing entirely"; exit 1; }
+python3 - "$(api "/api/v1/traces/$statements_trace_id")" <<'PY'
+import json, sys
+detail = json.loads(sys.argv[1])
+result = detail["result"]
+assert result["omitted"], "an omitted result must say so, or it reads as 'returned nothing'"
+assert not result["sets"], f"rows were kept anyway: {result['sets']!r}"
+assert detail["row_count"] == 1, f"the row count is metadata and must survive: {detail['row_count']}"
+PY
+
+api /api/v1/pools/app_main -X PATCH -H 'content-type: application/json' -d '{"trace":"off"}' > /dev/null
+psql_client -c "select 123456;" > /dev/null
+sleep 0.5
+python3 - "$(api '/api/v1/traces?q=select%20123456')" <<'PY'
+import json, sys
+rows = json.loads(sys.argv[1])["traces"]
+assert not rows, f"a pool with tracing off still recorded a query: {rows!r}"
+PY
+api /api/v1/pools/app_main -X PATCH -H 'content-type: application/json' -d '{"trace":"full"}' > /dev/null
 
 before="$(api /api/v1/summary | python3 -c 'import sys,json; print(json.load(sys.stdin)["pool_snapshots"][0]["created_total"])')"
 echo "    backend connections opened: $before"

@@ -73,6 +73,17 @@ pub struct ConfigField {
 }
 
 impl ConfigField {
+    /// The same field with its `required` flag cleared.
+    ///
+    /// Requiredness is a property of the family *and* of how the pool is
+    /// configured: a backend service account is the only way in under shared
+    /// auth, and just a fallback under per-user auth, where every client brings
+    /// its own credential. The registry has no notion of pool modes and should
+    /// not grow one, so the caller that does know relaxes the field instead.
+    pub fn optional(self) -> Self {
+        Self { required: false, ..self }
+    }
+
     /// Validate a submitted value.
     ///
     /// `None` means the field was omitted, which is only an error when the
@@ -216,6 +227,18 @@ mod tests {
         assert_eq!(HOST.validate(None), Err(FieldError::Missing { field: "host" }));
         assert_eq!(HOST.validate(Some(&json!(""))), Err(FieldError::Missing { field: "host" }));
         assert_eq!(HOST.validate(Some(&json!("db.internal"))), Ok(()));
+    }
+
+    #[test]
+    fn a_relaxed_field_accepts_absence_and_nothing_else_changes() {
+        let relaxed = HOST.optional();
+        assert_eq!(relaxed.validate(None), Ok(()));
+        assert_eq!(relaxed.validate(Some(&json!(""))), Ok(()));
+        assert_eq!(
+            relaxed.validate(Some(&json!(7))),
+            Err(FieldError::WrongType { field: "host", expected: "string" }),
+            "relaxing requiredness must not relax the type"
+        );
     }
 
     #[test]

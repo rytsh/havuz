@@ -1,6 +1,6 @@
 <script lang="ts">
   import { api, formatFanIn } from "../lib/api";
-  import type { Pool, Warning } from "../lib/types";
+  import type { Pool, TraceLevel, Warning } from "../lib/types";
   import Warnings from "../components/Warnings.svelte";
   import PoolModeGuide from "../components/PoolModeGuide.svelte";
 
@@ -14,6 +14,13 @@
   let editMaxSize = $state(10);
   let editMaxClients = $state(100);
   let editListenPort = $state<number | undefined>(undefined);
+  let editTrace = $state<TraceLevel>("statements");
+
+  const traceLabel: Record<TraceLevel, string> = {
+    off: "not traced",
+    statements: "queries traced",
+    full: "queries + results traced",
+  };
 
   /**
    * Ports serving more than one pool. Worth flagging: on those, a client has
@@ -80,6 +87,7 @@
     editMaxSize = pool.limits.max_size;
     editMaxClients = pool.limits.max_client_connections;
     editListenPort = pool.listen_port;
+    editTrace = pool.trace;
   }
 
   async function saveConfiguration(event: Event) {
@@ -92,6 +100,7 @@
         max_size: editMaxSize,
         max_client_connections: editMaxClients,
         listen_port: editListenPort,
+        trace: editTrace,
       }),
     );
     if (!error) editing = null;
@@ -158,6 +167,7 @@
           <td class="muted">{pool.targets.map((t) => `${t.host}:${t.port}`).join(", ")}</td>
           <td>
             <span class="badge" class:ok={pool.mode !== "session"}>{pool.mode}</span>
+            <div class="muted text-xs" title="Change under Configure">{traceLabel[pool.trace]}</div>
           </td>
           <td>
             {pool.limits.max_client_connections} → {pool.limits.max_size}
@@ -241,7 +251,21 @@
           <label for="edit-listen-port">Client port</label>
           <input id="edit-listen-port" type="number" min="1" max="65535" bind:value={editListenPort} required />
         </div>
+        <div class="field mb-0">
+          <label for="edit-trace">Query tracing</label>
+          <select id="edit-trace" bind:value={editTrace}>
+            <option value="off">Nothing recorded</option>
+            <option value="statements">Queries only</option>
+            <option value="full">Queries and their results</option>
+          </select>
+        </div>
       </div>
+      {#if editTrace === "full"}
+        <div class="warning mb-0">
+          Result rows are kept verbatim for as long as the trace retention allows. Turn this back down once you have
+          what you needed.
+        </div>
+      {/if}
       <PoolModeGuide mode={editMode} />
       {#if editMode === "session" && editMaxClients > editMaxSize}
         <div class="warning mb-0">

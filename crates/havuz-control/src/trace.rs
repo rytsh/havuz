@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use havuz_core::TraceLevel;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
@@ -38,6 +39,11 @@ pub struct TraceContext {
     pub user: String,
     pub application: Option<String>,
     pub client_addr: String,
+    /// How much of this pool's traffic is recorded. Carried on the context
+    /// rather than checked by every caller: a family decodes its wire format
+    /// into span calls and should not also have to remember which of them the
+    /// operator asked for.
+    pub level: TraceLevel,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -98,6 +104,12 @@ pub struct TraceFilter {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct QueryResult {
     pub sets: Vec<ResultSet>,
+    /// The pool records statements only, so an empty `sets` means "not kept"
+    /// rather than "returned nothing". Defaulted rather than required so traces
+    /// written before the setting existed still load, and read as captured —
+    /// which they were.
+    #[serde(default)]
+    pub omitted: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -210,6 +222,9 @@ impl TraceStore {
     }
 
     pub fn begin(self: &Arc<Self>, context: &TraceContext, sql: impl Into<String>) -> TraceSpan {
+        if context.level.is_off() {
+            return self.inert();
+        }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let started = Instant::now();
         let public = ActiveTrace {
@@ -226,7 +241,32 @@ impl TraceStore {
             backend_pid: None,
         };
         self.active.write().expect("trace registry poisoned").insert(id, ActiveEntry { public, started });
-        TraceSpan { store: self.clone(), id, started, wait_us: 0, capture: ResultCapture::default(), finished: false }
+        TraceSpan {
+            store: self.clone(),
+            id,
+            started,
+            wait_us: 0,
+            capture: ResultCapture::new(context.level.captures_results()),
+            finished: false,
+        }
+    }
+
+    /// A span that records nothing, for a pool with tracing off.
+    ///
+    /// Returned rather than `None` so the relays stay free of a second layer of
+    /// `Option`: they already decode messages into span calls, and every one of
+    /// those calls is a no-op here. Marking it finished is what makes it inert
+    /// — completion and `Drop` both return immediately, and there is no entry
+    /// in `active` to remove.
+    fn inert(self: &Arc<Self>) -> TraceSpan {
+        TraceSpan {
+            store: self.clone(),
+            id: 0,
+            started: Instant::now(),
+            wait_us: 0,
+            capture: ResultCapture::new(false),
+            finished: true,
+        }
     }
 
     pub fn active(&self) -> Vec<ActiveTrace> {
@@ -307,6 +347,9 @@ impl TraceStore {
         code: impl Into<String>,
         message: impl Into<String>,
     ) {
+        if context.level.is_off() {
+            return;
+        }
         let duration_us = waited.as_micros() as u64;
         let completed = CompletedTrace {
             summary: TraceSummary {
@@ -329,7 +372,7 @@ impl TraceStore {
                 error_code: Some(code.into()),
                 error_message: Some(message.into()),
             },
-            result: QueryResult::default(),
+            result: QueryResult { omitted: !context.level.captures_results(), ..QueryResult::default() },
         };
         if self.completed_tx.send(completed).is_err() {
             tracing::error!("query trace writer stopped");
@@ -398,7 +441,9 @@ impl TraceStore {
             error_code: error.as_ref().map(|value| value.0.clone()),
             error_message: error.map(|value| value.1),
         };
-        let completed = CompletedTrace { summary, result: std::mem::take(&mut span.capture.result) };
+        let mut result = std::mem::take(&mut span.capture.result);
+        result.omitted = !span.capture.keep_rows;
+        let completed = CompletedTrace { summary, result };
         if self.completed_tx.send(completed).is_err() {
             tracing::error!(trace_id = span.id, "query trace writer stopped");
         }
@@ -465,6 +510,10 @@ impl Drop for TraceSpan {
 
 #[derive(Default)]
 struct ResultCapture {
+    /// False under [`TraceLevel::Statements`]: columns and rows are dropped as
+    /// they arrive rather than being collected and discarded later, so a pool
+    /// that does not want its data kept never holds it in the first place.
+    keep_rows: bool,
     result: QueryResult,
     current_set: Option<usize>,
     row_count: u64,
@@ -476,14 +525,27 @@ struct ResultCapture {
 }
 
 impl ResultCapture {
+    fn new(keep_rows: bool) -> Self {
+        Self { keep_rows, ..Self::default() }
+    }
+
     fn begin_result_set(&mut self, columns: Vec<String>) {
+        if !self.keep_rows {
+            return;
+        }
         self.result.sets.push(ResultSet { columns, ..ResultSet::default() });
         self.current_set = Some(self.result.sets.len() - 1);
     }
 
     fn command_complete(&mut self, tag: String, rows: u64) {
+        // The tag and the row count are facts about the statement, not the data
+        // it returned, so they survive at every level: "UPDATE 4000" is exactly
+        // the sort of thing you want to see without wanting the 4000 rows.
         self.row_count = self.row_count.saturating_add(rows);
         self.command_tag = Some(tag.clone());
+        if !self.keep_rows {
+            return;
+        }
         let index = match self.current_set {
             Some(index) => index,
             None => {
@@ -500,6 +562,12 @@ impl ResultCapture {
     }
 
     fn push_row(&mut self, row: Vec<Option<String>>) {
+        if !self.keep_rows {
+            // Not truncation: nothing was ever going to be kept, and saying
+            // "truncated" would read as "there was more" instead of "there was
+            // none of it".
+            return;
+        }
         if self.captured_rows >= MAX_RESULT_ROWS || self.bytes >= MAX_RESULT_BYTES {
             self.truncated = true;
             return;
@@ -599,11 +667,16 @@ mod tests {
     use super::*;
 
     fn context() -> TraceContext {
+        context_at(TraceLevel::Full)
+    }
+
+    fn context_at(level: TraceLevel) -> TraceContext {
         TraceContext {
             pool: "app_main".into(),
             user: "svc_orders".into(),
             application: Some("orders-api".into()),
             client_addr: "127.0.0.1:1234".into(),
+            level,
         }
     }
 
@@ -656,6 +729,66 @@ mod tests {
     }
 
     #[test]
+    fn statements_only_keeps_what_ran_and_none_of_what_came_back() {
+        // The distinction the level exists for: timings, tag, row count and
+        // outcome are diagnostics; the rows themselves are the customer's data.
+        let store = TraceStore::memory();
+        let mut span = store.begin(&context_at(TraceLevel::Statements), "select * from patients");
+        span.assign("primary/127.0.0.1:5432", Some(42));
+        span.begin_result_set(vec!["name".into()]);
+        span.push_row(vec![Some("Ada Lovelace".into())]);
+        span.command_complete("SELECT 1", 1);
+        span.succeed();
+        wait_for_history(&store);
+
+        let summary = &store.list(&TraceFilter::default()).unwrap()[0];
+        assert_eq!(summary.sql, "select * from patients", "the statement is still the point");
+        assert_eq!(summary.row_count, 1, "how many rows came back is not the rows");
+        assert_eq!(summary.command_tag.as_deref(), Some("SELECT 1"));
+        assert_eq!(summary.backend_pid, Some(42));
+        assert!(!summary.result_truncated, "nothing was truncated; nothing was collected");
+
+        let detail = store.get(summary.id).unwrap().unwrap();
+        assert!(detail.result.sets.is_empty());
+        assert!(detail.result.omitted, "an empty result must be distinguishable from a withheld one");
+    }
+
+    #[test]
+    fn tracing_off_records_nothing_at_all() {
+        let store = TraceStore::memory();
+        let context = context_at(TraceLevel::Off);
+        let mut span = store.begin(&context, "select 42");
+        assert!(store.active().is_empty(), "a pool with tracing off does not appear under 'running now'");
+        span.assign("primary/127.0.0.1:5432", Some(42));
+        span.push_row(vec![Some("42".into())]);
+        span.command_complete("SELECT 1", 1);
+        span.succeed();
+        store.record_failure(&context, "connection checkout", Duration::from_secs(5), "53300", "pool exhausted");
+
+        // Nothing is queued, so there is nothing to wait for; give the writer a
+        // chance to prove it would have flushed.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(store.list(&TraceFilter::default()).unwrap().is_empty());
+        assert_eq!(store.count(&TraceFilter::default()).unwrap(), 0);
+    }
+
+    #[test]
+    fn a_cancelled_span_from_a_silent_pool_is_not_resurrected_by_drop() {
+        // `Drop` is what records an abandoned statement. An inert span must not
+        // use that path to write the trace its pool asked not to have.
+        let store = TraceStore::memory();
+        drop(store.begin(&context_at(TraceLevel::Off), "select 42"));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(store.list(&TraceFilter::default()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_result_stored_before_the_setting_existed_reads_as_captured() {
+        let old: QueryResult = serde_json::from_str(r#"{"sets":[]}"#).unwrap();
+        assert!(!old.omitted, "backfilling 'withheld' onto traces that were captured would be a lie");
+    }
+
+    #[test]
     fn filters_and_clear_are_applied_by_sqlite() {
         let store = TraceStore::memory();
         store.begin(&context(), "select 1").succeed();
@@ -702,7 +835,7 @@ mod tests {
     #[test]
     fn result_capture_is_bounded() {
         // A trace must never be the reason a large result set costs memory.
-        let mut capture = ResultCapture::default();
+        let mut capture = ResultCapture::new(true);
         capture.begin_result_set(vec!["value".into()]);
         for _ in 0..MAX_RESULT_ROWS + 10 {
             capture.push_row(vec![Some("x".into())]);
@@ -713,7 +846,7 @@ mod tests {
 
     #[test]
     fn the_byte_budget_truncates_before_the_row_budget_does() {
-        let mut capture = ResultCapture::default();
+        let mut capture = ResultCapture::new(true);
         capture.begin_result_set(vec!["blob".into()]);
         let big = "x".repeat(MAX_RESULT_BYTES / 2 + 1);
         capture.push_row(vec![Some(big.clone())]);
@@ -724,7 +857,7 @@ mod tests {
 
     #[test]
     fn rows_arriving_without_a_description_still_land_in_a_set() {
-        let mut capture = ResultCapture::default();
+        let mut capture = ResultCapture::new(true);
         capture.push_row(vec![Some("orphan".into())]);
         capture.command_complete("SELECT 1".into(), 1);
         assert_eq!(capture.result.sets.len(), 1);

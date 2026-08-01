@@ -231,6 +231,7 @@ mod tests {
             settings: Default::default(),
             routing: RoutingConfig { read_write_split: split, ..RoutingConfig::default() },
             backend_auth: Default::default(),
+            trace: Default::default(),
             disabled: false,
             description: None,
         }

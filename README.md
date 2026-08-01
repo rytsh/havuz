@@ -181,7 +181,10 @@ transaction mode, the configured fan-in is fiction.
 ### Per-user backend authentication
 
 A pool set to `backend_auth = per_user` opens its connections as the client
-rather than as a service account. Each user gets a set of connections of its
+rather than as a service account. It is a PostgreSQL-family feature: the JDBC
+bridge holds one connection string with one identity in it, so it declares the
+capability as absent and the admin API refuses the setting rather than accepting
+it and pooling everyone through the service account anyway. Each user gets a set of connections of its
 own, so `max_size` becomes a per-user budget:
 
 | | shared | per user |
@@ -216,6 +219,17 @@ across.
 That last part is the migration path. Flipping a pool to `per_user` changes
 nothing until each user is switched over individually on the **Users** page, so
 you can move one application at a time and watch what it costs.
+
+The service account is nevertheless *optional* on such a pool: leave the backend
+user and password blank and the pool has no shared identity at all. Every client
+then connects as itself or not at all, which is the point of the mode taken to
+its conclusion — and worth having, because a service account that exists is a
+service account someone can use. The price is the things that have no client to
+borrow from: *Test Connection* reports that there is nothing to probe with, a
+user still on the shared identity is refused with an error saying so, and
+`read_write_split` is rejected outright because replica lag cannot be measured.
+Under `backend_auth = shared` the account remains mandatory; there is no other
+way in.
 
 ### The JDBC bridge, and why it is a different kind of thing
 
@@ -364,6 +378,27 @@ target, backend PID and elapsed time. Completed traces include pool wait time,
 execution time, command status, PostgreSQL errors and a sample of the actual
 result rows. History can be filtered by pool, user, status, SQL/application text
 and minimum duration.
+
+How much of that a pool produces is `trace`, chosen when the pool is created and
+changeable at any time afterwards:
+
+| | recorded | not recorded |
+|---|---|---|
+| `off` | nothing; the pool does not appear on the screen at all | everything |
+| `statements` (default) | SQL, wait and execution time, target, backend PID, command tag, row count, SQLSTATE | result rows |
+| `full` | all of the above | — |
+
+It is two questions rather than a switch because they are two decisions.
+Keeping *what ran* is diagnostics and is what a pooler exists to be able to
+explain. Keeping *what came back* is a sample of production rows in a second
+file with a lifetime of its own, and no amount of usefulness makes that the
+same choice. Bind parameter values are never recorded at any level: a `Bind` is
+traced through the prepared statement it names, so `$1` stays `$1`.
+
+`statements` is the default, including for pools that predate the setting.
+Upgrading therefore stops result capture on existing pools rather than silently
+continuing to sample data nobody was asked about; turn it back up per pool where
+you want it.
 
 Completed traces are stored for seven days in `traces.sqlite3` beside
 `state.json`. The file and its WAL are created with mode `0600` on Unix. Result

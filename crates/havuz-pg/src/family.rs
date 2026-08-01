@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use havuz_control::{BackendIdentity as BackendIdentityReport, ControlPlane, Registries, TargetReport, TraceContext};
 use havuz_core::state::{PoolConfig, State};
-use havuz_core::{SslMode, StateStore};
+use havuz_core::{SslMode, StateStore, TraceLevel};
 use havuz_pool::PoolSnapshot;
 use havuz_proto::{
     BackendConn, PoolMode, PoolRoute, Probe, ProtoError, ProtoResult, ProtocolFamily, ResetOutcome, ServeOutcome,
@@ -193,6 +193,13 @@ impl PgFamily {
         self.state.load().pools.get(name).map(|p| p.mode).unwrap_or(PoolMode::Session)
     }
 
+    /// Read at connect time rather than baked into the pool, so turning tracing
+    /// up during an incident takes effect on the next session instead of
+    /// requiring the pool to be rebuilt underneath its clients.
+    fn trace_level(&self, name: &str) -> TraceLevel {
+        self.state.load().pools.get(name).map(|p| p.trace).unwrap_or_default()
+    }
+
     /// Bring the live pool set in line with the configuration.
     ///
     /// Pools that disappeared are drained rather than dropped, so in-flight
@@ -311,6 +318,16 @@ impl PgFamily {
         credential: Option<&BackendCredential>,
     ) -> Result<Arc<PoolGroup>, ProtoError> {
         let Some(credential) = credential else {
+            // A per-user pool may be created without a service account at all,
+            // in which case the fallback these clients rely on does not exist.
+            // Saying so beats letting the backend reject a connection opened as
+            // nobody, which reads like a database misconfiguration.
+            if entry.config.backend_auth.is_per_user() && entry.config.backend_user.is_empty() {
+                return Err(ProtoError::auth(format!(
+                    "pool '{pool}' has no service account: give user '{user}' a database role of its own, \
+                     or add a backend user to the pool"
+                )));
+            }
             return Ok(entry.shared.clone());
         };
         let fingerprint = credential.fingerprint();
@@ -540,6 +557,7 @@ impl ProtocolFamily for PgFamily {
             user: identity.user.clone(),
             application: identity.application_name.clone(),
             client_addr: identity.peer.to_string(),
+            level: self.trace_level(&identity.pool),
         };
         let holder = self.registries.holders.session(trace_context.clone(), mode);
         holder.waiting_for_startup();
@@ -751,10 +769,14 @@ impl ProtocolFamily for PgFamily {
     async fn probe(&self, pool_name: &str) -> ProtoResult<Probe> {
         // Probing runs on the service account: there is no client here, so
         // there is no credential to borrow.
-        let group = self
-            .entry(pool_name)
-            .map(|entry| entry.shared.clone())
-            .ok_or_else(|| ProtoError::NoRoute(pool_name.to_string()))?;
+        let entry = self.entry(pool_name).ok_or_else(|| ProtoError::NoRoute(pool_name.to_string()))?;
+        if entry.config.backend_user.is_empty() {
+            return Err(ProtoError::auth(
+                "this pool has no service account, so there is no identity to probe with: \
+                 every backend connection is opened as the client that asked for it",
+            ));
+        }
+        let group = entry.shared.clone();
         let started = std::time::Instant::now();
         let checkout = group.primary().acquire().await.map_err(|e| ProtoError::backend(e.to_string()))?;
 
@@ -853,6 +875,7 @@ mod tests {
             settings: Default::default(),
             routing: Default::default(),
             backend_auth: Default::default(),
+            trace: Default::default(),
             disabled: false,
             description: None,
         }
@@ -867,6 +890,30 @@ mod tests {
             .put(key, havuz_secrets::user_verifier("svc_orders"), &ScramVerifier::from_password(password).encode())
             .unwrap();
         state
+    }
+
+    #[tokio::test]
+    async fn the_trace_level_is_read_from_the_pool_at_connect_time() {
+        // Read per session rather than captured when the pool is built, so
+        // raising capture during an incident does not mean rebuilding the pool
+        // underneath the clients it is meant to diagnose.
+        let key = MasterKey::generate();
+        let mut state = state_with_user("hunter2", &key);
+        state.pools.get_mut("app_main").unwrap().trace = TraceLevel::Off;
+        let store = Arc::new(StateStore::ephemeral(state));
+        let family = family_for(store.clone(), key);
+
+        assert_eq!(family.trace_level("app_main"), TraceLevel::Off);
+        assert_eq!(family.trace_level("no_such_pool"), TraceLevel::Statements, "the default, not a panic");
+
+        store
+            .update(|s| {
+                s.pools.get_mut("app_main").unwrap().trace = TraceLevel::Full;
+                true
+            })
+            .await
+            .unwrap();
+        assert_eq!(family.trace_level("app_main"), TraceLevel::Full, "without a pool rebuild");
     }
 
     #[tokio::test]
@@ -1004,6 +1051,45 @@ mod tests {
         let group = family.group_for(&entry, "app_main", "svc_legacy", None).unwrap();
         assert!(Arc::ptr_eq(&group, &entry.shared));
         assert!(family.backend_identities().is_empty());
+    }
+
+    #[tokio::test]
+    async fn without_a_service_account_a_client_that_is_not_its_own_role_is_told_why() {
+        // A per-user pool may be created with no service account at all. The
+        // fallback then does not exist, and saying so beats opening a backend
+        // connection as nobody and relaying whatever the database makes of it.
+        let key = MasterKey::generate();
+        let mut state = state_with_user("hunter2", &key);
+        let pool = state.pools.get_mut("app_main").unwrap();
+        pool.backend_auth = BackendAuth::PerUser;
+        pool.backend_user = String::new();
+
+        let family = PgFamily::new(Arc::new(StateStore::ephemeral(state)), Arc::new(key), Registries::ephemeral());
+        family.sync_pools().unwrap();
+        let entry = family.entry("app_main").unwrap();
+
+        let err = family.group_for(&entry, "app_main", "svc_legacy", None).unwrap_err();
+        assert_eq!(err.kind(), "auth");
+        assert!(err.to_string().contains("svc_legacy"), "the message must name the user to fix: {err}");
+
+        // A user that does bring a credential is unaffected.
+        assert!(family.group_for(&entry, "app_main", "svc_orders", Some(&credential("hunter2"))).is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_pool_without_a_service_account_cannot_be_probed() {
+        let key = MasterKey::generate();
+        let mut state = state_with_user("hunter2", &key);
+        let pool = state.pools.get_mut("app_main").unwrap();
+        pool.backend_auth = BackendAuth::PerUser;
+        pool.backend_user = String::new();
+
+        let family = PgFamily::new(Arc::new(StateStore::ephemeral(state)), Arc::new(key), Registries::ephemeral());
+        family.sync_pools().unwrap();
+
+        let err = family.probe("app_main").await.unwrap_err();
+        assert_eq!(err.kind(), "auth");
+        assert!(err.to_string().contains("service account"), "{err}");
     }
 
     #[tokio::test]

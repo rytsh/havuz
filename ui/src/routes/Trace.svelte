@@ -255,6 +255,10 @@
 <div class="page-heading">
   <div>
     <h1>Query trace</h1>
+    <p class="subtitle">
+      Shows the pools that record queries. A pool set to record nothing is absent here entirely — what each one keeps
+      is on <a href="#/databases">Databases</a>, under Configure.
+    </p>
   </div>
   <div class="row">
     <span class="badge">{data?.retention_days ?? 7} day retention</span>
@@ -483,6 +487,13 @@
       {#if detail.result_truncated}
         <div class="warning">Result sample reached the {data?.result_limits.rows ?? 100} row or size limit and was truncated.</div>
       {/if}
+      {#if detail.result.omitted}
+        <div class="trace-empty">
+          This pool records queries only, so the rows this statement returned were never kept — {detail.row_count}
+          of them, according to the backend. Switch its tracing to “Queries and their results” under
+          <strong>Databases → Configure</strong> to capture a sample.
+        </div>
+      {/if}
       {#each detail.result.sets as result, index}
         <div class="result-heading"><span>Result set {index + 1}</span><code>{result.command_tag ?? "rows"}</code></div>
         {#if result.rows.length > 0}
@@ -498,7 +509,7 @@
           </div>
         {/if}
       {/each}
-      {#if detail.result.sets.length === 0 && !detail.error_message}<div class="trace-empty">The query returned no result set.</div>{/if}
+      {#if detail.result.sets.length === 0 && !detail.result.omitted && !detail.error_message}<div class="trace-empty">The query returned no result set.</div>{/if}
     </div>
   </div>
 {/if}

@@ -1117,6 +1117,7 @@ mod tests {
                 ..RoutingConfig::default()
             },
             backend_auth: Default::default(),
+            trace: Default::default(),
             disabled: false,
             description: None,
         };

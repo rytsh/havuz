@@ -6,9 +6,9 @@ use axum::extract::{Path, Query, State};
 use axum::response::IntoResponse;
 use axum::routing::{get, patch, post};
 use axum::{Json, Router};
-use havuz_core::state::{BackendAuth, PoolConfig, PoolLimits, RoutingConfig, Target, UserConfig, Warning};
+use havuz_core::state::{BackendAuth, PoolConfig, PoolLimits, RoutingConfig, Target, TraceLevel, UserConfig, Warning};
 use havuz_pool::PoolSnapshot;
-use havuz_registry::PoolMode;
+use havuz_registry::{FieldRole, PoolMode};
 use havuz_secrets::ScramVerifier;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -90,6 +90,7 @@ struct PoolView {
     backend_user: String,
     listen_port: u16,
     backend_auth: BackendAuth,
+    trace: TraceLevel,
     /// Whether a password is stored. Never the password itself.
     has_backend_password: bool,
     targets: Vec<Target>,
@@ -118,6 +119,7 @@ fn pool_view(name: &str, config: &PoolConfig, state: &havuz_core::State, runtime
         backend_user: config.backend_user.clone(),
         listen_port: config.listen_port,
         backend_auth: config.backend_auth,
+        trace: config.trace,
         has_backend_password: state.secrets.contains(&havuz_secrets::pool_backend_password(name)),
         targets: config.targets.clone(),
         limits: config.limits.clone(),
@@ -179,6 +181,12 @@ struct CreatePool {
     /// shared service account, which is what every other pooler does.
     #[serde(default)]
     backend_auth: BackendAuth,
+    /// How much of this pool's traffic is recorded. Defaults to statements
+    /// only: the timings and outcomes are what a pooler is asked to explain,
+    /// and the row values are the part that turns a trace into a copy of the
+    /// data.
+    #[serde(default)]
+    trace: TraceLevel,
     #[serde(default)]
     limits: Option<PoolLimits>,
     #[serde(default)]
@@ -234,9 +242,31 @@ async fn create_pool(
     let (family, profile) = havuz_registry::resolve(&body.family, body.profile.as_deref())
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
+    if body.backend_auth.is_per_user() && !family.capabilities.per_user_auth {
+        // Refusing beats accepting and quietly pooling everyone through the
+        // service account, which looks identical in the UI and nothing like it
+        // in the database's own view of who is connected.
+        return Err(ApiError::BadRequest(format!(
+            "family '{}' cannot open backend connections as the connecting client; use a shared service account",
+            family.id
+        )));
+    }
+
     // Validate the family-specific settings against the same declaration the
     // UI rendered its form from.
+    //
+    // Under per-user auth every client arrives with its own credential, so the
+    // service account stops being the way in and becomes an optional fallback
+    // for probes and for users that have not been moved across yet. Leaving it
+    // blank there is a legitimate choice — a pool nobody but named users can
+    // open — so the family's `required` flag is relaxed for credential fields
+    // rather than being enforced against a mode it predates.
+    let credentials_optional = body.backend_auth.is_per_user();
     for field in family.config_fields {
+        let field = match field.role {
+            Some(FieldRole::User | FieldRole::Password) if credentials_optional => field.optional(),
+            _ => *field,
+        };
         field.validate(body.settings.get(field.name)).map_err(|e| ApiError::BadRequest(e.to_string()))?;
     }
     if let Some(unknown) = body.settings.keys().find(|k| !family.config_fields.iter().any(|f| f.name == k.as_str())) {
@@ -274,6 +304,7 @@ async fn create_pool(
         settings,
         routing: body.routing.unwrap_or_default(),
         backend_auth: body.backend_auth,
+        trace: body.trace,
         disabled: false,
         description: body.description,
     };
@@ -314,6 +345,11 @@ struct UpdatePool {
     max_client_connections: Option<u32>,
     #[serde(default)]
     listen_port: Option<u16>,
+    /// Changeable after creation on purpose: turning capture up for the length
+    /// of an incident and back down afterwards is the normal way to use it, and
+    /// having to recreate the pool would make that impossible.
+    #[serde(default)]
+    trace: Option<TraceLevel>,
 }
 
 async fn update_pool(
@@ -343,6 +379,9 @@ async fn update_pool(
                 }
                 if let Some(listen_port) = body.listen_port {
                     pool.listen_port = listen_port;
+                }
+                if let Some(trace) = body.trace {
+                    pool.trace = trace;
                 }
                 true
             }
@@ -1456,6 +1495,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_pool_records_statements_unless_asked_otherwise() {
+        let (app, state) = app();
+        let (status, body) = post(&app, "/api/v1/pools", pool_payload()).await;
+        assert_eq!(status, StatusCode::CREATED, "body: {body}");
+        assert_eq!(body["trace"], "statements");
+        assert_eq!(state.store.load().pools["app_main"].trace, havuz_core::TraceLevel::Statements);
+    }
+
+    #[tokio::test]
+    async fn the_trace_level_is_chosen_at_creation_and_changeable_afterwards() {
+        // Turning capture up for the length of an incident and back down again
+        // is the normal way to use this, so it cannot be creation-only.
+        let (app, state) = app();
+        let mut payload = pool_payload();
+        payload["trace"] = json!("full");
+        let (status, body) = post(&app, "/api/v1/pools", payload).await;
+        assert_eq!(status, StatusCode::CREATED, "body: {body}");
+        assert_eq!(body["trace"], "full");
+
+        let (status, body) = patch(&app, "/api/v1/pools/app_main", json!({ "trace": "off" })).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(body["trace"], "off");
+        assert_eq!(state.store.load().pools["app_main"].trace, havuz_core::TraceLevel::Off);
+
+        // An update that says nothing about tracing leaves it alone.
+        patch(&app, "/api/v1/pools/app_main", json!({ "max_size": 5 })).await;
+        assert_eq!(state.store.load().pools["app_main"].trace, havuz_core::TraceLevel::Off);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_trace_level_is_refused_rather_than_defaulted() {
+        let (app, state) = app();
+        let mut payload = pool_payload();
+        payload["trace"] = json!("everything");
+        let (status, _) = post(&app, "/api/v1/pools", payload).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(state.store.load().pools.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_per_user_pool_does_not_need_a_service_account() {
+        // Every client brings its own credential, so the service account is a
+        // fallback rather than the way in. Demanding one would be demanding a
+        // login the operator may deliberately not want to exist.
+        let (app, state) = app();
+        let mut payload = pool_payload();
+        payload["backend_auth"] = json!("per_user");
+        payload["settings"] = json!({ "host": "pg-primary.internal", "port": 5432, "database": "appdb" });
+
+        let (status, body) = post(&app, "/api/v1/pools", payload).await;
+        assert_eq!(status, StatusCode::CREATED, "body: {body}");
+        assert_eq!(body["backend_user"], "");
+        assert_eq!(body["has_backend_password"], false);
+        assert_eq!(state.store.load().pools["app_main"].backend_user, "");
+    }
+
+    #[tokio::test]
+    async fn a_shared_pool_still_needs_a_service_account() {
+        // The relaxation is per-user auth's alone: a shared pool with no
+        // account is a pool nobody can connect through.
+        let (app, state) = app();
+        let mut payload = pool_payload();
+        payload["settings"] = json!({ "host": "pg-primary.internal", "port": 5432, "database": "appdb" });
+
+        let (status, body) = post(&app, "/api/v1/pools", payload).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+        assert!(body["error"]["message"].as_str().unwrap_or_default().contains("username"), "body: {body}");
+        assert!(state.store.load().pools.is_empty());
+    }
+
+    #[tokio::test]
+    async fn per_user_authentication_is_refused_by_families_that_cannot_do_it() {
+        // Accepting it would pool every client through the service account
+        // while the dashboard claimed otherwise.
+        let (app, state) = app();
+        let payload = json!({
+            "name": "legacy",
+            "family": "jdbc",
+            "listen_port": 6433,
+            "backend_auth": "per_user",
+            "settings": {
+                "url": "jdbc:oracle:thin:@//db.internal:1521/ORCLPDB1",
+                "driver_paths": "/opt/havuz/drivers/ojdbc11.jar",
+                "username": "app",
+                "password": "hunter2",
+            },
+            "limits": { "max_size": 3, "max_client_connections": 100 }
+        });
+
+        let (status, body) = post(&app, "/api/v1/pools", payload).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+        assert!(
+            body["error"]["message"].as_str().unwrap_or_default().contains("connecting client"),
+            "the reason must name the limitation, not the credentials: {body}"
+        );
+        assert!(state.store.load().pools.is_empty());
+    }
+
+    #[tokio::test]
     async fn per_user_authentication_is_refused_without_client_tls() {
         // It asks clients for their password. Catching it here beats letting
         // every connection to the pool fail afterwards.
@@ -1559,6 +1697,7 @@ mod tests {
             user: "svc_orders".into(),
             application: Some("orders-api".into()),
             client_addr: "127.0.0.1:5000".into(),
+            level: havuz_core::TraceLevel::Full,
         };
         let holder = state.registries.holders.session(context.clone(), havuz_core::PoolMode::Transaction);
         holder.idle_in_transaction("primary/127.0.0.1:5432".into(), Some(4242));

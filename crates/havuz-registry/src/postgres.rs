@@ -17,6 +17,7 @@ pub(crate) const POSTGRES: FamilyDescriptor = FamilyDescriptor {
         tls: true,
         scram_sha256: true,
         md5_auth: true,
+        per_user_auth: true,
         prepared_statements: true,
         cancel_request: true,
         bulk_copy: true,

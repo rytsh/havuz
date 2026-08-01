@@ -172,6 +172,7 @@ mod tests {
             settings: Default::default(),
             routing: Default::default(),
             backend_auth: Default::default(),
+            trace: Default::default(),
             disabled: false,
             description: None,
         }

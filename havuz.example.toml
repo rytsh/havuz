@@ -52,6 +52,12 @@ ui = true
 
 [state]
 # Holds state.json, which contains sealed credentials. Written with mode 0600.
+#
+# Also holds traces.sqlite3, the query trace history. How much each pool puts
+# there is the pool's own `trace` setting — `off`, `statements` (the default) or
+# `full`, which additionally keeps a sample of the rows queries returned. Set it
+# per pool from the dashboard or the admin API, not here: it is a property of
+# the data behind a pool, not of the process.
 dir = "./data"
 
 [log]

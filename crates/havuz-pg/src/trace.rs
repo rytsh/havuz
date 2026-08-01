@@ -154,6 +154,7 @@ mod tests {
             user: "svc_orders".into(),
             application: Some("orders-api".into()),
             client_addr: "127.0.0.1:1234".into(),
+            level: havuz_core::TraceLevel::Full,
         }
     }
 

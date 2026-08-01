@@ -191,6 +191,21 @@ impl State {
             if pool.routing.read_write_split && pool.routing.sticky_after_write.is_zero() {
                 out.push(Warning::NoStickyWindow { pool: name.clone() });
             }
+            // Per-user auth without a service account removes the fallback the
+            // migration path relies on. The users left on it are refused when
+            // they connect, which is far too late to find out.
+            if pool.backend_auth.is_per_user() && pool.backend_user.is_empty() {
+                let mut stranded: Vec<String> = self
+                    .users
+                    .iter()
+                    .filter(|(_, user)| !user.own_backend_role && user.pools.iter().any(|p| p == name))
+                    .map(|(user, _)| user.clone())
+                    .collect();
+                stranded.sort();
+                if !stranded.is_empty() {
+                    out.push(Warning::UsersWithoutBackendRole { pool: name.clone(), users: stranded });
+                }
+            }
             // Read-only is enforced by refusing the statements that would turn
             // `default_transaction_read_only` back off, which means reading
             // every statement. Session mode is a byte shovel and does not, so
@@ -258,6 +273,13 @@ pub enum Warning {
     NoStickyWindow {
         pool: String,
     },
+    /// A per-user pool with no service account still has users who have not
+    /// been moved onto a database role of their own. There is nothing left for
+    /// them to fall back to, so they are locked out at connect time.
+    UsersWithoutBackendRole {
+        pool: String,
+        users: Vec<String>,
+    },
 }
 
 /// One client-facing socket and the pools reachable through it.
@@ -322,6 +344,53 @@ impl BackendAuth {
     }
 }
 
+/// How much of a pool's traffic is written to the query trace store.
+///
+/// Tracing is the feature that makes a pooler explicable — which statement
+/// waited, on which backend, and what it returned — and it is also the feature
+/// that turns the pooler into a copy of your data. Those are not the same
+/// decision, so this is not a boolean: keeping *what ran* is cheap and rarely
+/// sensitive, while keeping *what came back* is a sample of production rows
+/// sitting in a second file with a second lifetime.
+///
+/// Picked per pool, because the answer differs per pool: a queue table and a
+/// table of patient records do not deserve the same treatment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TraceLevel {
+    /// Nothing is recorded. The pool disappears from the query trace screen
+    /// entirely — no history, and no entry under "running now" either.
+    Off,
+    /// Statement text, timings, target, backend PID and outcome. Enough to
+    /// answer why something was slow and where it ran; no row values, so a
+    /// trace cannot leak what the query returned.
+    #[default]
+    Statements,
+    /// Everything [`TraceLevel::Statements`] keeps, plus a bounded sample of
+    /// the rows the backend sent back. The sample is capped, but it is real
+    /// production data and outlives the connection that produced it.
+    Full,
+}
+
+impl TraceLevel {
+    pub fn is_off(self) -> bool {
+        matches!(self, TraceLevel::Off)
+    }
+
+    /// Whether result rows are kept alongside the statement.
+    pub fn captures_results(self) -> bool {
+        matches!(self, TraceLevel::Full)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TraceLevel::Off => "off",
+            TraceLevel::Statements => "statements",
+            TraceLevel::Full => "full",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PoolConfig {
     /// Registry family id, e.g. `postgres`.
@@ -334,10 +403,14 @@ pub struct PoolConfig {
     /// Backend service account. The password lives in the secret store, keyed
     /// by `havuz_secrets::pool_backend_password(pool_name)`.
     ///
-    /// Still required under [`BackendAuth::PerUser`], where it stops being the
-    /// account clients run as and becomes the account health probes and "Test
+    /// Required under [`BackendAuth::Shared`], which has no other way in.
+    /// Optional under [`BackendAuth::PerUser`], where it stops being the account
+    /// clients run as and becomes the account health probes and "Test
     /// Connection" use — those have no client, so they have no credential to
-    /// borrow. It also serves users who have no database role of their own.
+    /// borrow — plus the fallback for users who have no database role of their
+    /// own. Empty means there is no service account: only users connecting as
+    /// themselves get in, and probing is unavailable, which is why
+    /// [`RoutingConfig::read_write_split`] then has to be off.
     pub backend_user: String,
     /// Database opened on the backend.
     pub database: String,
@@ -356,6 +429,9 @@ pub struct PoolConfig {
     /// Whose credentials backend connections are opened with.
     #[serde(default)]
     pub backend_auth: BackendAuth,
+    /// How much of this pool's traffic reaches the query trace store.
+    #[serde(default)]
+    pub trace: TraceLevel,
     #[serde(default)]
     pub disabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -651,6 +727,7 @@ mod tests {
             settings: Default::default(),
             routing: Default::default(),
             backend_auth: Default::default(),
+            trace: Default::default(),
             disabled: false,
             description: None,
         }
@@ -778,6 +855,32 @@ mod tests {
         without.remove("backend_auth");
         let parsed: PoolConfig = serde_json::from_value(serde_json::Value::Object(without)).unwrap();
         assert_eq!(parsed.backend_auth, BackendAuth::Shared);
+    }
+
+    #[test]
+    fn a_pool_written_before_the_trace_setting_existed_records_statements_only() {
+        // Upgrading tightens rather than loosens: a pool that has never been
+        // asked stops keeping result rows, and keeps everything an operator
+        // actually diagnoses with. The other direction — silently continuing to
+        // sample production data because the file predates the question — is
+        // not a default anyone consented to.
+        let json = serde_json::to_value(pool()).unwrap();
+        let mut without = json.as_object().unwrap().clone();
+        without.remove("trace");
+        let parsed: PoolConfig = serde_json::from_value(serde_json::Value::Object(without)).unwrap();
+        assert_eq!(parsed.trace, TraceLevel::Statements);
+        assert!(!parsed.trace.captures_results());
+        assert!(!parsed.trace.is_off());
+    }
+
+    #[test]
+    fn trace_levels_serialise_as_the_names_the_api_uses() {
+        for (level, name) in
+            [(TraceLevel::Off, "off"), (TraceLevel::Statements, "statements"), (TraceLevel::Full, "full")]
+        {
+            assert_eq!(serde_json::to_value(level).unwrap(), serde_json::json!(name));
+            assert_eq!(level.as_str(), name);
+        }
     }
 
     #[test]
@@ -910,6 +1013,36 @@ mod tests {
         let mut state = State::default();
         state.pools.insert("orphan".into(), pool());
         assert!(state.warnings().iter().any(|w| matches!(w, Warning::PoolWithoutUsers { pool } if pool == "orphan")));
+    }
+
+    #[test]
+    fn a_per_user_pool_without_a_service_account_flags_the_users_it_locks_out() {
+        // The fallback these users rely on does not exist, and they find out
+        // when they connect unless something says so first.
+        let mut p = pool();
+        p.backend_auth = BackendAuth::PerUser;
+        p.backend_user = String::new();
+        let mut state = state_with_pool("app_main", p);
+
+        let stranded = state.warnings().into_iter().find_map(|w| match w {
+            Warning::UsersWithoutBackendRole { pool, users } if pool == "app_main" => Some(users),
+            _ => None,
+        });
+        assert_eq!(stranded, Some(vec!["svc".to_string()]));
+
+        state.users.get_mut("svc").unwrap().own_backend_role = true;
+        assert!(
+            !state.warnings().iter().any(|w| matches!(w, Warning::UsersWithoutBackendRole { .. })),
+            "a user on its own database role needs no service account"
+        );
+    }
+
+    #[test]
+    fn a_per_user_pool_with_a_service_account_strands_nobody() {
+        let mut p = pool();
+        p.backend_auth = BackendAuth::PerUser;
+        let state = state_with_pool("app_main", p);
+        assert!(!state.warnings().iter().any(|w| matches!(w, Warning::UsersWithoutBackendRole { .. })));
     }
 
     #[test]
