@@ -20,9 +20,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+pub use havuz_control::PrimaryReason;
+
+use havuz_control::{PrimaryReasonCount, ReplicaRouting, RoutingReport};
 use havuz_core::RoutingConfig;
-use havuz_pool::{BreakerConfig, BreakerSnapshot, CircuitBreaker};
-use serde::Serialize;
+use havuz_pool::{BreakerConfig, CircuitBreaker};
 
 use crate::classify::RouteIntent;
 
@@ -35,35 +37,6 @@ pub enum Route {
     Primary(PrimaryReason),
     /// Index into the replica list.
     Replica(usize),
-}
-
-/// Why a statement went to the primary. Surfaced in the dashboard, because
-/// "why is my replica idle?" is otherwise unanswerable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PrimaryReason {
-    /// Read/write split is not enabled for this pool.
-    SplitDisabled,
-    /// The statement writes, or could not be proven not to.
-    Write,
-    /// The session wrote recently, so its reads follow it to the primary.
-    ReadAfterWrite,
-    /// A transaction is open and was already routed.
-    TransactionPinned,
-    /// Every replica is unhealthy, lagging, or absent.
-    NoReplicaAvailable,
-}
-
-impl PrimaryReason {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            PrimaryReason::SplitDisabled => "split_disabled",
-            PrimaryReason::Write => "write",
-            PrimaryReason::ReadAfterWrite => "read_after_write",
-            PrimaryReason::TransactionPinned => "transaction_pinned",
-            PrimaryReason::NoReplicaAvailable => "no_replica_available",
-        }
-    }
 }
 
 /// Health and position of one replica.
@@ -112,29 +85,13 @@ impl ReplicaState {
         self.breaker.allows()
     }
 
-    pub fn snapshot(&self) -> ReplicaSnapshot {
-        ReplicaSnapshot {
+    pub fn snapshot(&self) -> ReplicaRouting {
+        ReplicaRouting {
             label: self.label.clone(),
             weight: self.weight,
             lag_millis: self.lag(),
             breaker: self.breaker.snapshot(),
         }
-    }
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct ReplicaSnapshot {
-    pub label: String,
-    pub weight: u32,
-    #[serde(serialize_with = "serialize_lag")]
-    pub lag_millis: Option<Duration>,
-    pub breaker: BreakerSnapshot,
-}
-
-fn serialize_lag<S: serde::Serializer>(value: &Option<Duration>, s: S) -> Result<S::Ok, S::Error> {
-    match value {
-        Some(d) => s.serialize_some(&(d.as_millis() as u64)),
-        None => s.serialize_none(),
     }
 }
 
@@ -193,7 +150,7 @@ impl RoutingStats {
         match route {
             Route::Primary(reason) => {
                 self.to_primary.fetch_add(1, Ordering::Relaxed);
-                self.primary_reasons[primary_reason_index(reason)].fetch_add(1, Ordering::Relaxed);
+                self.primary_reasons[reason.index()].fetch_add(1, Ordering::Relaxed);
             }
             Route::Replica(_) => {
                 self.to_replica.fetch_add(1, Ordering::Relaxed);
@@ -201,52 +158,24 @@ impl RoutingStats {
         }
     }
 
-    pub fn snapshot(&self) -> RoutingSnapshot {
+    pub fn snapshot(&self) -> RoutingReport {
         let to_primary = self.to_primary.load(Ordering::Relaxed);
         let to_replica = self.to_replica.load(Ordering::Relaxed);
         let total = to_primary + to_replica;
 
-        RoutingSnapshot {
+        RoutingReport {
             to_primary,
             to_replica,
             replica_share: (total > 0).then(|| to_replica as f32 / total as f32),
-            primary_reasons: PRIMARY_REASONS
+            primary_reasons: PrimaryReason::ALL
                 .iter()
                 .map(|reason| PrimaryReasonCount {
                     reason: *reason,
-                    count: self.primary_reasons[primary_reason_index(*reason)].load(Ordering::Relaxed),
+                    count: self.primary_reasons[reason.index()].load(Ordering::Relaxed),
                 })
                 .collect(),
         }
     }
-}
-
-const PRIMARY_REASONS: [PrimaryReason; 5] = [
-    PrimaryReason::SplitDisabled,
-    PrimaryReason::Write,
-    PrimaryReason::ReadAfterWrite,
-    PrimaryReason::TransactionPinned,
-    PrimaryReason::NoReplicaAvailable,
-];
-
-fn primary_reason_index(reason: PrimaryReason) -> usize {
-    PRIMARY_REASONS.iter().position(|r| *r == reason).expect("PRIMARY_REASONS is exhaustive")
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct RoutingSnapshot {
-    pub to_primary: u64,
-    pub to_replica: u64,
-    /// Fraction of statements a replica actually handled. The number that says
-    /// whether read/write split is doing anything.
-    pub replica_share: Option<f32>,
-    pub primary_reasons: Vec<PrimaryReasonCount>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct PrimaryReasonCount {
-    pub reason: PrimaryReason,
-    pub count: u64,
 }
 
 /// Picks targets.

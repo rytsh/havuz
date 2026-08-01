@@ -47,7 +47,7 @@ cargo build -q --release -p havuz-server
 
 cat > "$WORK/havuz.toml" <<TOML
 [server]
-listen = "0.0.0.0:$POOL_PORT"
+bind = "0.0.0.0"
 [admin]
 listen = "127.0.0.1:$ADMIN_PORT"
 [state]
@@ -71,9 +71,9 @@ api /api/v1/pools -H 'content-type: application/json' -d "{
     {\"host\": \"127.0.0.1\", \"port\": $PRIMARY_PORT, \"role\": \"primary\"},
     {\"host\": \"127.0.0.1\", \"port\": $REPLICA_PORT, \"role\": \"replica\"}
   ],
-  \"database\": \"appdb\", \"backend_user\": \"app\", \"backend_password\": \"hunter2\",
+  \"listen_port\": $POOL_PORT,
   \"settings\": {\"host\": \"127.0.0.1\", \"port\": $PRIMARY_PORT, \"database\": \"appdb\",
-                 \"username\": \"app\", \"sslmode\": \"disable\"},
+                 \"username\": \"app\", \"password\": \"hunter2\", \"sslmode\": \"disable\"},
   \"limits\": {\"max_size\": 3, \"max_client_connections\": 100},
   \"routing\": {\"read_write_split\": true, \"sticky_after_write\": \"1s\",
                 \"max_replica_lag\": \"5s\", \"health_interval\": \"2s\",

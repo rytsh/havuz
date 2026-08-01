@@ -1,10 +1,11 @@
 <script lang="ts">
   import { api } from "../lib/api";
-  import type { GroupSnapshot, Pool, PrimaryReason } from "../lib/types";
+  import type { GroupSnapshot, Pool, PoolIdentities, PrimaryReason } from "../lib/types";
 
   let pools = $state<Pool[]>([]);
   let selected = $state<string | null>(null);
   let group = $state<GroupSnapshot | null>(null);
+  let identities = $state<PoolIdentities | null>(null);
   let error = $state<string | null>(null);
 
   /**
@@ -25,6 +26,7 @@
       pools = (await api.pools()).pools;
       if (!selected && pools.length > 0) selected = pools[0].name;
       group = selected ? await api.poolTargets(selected) : null;
+      identities = selected ? await api.poolIdentities(selected) : null;
       error = null;
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
@@ -171,6 +173,39 @@
         {/each}
       </tbody>
     </table>
+    </div>
+  {/if}
+{/if}
+
+{#if identities?.max_size_is_per_user}
+  <h2>Backend identities</h2>
+  <p class="muted">
+    Clients on this pool authenticate against the database as themselves, so each user holds a set of connections of its
+    own. <code>max_size</code> is the budget for one user, not for the pool — the total depends on how many are
+    connected at once, and PostgreSQL's <code>CONNECTION LIMIT</code> per role is the backstop.
+  </p>
+
+  {#if identities.identities.length === 0}
+    <p class="muted">No user is connected as itself right now. Idle identities are released once their connections close.</p>
+  {:else}
+    <div class="table-scroll">
+      <table>
+        <thead>
+          <tr><th>User</th><th>Open</th><th>Active</th><th>Idle</th><th>Waiting</th><th>Budget</th></tr>
+        </thead>
+        <tbody>
+          {#each identities.identities as identity (identity.user)}
+            <tr>
+              <td><strong>{identity.user}</strong></td>
+              <td>{identity.pool_snapshot.open}</td>
+              <td>{identity.pool_snapshot.active}</td>
+              <td>{identity.pool_snapshot.idle}</td>
+              <td class:danger={identity.pool_snapshot.waiting > 0}>{identity.pool_snapshot.waiting}</td>
+              <td class="muted">{identity.pool_snapshot.max_size}</td>
+            </tr>
+          {/each}
+        </tbody>
+      </table>
     </div>
   {/if}
 {/if}

@@ -15,6 +15,18 @@
   let editMaxClients = $state(100);
   let editListenPort = $state<number | undefined>(undefined);
 
+  /**
+   * Ports serving more than one pool. Worth flagging: on those, a client has
+   * to name the pool it wants, and on the others the name is ignored.
+   */
+  const sharedPorts = $derived(
+    new Set(
+      pools
+        .map((pool) => pool.listen_port)
+        .filter((port, _, all) => all.filter((other) => other === port).length > 1),
+    ),
+  );
+
   async function refresh() {
     try {
       const result = await api.pools();
@@ -67,7 +79,7 @@
     editMode = pool.mode;
     editMaxSize = pool.limits.max_size;
     editMaxClients = pool.limits.max_client_connections;
-    editListenPort = pool.listen_port ?? undefined;
+    editListenPort = pool.listen_port;
   }
 
   async function saveConfiguration(event: Event) {
@@ -79,7 +91,7 @@
         mode: editMode,
         max_size: editMaxSize,
         max_client_connections: editMaxClients,
-        listen_port: editListenPort || null,
+        listen_port: editListenPort,
       }),
     );
     if (!error) editing = null;
@@ -122,13 +134,19 @@
         <tr>
           <td>
             <strong>{pool.name}</strong>
-            <div class="muted text-xs">{pool.database} as {pool.backend_user}</div>
+            {#if pool.backend_auth === "per_user"}
+              <div class="muted text-xs">{pool.database} as each connecting user</div>
+              <span class="badge" title="Backend connections are opened with each client's own credentials"
+                >per-user auth</span
+              >
+            {:else}
+              <div class="muted text-xs">{pool.database} as {pool.backend_user}</div>
+            {/if}
           </td>
           <td>
-            {#if pool.listen_port}
-              <span class="badge ok">dedicated :{pool.listen_port}</span>
-            {:else}
-              <span class="muted">shared listener</span>
+            <span class="badge ok">:{pool.listen_port}</span>
+            {#if sharedPorts.has(pool.listen_port)}
+              <div class="muted text-xs">shared, selected by name</div>
             {/if}
           </td>
           <td>
@@ -141,10 +159,18 @@
           <td>
             <span class="badge" class:ok={pool.mode !== "session"}>{pool.mode}</span>
           </td>
-          <td>{pool.limits.max_client_connections} → {pool.limits.max_size}</td>
+          <td>
+            {pool.limits.max_client_connections} → {pool.limits.max_size}
+            {#if pool.backend_ceiling === null}
+              <div class="muted text-xs" title="max_size is applied to each user separately">per user</div>
+            {/if}
+          </td>
           <td>
             {#if pool.configured_fan_in === null}
               <span class="muted" title="Session mode cannot multiplex">—</span>
+            {:else if pool.backend_auth === "per_user"}
+              <strong>{formatFanIn(pool.configured_fan_in)}</strong>
+              <div class="muted text-xs" title="Each user multiplexes over its own connections">per user</div>
             {:else}
               <strong>{formatFanIn(pool.configured_fan_in)}</strong>
             {/if}
@@ -212,8 +238,8 @@
           <input id="edit-max-clients" type="number" min="1" bind:value={editMaxClients} />
         </div>
         <div class="field mb-0">
-          <label for="edit-listen-port">Dedicated port <span class="muted font-normal">(optional)</span></label>
-          <input id="edit-listen-port" type="number" min="1" max="65535" bind:value={editListenPort} placeholder="shared" />
+          <label for="edit-listen-port">Client port</label>
+          <input id="edit-listen-port" type="number" min="1" max="65535" bind:value={editListenPort} required />
         </div>
       </div>
       <PoolModeGuide mode={editMode} />

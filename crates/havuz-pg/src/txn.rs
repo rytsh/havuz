@@ -31,6 +31,7 @@
 //! **A backend is only borrowed when there is work.** An idle client holds
 //! nothing. That is the entire source of the fan-in.
 
+use havuz_control::{HolderHandle, KickSignal, PrimaryReason, TraceContext, TraceSpan, TraceStore};
 use havuz_pool::Checkout;
 use havuz_proto::{BackendConn, FlowEvent, PinReason, ProtoError, ProtoResult, SessionState};
 use tokio::io::AsyncWriteExt;
@@ -38,15 +39,13 @@ use tokio::io::AsyncWriteExt;
 use crate::backend::PgConnector;
 use crate::classify::{classify, route_intent, ClientIntent, RouteIntent};
 use crate::group::PoolGroup;
-use crate::holder::HolderHandle;
 use crate::params::{self, ClientParams, SetAction};
 use crate::prepared::{ClientStatements, Rewrite};
 use crate::protocol::{sqlstate, Message, TransactionStatus};
 use crate::relay::RelayStats;
-use crate::routing::{PrimaryReason, Route, SessionRouting};
-use crate::sessions::KickSignal;
+use crate::routing::{Route, SessionRouting};
 use crate::stream::MaybeTls;
-use crate::trace::{TraceContext, TraceSpan, TraceStore};
+use crate::trace::PgTraceSpan;
 
 /// Outcome of a transaction-mode session.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,12 +75,6 @@ pub struct SessionPolicy {
     pub read_only: bool,
     /// Resolves when an operator ends this session.
     pub kick: KickSignal,
-}
-
-impl Default for KickSignal {
-    fn default() -> Self {
-        Self::never()
-    }
 }
 
 /// Relay a client session in transaction mode.
@@ -1112,7 +1105,7 @@ mod tests {
             targets,
             backend_user: "app".into(),
             database: "appdb".into(),
-            listen_port: None,
+            listen_port: 6432,
             limits: PoolLimits { max_size, queue_timeout: Duration::from_secs(5), ..PoolLimits::default() },
             settings: Default::default(),
             routing: RoutingConfig {
@@ -1123,6 +1116,7 @@ mod tests {
                 sticky_after_write: Duration::from_millis(50),
                 ..RoutingConfig::default()
             },
+            backend_auth: Default::default(),
             disabled: false,
             description: None,
         };
@@ -1546,7 +1540,7 @@ mod tests {
     async fn an_idle_session_is_kicked_as_soon_as_it_is_signalled() {
         let server = FakeServer::start().await;
         let pool = server.pool(2);
-        let registry = crate::sessions::SessionRegistry::new();
+        let registry = havuz_control::SessionRegistry::new();
         let session = registry.register("svc_orders", "app_main", None, "127.0.0.1:5000", 0).unwrap();
 
         let (mut client, relay) =
@@ -1578,7 +1572,7 @@ mod tests {
         // client would receive the tail of this one's result set.
         let server = FakeServer::start().await;
         let pool = server.pool(1);
-        let registry = crate::sessions::SessionRegistry::new();
+        let registry = havuz_control::SessionRegistry::new();
         let session = registry.register("svc_orders", "app_main", None, "127.0.0.1:5000", 0).unwrap();
 
         let (mut client, relay) =
@@ -1607,7 +1601,7 @@ mod tests {
         // is not lost.
         let server = FakeServer::start().await;
         let pool = server.pool(1);
-        let registry = crate::sessions::SessionRegistry::new();
+        let registry = havuz_control::SessionRegistry::new();
         let session = registry.register("svc_orders", "app_main", None, "127.0.0.1:5000", 0).unwrap();
         registry.kick_user("svc_orders");
 
@@ -1626,7 +1620,7 @@ mod tests {
     async fn an_unkicked_session_is_never_disturbed() {
         let server = FakeServer::start().await;
         let pool = server.pool(2);
-        let registry = crate::sessions::SessionRegistry::new();
+        let registry = havuz_control::SessionRegistry::new();
         let mine = registry.register("svc_orders", "app_main", None, "a", 0).unwrap();
         let _theirs = registry.register("svc_reports", "app_main", None, "b", 0).unwrap();
 

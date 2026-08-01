@@ -1,37 +1,47 @@
 # havuz bootstrap configuration.
 #
-# Only process-level settings live here: listen addresses, TLS material and
+# Only process-level settings live here: the bind address, TLS material and
 # where state is kept. Pools and users are managed through the dashboard or the
 # admin API and stored in `state.json`, because they change at runtime and
 # restarting a pooler to add a database is not acceptable.
 #
+# Note what is *not* here: a client port. Each pool declares the port it is
+# reached on, so ports move without a restart. Pools may share a port, in which
+# case the database name in the connection string picks between them:
+#
+#   one pool on :6432      postgresql://svc_orders:***@havuz:6432/anything
+#   two pools on :6432     postgresql://svc_orders:***@havuz:6432/app_main
+#
 # Start with:  HAVUZ_MASTER_KEY=$(havuz keygen) havuz run --config havuz.toml
 
 [server]
-# Shared client listener. The pool is chosen by the database name in the
-# connection string. Pools may also request an optional dedicated listen port
-# from the dashboard; those ports exist only while that pool is enabled.
-#   postgresql://svc_orders:***@havuz:5432/app_main
-listen = "0.0.0.0:5432"
+# Interface every pool port is bound on. Address only; the ports come from the
+# pools themselves.
+bind = "0.0.0.0"
 
 # 0 means one worker per core.
 workers = 0
 
-# Hard ceiling across all pools, enforced at accept time. Protects the process
-# from file descriptor exhaustion before per-pool limits get a chance to apply.
+# Hard ceiling across every pool port, enforced at accept time. Protects the
+# process from file descriptor exhaustion before per-pool limits get a chance
+# to apply.
 max_client_connections = 1000
 
 [server.tls]
-# Both must be set, or neither. Without them havuz declines SSLRequest and
-# clients fall back to plaintext, exactly as they would against a Postgres
-# built without TLS.
+# TLS for the client-facing listeners. Both must be set, or neither: without
+# them havuz declines SSLRequest and clients fall back to plaintext, exactly as
+# they would against a Postgres built without TLS.
+#
+# Required for pools with `backend_auth = per_user`, which ask each client for
+# its password and refuse to do so over an unencrypted socket.
 # cert = "/etc/havuz/tls/server.crt"
 # key  = "/etc/havuz/tls/server.key"
 require_client_cert = false
 
 [admin]
 # The HTTP API and the dashboard. Loopback by default on purpose: this endpoint
-# can repoint a pool at another database.
+# can repoint a pool at another database. This port is reserved: a pool that
+# asks for it is refused rather than silently losing the race for the socket.
 listen = "127.0.0.1:7432"
 
 # On a non-loopback address havuz refuses to start without authentication.

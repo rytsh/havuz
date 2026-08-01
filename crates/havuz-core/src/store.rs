@@ -52,6 +52,14 @@ pub struct StateStore {
     path: PathBuf,
     current: ArcSwap<State>,
     write_lock: tokio::sync::Mutex<()>,
+    /// Bumped on every published change.
+    ///
+    /// The listener supervisor needs to know that a pool's port moved, and
+    /// polling the state for that would either be slow to react or a busy loop.
+    /// A counter rather than the state itself keeps `StateStore: Debug` cheap
+    /// and makes a missed wakeup impossible: a receiver that was busy sees the
+    /// latest value, not a queue of intermediate ones.
+    revision: tokio::sync::watch::Sender<u64>,
 }
 
 impl StateStore {
@@ -78,12 +86,29 @@ impl StateStore {
             Err(source) => return Err(StoreError::Read { path, source }),
         };
 
-        Ok(Self { path, current: ArcSwap::from_pointee(state), write_lock: tokio::sync::Mutex::new(()) })
+        Ok(Self::wrap(path, state))
     }
 
     /// In-memory store for tests and for `--dry-run`.
     pub fn ephemeral(state: State) -> Self {
-        Self { path: PathBuf::new(), current: ArcSwap::from_pointee(state), write_lock: tokio::sync::Mutex::new(()) }
+        Self::wrap(PathBuf::new(), state)
+    }
+
+    fn wrap(path: PathBuf, state: State) -> Self {
+        Self {
+            path,
+            current: ArcSwap::from_pointee(state),
+            write_lock: tokio::sync::Mutex::new(()),
+            revision: tokio::sync::watch::channel(0).0,
+        }
+    }
+
+    /// Resolves whenever the state has been republished.
+    ///
+    /// Marked as seen on subscription, so a fresh receiver waits for the next
+    /// change rather than firing immediately.
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.revision.subscribe()
     }
 
     pub fn path(&self) -> &Path {
@@ -114,6 +139,7 @@ impl StateStore {
             write_atomic(&self.path, &next).await?;
         }
         self.current.store(Arc::new(next));
+        self.publish();
         Ok(outcome)
     }
 
@@ -129,7 +155,14 @@ impl StateStore {
         state.validate()?;
         let state = Arc::new(state);
         self.current.store(state.clone());
+        self.publish();
         Ok(state)
+    }
+
+    fn publish(&self) {
+        // `send_modify` rather than `send`: it does not care whether anyone is
+        // listening, which a store used by a test with no supervisor is not.
+        self.revision.send_modify(|revision| *revision += 1);
     }
 }
 
@@ -184,10 +217,11 @@ mod tests {
             targets: vec![Target::new("pg", 5432)],
             backend_user: "app".into(),
             database: "appdb".into(),
-            listen_port: None,
+            listen_port: 6432,
             limits: PoolLimits::default(),
             settings: Default::default(),
             routing: Default::default(),
+            backend_auth: Default::default(),
             disabled: false,
             description: None,
         }

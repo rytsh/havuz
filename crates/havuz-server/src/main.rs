@@ -1,14 +1,16 @@
 //! havuz: a PostgreSQL connection pooler with a dashboard.
 
 mod cli;
+mod families;
 mod listener;
+mod pooler;
 mod shutdown;
 
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
+use havuz_control::{ClientGate, Registries};
 use havuz_core::{Bootstrap, StateStore};
-use havuz_pg::PgFamily;
 use havuz_secrets::MasterKey;
 
 use cli::Command;
@@ -41,8 +43,8 @@ fn main() -> Result<()> {
         Command::Check { config } => {
             let bootstrap = Bootstrap::load(&config).with_context(|| format!("loading {}", config.display()))?;
             println!("config ok");
-            println!("  pooler listens on {}", bootstrap.server.listen);
-            println!("  admin listens on  {}", bootstrap.admin.listen);
+            println!("  pool ports bound on {}", bootstrap.server.bind);
+            println!("  admin listens on    {}", bootstrap.admin.listen);
             println!("  state directory   {}", bootstrap.state.dir.display());
             Ok(())
         }
@@ -100,37 +102,51 @@ async fn serve(bootstrap: Bootstrap) -> Result<()> {
         tracing::warn!(count = stale, "secrets sealed under a different master key; they cannot be read");
     }
 
-    let family = PgFamily::persistent(store.clone(), master_key.clone(), bootstrap.state.dir.join("traces.sqlite3"))
-        .context("opening query trace store")?;
-    family.configure_listeners(bootstrap.server.listen, bootstrap.server.max_client_connections);
-    family.sync_pools().map_err(|e| anyhow::anyhow!("building pools: {e}"))?;
+    // One session list, one pin rate, one trace database, however many
+    // protocols end up running in this process.
+    let registries =
+        Registries::persistent(bootstrap.state.dir.join("traces.sqlite3")).context("opening query trace store")?;
+
+    // Which families exist is the registry's decision, not this file's.
+    let tls = families::client_tls(&bootstrap.server.tls)?;
+    let families = families::build(&store, &master_key, &registries, &tls)?;
+    families.sync_all().map_err(|e| anyhow::anyhow!("building pools: {e}"))?;
 
     let current = store.load();
     for warning in current.warnings() {
         tracing::warn!(?warning, "configuration warning");
     }
-    tracing::info!(pools = current.pools.len(), users = current.users.len(), "state loaded");
+    let listeners = current.listeners();
+    tracing::info!(pools = current.pools.len(), users = current.users.len(), ports = listeners.len(), "state loaded");
 
     let shutdown = shutdown::Shutdown::new();
+    let gate = Arc::new(ClientGate::new(bootstrap.server.max_client_connections));
 
     let admin_state = havuz_admin::AdminState::new(
         store.clone(),
         master_key.clone(),
-        family.clone(),
+        families.clone(),
+        registries,
+        bootstrap.server.reserved_port(bootstrap.admin.listen),
+        tls.acceptor.is_some(),
         &bootstrap.admin.auth,
         bootstrap.admin.ui,
     );
 
     let admin = listener::spawn_admin(bootstrap.admin.listen, havuz_admin::router(admin_state), shutdown.clone());
-    let pooler = listener::spawn_pooler(
-        bootstrap.server.listen,
-        family.clone(),
-        bootstrap.server.max_client_connections,
-        shutdown.clone(),
+    let pooler = tokio::spawn(
+        pooler::Pooler::new(
+            bootstrap.server.bind,
+            bootstrap.server.reserved_port(bootstrap.admin.listen),
+            families,
+            store.clone(),
+            gate,
+            shutdown.clone(),
+        )
+        .run(),
     );
 
     shutdown.wait_for_signal().await;
-    family.stop_dedicated_listeners();
     tracing::info!("shutting down, waiting for in-flight sessions");
 
     let _ = tokio::join!(admin, pooler);

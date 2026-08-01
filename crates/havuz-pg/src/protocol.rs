@@ -196,6 +196,18 @@ fn decode_params(body: &[u8]) -> Result<Vec<(String, String)>, ProtocolError> {
 
 /// Any message after the startup exchange.
 ///
+/// One column of a result set, as `RowDescription` carries it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FieldDescription {
+    pub name: String,
+    pub type_oid: i32,
+    /// Bytes for a fixed-width type, `-1` for a variable-length one.
+    pub type_size: i16,
+    /// Type-specific detail such as `numeric(10,2)`. `-1` means unspecified,
+    /// which every client accepts.
+    pub type_modifier: i32,
+}
+
 /// The body is kept as raw [`Bytes`] on purpose: in session mode we forward it
 /// untouched, and in transaction mode only a handful of tags need inspecting.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -251,6 +263,18 @@ impl Message {
         Message::new(b'R', body.freeze())
     }
 
+    /// `AuthenticationCleartextPassword`.
+    ///
+    /// Only ever sent on a pool that authenticates per user, where havuz needs
+    /// the plaintext to open a backend connection as that client. The handshake
+    /// refuses to send it over an unencrypted socket, because a password on the
+    /// wire is worse than no pooler at all.
+    pub fn authentication_cleartext() -> Self {
+        let mut body = BytesMut::with_capacity(4);
+        body.put_i32(3);
+        Message::new(b'R', body.freeze())
+    }
+
     /// `AuthenticationSASL` advertising SCRAM-SHA-256.
     pub fn authentication_sasl() -> Self {
         let mut body = BytesMut::new();
@@ -300,6 +324,99 @@ impl Message {
     /// the backend can be released.
     pub fn ready_for_query(status: TransactionStatus) -> Self {
         Message::new(b'Z', Bytes::from(vec![status.as_byte()]))
+    }
+
+    // --- Result sets ---
+    //
+    // Nothing on the pooling path builds these: a pooler relays a backend's
+    // result rather than composing one. They exist for the JDBC bridge, which
+    // has no PostgreSQL on the other side to copy frames from and so has to be
+    // a PostgreSQL server rather than a relay.
+
+    /// `RowDescription`.
+    ///
+    /// Everything except the name and the type OID is optional in practice —
+    /// clients use the OID to decode and ignore the rest — but `psql` prints
+    /// nothing at all if the field count and the `DataRow` width disagree, so
+    /// the two are built from the same slice.
+    pub fn row_description(fields: &[FieldDescription]) -> Self {
+        let mut body = BytesMut::new();
+        body.put_i16(fields.len() as i16);
+        for field in fields {
+            body.put_slice(field.name.as_bytes());
+            body.put_u8(0);
+            // Table OID and column number: zero means "not a plain column of a
+            // real table", which is the truth for anything coming through a
+            // bridge and is what PostgreSQL itself sends for a computed column.
+            body.put_i32(0);
+            body.put_i16(0);
+            body.put_i32(field.type_oid);
+            body.put_i16(field.type_size);
+            body.put_i32(field.type_modifier);
+            body.put_i16(0); // text format
+        }
+        Message::new(b'T', body.freeze())
+    }
+
+    /// `DataRow`. `None` is SQL NULL, which is a length of -1 and no bytes —
+    /// distinct from a zero-length value, and conflating the two is the classic
+    /// way to turn an empty string into a null halfway down a pipeline.
+    pub fn data_row(values: &[Option<Vec<u8>>]) -> Self {
+        let mut body = BytesMut::new();
+        body.put_i16(values.len() as i16);
+        for value in values {
+            match value {
+                Some(bytes) => {
+                    body.put_i32(bytes.len() as i32);
+                    body.put_slice(bytes);
+                }
+                None => body.put_i32(-1),
+            }
+        }
+        Message::new(b'D', body.freeze())
+    }
+
+    /// `CommandComplete`, e.g. `SELECT 3` or `INSERT 0 1`.
+    pub fn command_complete(tag: &str) -> Self {
+        let mut body = BytesMut::with_capacity(tag.len() + 1);
+        body.put_slice(tag.as_bytes());
+        body.put_u8(0);
+        Message::new(b'C', body.freeze())
+    }
+
+    /// `EmptyQueryResponse`, for a query that was only whitespace or comments.
+    /// Sending `CommandComplete` instead makes some clients report a row count
+    /// for a statement that never existed.
+    pub fn empty_query_response() -> Self {
+        Message::new(b'I', Bytes::new())
+    }
+
+    /// `ParameterDescription`. An OID of 0 means "decide for yourself", which
+    /// is the honest answer when the driver would not describe the statement.
+    pub fn parameter_description(oids: &[i32]) -> Self {
+        let mut body = BytesMut::new();
+        body.put_i16(oids.len() as i16);
+        for oid in oids {
+            body.put_i32(*oid);
+        }
+        Message::new(b't', body.freeze())
+    }
+
+    pub fn parse_complete() -> Self {
+        Message::new(b'1', Bytes::new())
+    }
+
+    pub fn bind_complete() -> Self {
+        Message::new(b'2', Bytes::new())
+    }
+
+    pub fn close_complete() -> Self {
+        Message::new(b'3', Bytes::new())
+    }
+
+    /// `NoData`, the answer to describing a statement that returns no rows.
+    pub fn no_data() -> Self {
+        Message::new(b'n', Bytes::new())
     }
 
     pub fn error_response(severity: &str, code: &str, message: &str) -> Self {
@@ -578,6 +695,42 @@ mod tests {
         assert_eq!(i32::from_be_bytes(msg.body[0..4].try_into().unwrap()), 10);
         assert_eq!(&msg.body[4..17], b"SCRAM-SHA-256");
         assert_eq!(&msg.body[17..], &[0, 0], "mechanism string and list both need terminators");
+    }
+
+    #[test]
+    fn a_result_set_round_trips_through_the_wire_format() {
+        let fields = vec![
+            FieldDescription { name: "id".into(), type_oid: 23, type_size: 4, type_modifier: -1 },
+            FieldDescription { name: "note".into(), type_oid: 25, type_size: -1, type_modifier: -1 },
+        ];
+        let described = Message::row_description(&fields);
+        assert_eq!(described.tag, b'T');
+        assert_eq!(i16::from_be_bytes([described.body[0], described.body[1]]), 2);
+        assert!(described.body.windows(3).any(|w| w == b"id\0"));
+
+        let row = Message::data_row(&[Some(b"7".to_vec()), None]);
+        assert_eq!(row.tag, b'D');
+        assert_eq!(i16::from_be_bytes([row.body[0], row.body[1]]), 2);
+        // -1 is SQL NULL. A zero length would be an empty string, and turning
+        // one into the other is the classic way to lose a null in a pipeline.
+        let tail = &row.body[row.body.len() - 4..];
+        assert_eq!(i32::from_be_bytes(tail.try_into().unwrap()), -1);
+    }
+
+    #[test]
+    fn an_empty_value_is_not_the_same_as_a_null() {
+        let row = Message::data_row(&[Some(Vec::new())]);
+        assert_eq!(i32::from_be_bytes(row.body[2..6].try_into().unwrap()), 0);
+    }
+
+    #[test]
+    fn command_complete_and_parameter_description_are_nul_and_count_framed() {
+        assert_eq!(&Message::command_complete("SELECT 3").body[..], b"SELECT 3\0");
+
+        let params = Message::parameter_description(&[23, 0]);
+        assert_eq!(params.tag, b't');
+        assert_eq!(i16::from_be_bytes([params.body[0], params.body[1]]), 2);
+        assert_eq!(i32::from_be_bytes(params.body[2..6].try_into().unwrap()), 23);
     }
 
     #[test]

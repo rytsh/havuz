@@ -1,18 +1,38 @@
 //! Client-side handshake.
 //!
-//! Clients authenticate against havuz, not against the database. The exchange
-//! here is a complete, independent SCRAM run using a verifier havuz stores
+//! Clients authenticate against havuz, not against the database. The default
+//! exchange is a complete, independent SCRAM run using a verifier havuz stores
 //! itself. Two consequences worth stating plainly:
 //!
 //! * havuz never learns the client's password, and a stolen state file does not
 //!   hand one over.
 //! * Client credentials can be rotated without touching the database.
+//!
+//! ## The exception, and why it is shaped like this
+//!
+//! A pool configured for per-user backend authentication needs the client's
+//! plaintext password, because that is what it will authenticate to PostgreSQL
+//! with — SCRAM cannot be proxied, so there is no way to reuse the client's
+//! proof. Such a pool asks for `AuthenticationCleartextPassword` instead.
+//!
+//! Two properties are preserved even then, and both are enforced here rather
+//! than left to configuration:
+//!
+//! * **The password never travels in the clear.** A cleartext request on an
+//!   unencrypted socket is refused outright, whatever `require_tls` says.
+//! * **The stored verifier is still checked.** Skipping it would turn havuz
+//!   into a credential-stuffing proxy pointed at the database, and would leave
+//!   `disabled`, `read_only` and the pool grants with nothing to hang off.
+//!
+//! What havuz still does not do is *store* the password. It is held for the
+//! life of the session, handed to the connector, and gone when the last client
+//! of that user disconnects.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use bytes::{Buf, Bytes};
-use havuz_proto::{ClientIdentity, ProtoError, ProtoResult};
+use havuz_proto::{ClientIdentity, PoolRoute, ProtoError, ProtoResult};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsAcceptor;
@@ -59,17 +79,79 @@ impl AuthDenial {
     }
 }
 
+/// How a client should prove who it is, and what havuz needs out of it.
+#[derive(Debug, Clone)]
+pub struct ClientAuth {
+    pub verifier: ScramVerifier,
+    /// The pool opens backend connections as this client, so the handshake
+    /// must come away holding the plaintext password.
+    pub needs_plaintext: bool,
+}
+
 /// Resolves a client identity against havuz's own user list.
 pub trait Authenticator: Send + Sync + 'static {
-    /// Return the verifier for `user`, provided the user may reach `pool`.
-    fn verifier(&self, user: &str, pool: &str) -> Result<ScramVerifier, AuthDenial>;
+    /// Return the auth policy for `user`, provided the user may reach `pool`.
+    fn resolve(&self, user: &str, pool: &str) -> Result<ClientAuth, AuthDenial>;
+}
+
+/// A client's database password, held only for the life of its session.
+///
+/// Never serialised, never logged, and never placed in [`ClientIdentity`] —
+/// that type is shared with every family and its whole point is that clients
+/// and backends do not learn each other's credentials.
+#[derive(Clone)]
+pub struct BackendCredential(String);
+
+impl BackendCredential {
+    /// Only for tests: a real one can only come from a client handshake.
+    #[doc(hidden)]
+    pub fn for_test(password: &str) -> Self {
+        Self(password.to_string())
+    }
+
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+
+    /// A stable, non-reversible tag for "is this the same password as before".
+    ///
+    /// Used to notice that a user rotated their password and that the
+    /// connections opened with the old one have to go, without keeping a
+    /// second copy of the password around to compare against.
+    pub fn fingerprint(&self) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(b"havuz-backend-credential-v1");
+        hasher.update(self.0.as_bytes());
+        hasher.finalize().into()
+    }
+}
+
+impl std::fmt::Debug for BackendCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BackendCredential(<redacted>)")
+    }
+}
+
+impl Drop for BackendCredential {
+    fn drop(&mut self) {
+        // Best effort: `String` may have reallocated, so this is a courtesy
+        // rather than a guarantee. The guarantee is that it is never persisted.
+        use zeroize::Zeroize;
+        self.0.zeroize();
+    }
 }
 
 /// What the handshake produced.
 #[derive(Debug)]
 pub enum HandshakeOutcome {
     /// A client authenticated successfully.
-    Established { identity: ClientIdentity, startup_params: Vec<(String, String)> },
+    Established {
+        identity: ClientIdentity,
+        startup_params: Vec<(String, String)>,
+        /// Present only for pools that authenticate per user.
+        credential: Option<BackendCredential>,
+    },
     /// A cancellation request. It carries no credentials by design, so it is
     /// resolved against the cancel-key registry instead.
     Cancel { process_id: i32, secret_key: i32 },
@@ -100,19 +182,22 @@ impl<A: Authenticator> ClientHandshake<A> {
     /// On success the stream is positioned right after `AuthenticationOk`; the
     /// caller finishes startup once it has a backend, because the parameters a
     /// client sees must come from the backend it will actually talk to.
-    pub async fn run(&self, socket: TcpStream, peer: SocketAddr) -> ProtoResult<(MaybeTls, HandshakeOutcome)> {
-        self.run_for_pool(socket, peer, None).await
+    pub async fn run(
+        &self,
+        socket: TcpStream,
+        peer: SocketAddr,
+        pool: &str,
+    ) -> ProtoResult<(MaybeTls, HandshakeOutcome)> {
+        self.run_for_pool(socket, peer, &PoolRoute::new(vec![pool.to_string()])).await
     }
 
-    /// Run a handshake on a listener dedicated to one pool.
-    ///
-    /// The dedicated route wins over the startup packet's database field, so a
-    /// client may omit the database and still reach the configured pool.
+    /// Negotiate, authenticate, and resolve which of the listener's pools the
+    /// client asked for.
     pub async fn run_for_pool(
         &self,
         socket: TcpStream,
         peer: SocketAddr,
-        forced_pool: Option<&str>,
+        route: &PoolRoute,
     ) -> ProtoResult<(MaybeTls, HandshakeOutcome)> {
         socket.set_nodelay(true).ok();
         let mut stream = MaybeTls::Plain(socket);
@@ -148,9 +233,23 @@ impl<A: Authenticator> ClientHandshake<A> {
         }
 
         let user = packet.user().map_err(|e| ProtoError::protocol(e.to_string()))?.to_string();
-        let pool = match forced_pool {
-            Some(pool) => pool.to_string(),
-            None => packet.database().map_err(|e| ProtoError::protocol(e.to_string()))?.to_string(),
+        let pool = match route.sole() {
+            // One pool on this port: the database field carries no routing
+            // information, so a connection string may omit it entirely.
+            Some(only) => only.to_string(),
+            None => {
+                let asked = packet.database().map_err(|e| ProtoError::protocol(e.to_string()))?;
+                if !route.contains(asked) {
+                    // Not "database does not exist": the pool may well exist,
+                    // just on another port, and saying so sends an operator
+                    // looking in the right place.
+                    let text =
+                        format!("no pool named \"{asked}\" on this port; available here: {}", route.names().join(", "));
+                    let _ = Message::fatal(sqlstate::UNDEFINED_DATABASE, &text).write(&mut stream).await;
+                    return Err(ProtoError::NoRoute(asked.to_string()));
+                }
+                asked.to_string()
+            }
         };
         let application_name = packet.application_name().map(str::to_string);
         let startup_params = match &packet {
@@ -158,8 +257,8 @@ impl<A: Authenticator> ClientHandshake<A> {
             _ => Vec::new(),
         };
 
-        let verifier = match self.authenticator.verifier(&user, &pool) {
-            Ok(verifier) => verifier,
+        let auth = match self.authenticator.resolve(&user, &pool) {
+            Ok(auth) => auth,
             Err(denial) => {
                 tracing::info!(%user, %pool, ?denial, "connection refused");
                 let msg = Message::fatal(denial.sqlstate(), &denial.client_message());
@@ -168,7 +267,23 @@ impl<A: Authenticator> ClientHandshake<A> {
             }
         };
 
-        self.scram(&mut stream, verifier).await?;
+        let credential = if auth.needs_plaintext {
+            // Not negotiable and not configurable. Asking for a password on a
+            // plaintext socket hands it to anyone on the path, and the whole
+            // point of this pool is that the password also opens the database.
+            if !stream.is_encrypted() {
+                let text = format!(
+                    "pool \"{pool}\" authenticates against the database as you, so it needs your password \
+                     and will only ask for it over TLS; connect with sslmode=require or higher"
+                );
+                let _ = Message::fatal(sqlstate::INVALID_AUTHORIZATION, &text).write(&mut stream).await;
+                return Err(ProtoError::Tls(format!("pool '{pool}' requires TLS for per-user authentication")));
+            }
+            Some(self.cleartext(&mut stream, &auth.verifier, &user, &pool).await?)
+        } else {
+            self.scram(&mut stream, auth.verifier).await?;
+            None
+        };
 
         Message::authentication_ok().write(&mut stream).await.map_err(|e| ProtoError::protocol(e.to_string()))?;
 
@@ -177,8 +292,44 @@ impl<A: Authenticator> ClientHandshake<A> {
             HandshakeOutcome::Established {
                 identity: ClientIdentity { user, pool, application_name, peer },
                 startup_params,
+                credential,
             },
         ))
+    }
+
+    /// Ask for the password itself, and check it against the stored verifier.
+    ///
+    /// Verifying locally first means a wrong password is refused by havuz and
+    /// never reaches the database, so a pool in this mode cannot be used to
+    /// brute-force database roles.
+    async fn cleartext(
+        &self,
+        stream: &mut MaybeTls,
+        verifier: &ScramVerifier,
+        user: &str,
+        pool: &str,
+    ) -> ProtoResult<BackendCredential> {
+        Message::authentication_cleartext().write(stream).await.map_err(|e| ProtoError::protocol(e.to_string()))?;
+
+        let msg = read_password_message(stream).await?;
+        // The payload is a NUL-terminated string; some clients omit the NUL.
+        let end = msg.body.iter().position(|byte| *byte == 0).unwrap_or(msg.body.len());
+        let password = std::str::from_utf8(&msg.body[..end])
+            .map_err(|_| ProtoError::auth("password is not valid utf-8"))?
+            .to_string();
+
+        // Recomputing with the stored salt and iteration count is the only way
+        // to check a plaintext against a verifier, and it is the same work the
+        // SCRAM path does.
+        let candidate = ScramVerifier::from_password_with(&password, verifier.salt(), verifier.iterations());
+        if candidate.stored_key() != verifier.stored_key() {
+            tracing::info!(%user, %pool, "connection refused: password does not match the stored verifier");
+            let denial = AuthDenial::UnknownUser;
+            let _ = Message::fatal(denial.sqlstate(), &denial.client_message()).write(stream).await;
+            return Err(ProtoError::auth("password did not verify"));
+        }
+
+        Ok(BackendCredential(password))
     }
 
     async fn upgrade(&self, mut stream: MaybeTls) -> ProtoResult<MaybeTls> {
@@ -313,9 +464,11 @@ mod tests {
     use tokio::io::AsyncReadExt;
     use tokio::net::TcpListener;
 
+    #[derive(Clone)]
     struct TestAuth {
         users: HashMap<String, (ScramVerifier, Vec<String>)>,
         pools: Vec<String>,
+        per_user: bool,
     }
 
     impl TestAuth {
@@ -325,12 +478,20 @@ mod tests {
                 "svc_orders".to_string(),
                 (ScramVerifier::from_password("hunter2"), vec!["app_main".to_string()]),
             );
-            Arc::new(Self { users, pools: vec!["app_main".into(), "other".into()] })
+            Arc::new(Self { users, pools: vec!["app_main".into(), "other".into()], per_user: false })
+        }
+
+        /// A pool that authenticates clients against the database as
+        /// themselves, and so must ask for the password itself.
+        fn per_user() -> Arc<Self> {
+            let mut auth = (*Self::new()).clone();
+            auth.per_user = true;
+            Arc::new(auth)
         }
     }
 
     impl Authenticator for TestAuth {
-        fn verifier(&self, user: &str, pool: &str) -> Result<ScramVerifier, AuthDenial> {
+        fn resolve(&self, user: &str, pool: &str) -> Result<ClientAuth, AuthDenial> {
             if !self.pools.iter().any(|p| p == pool) {
                 return Err(AuthDenial::UnknownPool { pool: pool.into() });
             }
@@ -340,7 +501,7 @@ mod tests {
             if !grants.iter().any(|g| g == pool) {
                 return Err(AuthDenial::NotGranted { user: user.into(), pool: pool.into() });
             }
-            Ok(verifier.clone())
+            Ok(ClientAuth { verifier: verifier.clone(), needs_plaintext: self.per_user })
         }
     }
 
@@ -367,6 +528,12 @@ mod tests {
                     let mut body = msg.body.clone();
                     match body.get_i32() {
                         0 => return Ok(socket),
+                        // AuthenticationCleartextPassword.
+                        3 => {
+                            let mut payload = password.as_bytes().to_vec();
+                            payload.push(0);
+                            Message::new(b'p', Bytes::from(payload)).write(&mut socket).await.unwrap();
+                        }
                         10 => {
                             let first = scram.client_first().unwrap();
                             let mut payload = Vec::new();
@@ -394,14 +561,17 @@ mod tests {
         }
     }
 
+    /// A port shared by two pools, so the startup packet's database field is
+    /// what selects between them.
     async fn spawn_server() -> (SocketAddr, tokio::task::JoinHandle<ProtoResult<(MaybeTls, HandshakeOutcome)>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let handshake = ClientHandshake::new(TestAuth::new());
+        let route = PoolRoute::new(vec!["app_main".to_string(), "other".to_string()]);
 
         let handle = tokio::spawn(async move {
             let (socket, peer) = listener.accept().await.unwrap();
-            handshake.run(socket, peer).await
+            handshake.run_for_pool(socket, peer, &route).await
         });
         (addr, handle)
     }
@@ -415,7 +585,7 @@ mod tests {
         client.await.unwrap().expect("client should reach AuthenticationOk");
 
         assert!(!stream.is_encrypted());
-        let HandshakeOutcome::Established { identity, startup_params } = outcome else {
+        let HandshakeOutcome::Established { identity, startup_params, .. } = outcome else {
             panic!("expected an established session");
         };
         assert_eq!(identity.user, "svc_orders");
@@ -460,22 +630,194 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dedicated_listener_pool_overrides_the_startup_database() {
+    async fn a_port_with_one_pool_ignores_the_startup_database() {
+        // The whole convenience of a per-pool port: the connection string does
+        // not have to repeat what the port already says.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let handshake = ClientHandshake::new(TestAuth::new());
         let server = tokio::spawn(async move {
             let (socket, peer) = listener.accept().await.unwrap();
-            handshake.run_for_pool(socket, peer, Some("app_main")).await
+            handshake.run(socket, peer, "app_main").await
         });
 
-        let client = tokio::spawn(async move { client_connect(addr, "svc_orders", "other", "hunter2").await });
-        let (_, outcome) = server.await.unwrap().expect("forced pool must authenticate");
+        let client = tokio::spawn(async move { client_connect(addr, "svc_orders", "anything", "hunter2").await });
+        let (_, outcome) = server.await.unwrap().expect("the port decides, so this must authenticate");
         client.await.unwrap().expect("client must reach AuthenticationOk");
         let HandshakeOutcome::Established { identity, .. } = outcome else {
             panic!("expected an established session");
         };
         assert_eq!(identity.pool, "app_main");
+    }
+
+    const TEST_CERT: &str = include_str!("../tests/fixtures/test-cert.pem");
+    const TEST_KEY: &str = include_str!("../tests/fixtures/test-key.pem");
+
+    /// A listener that can actually negotiate TLS, so the per-user tests
+    /// exercise the real encrypted path rather than a flag that says they did.
+    fn tls_acceptor() -> (TlsAcceptor, tempfile::TempDir) {
+        havuz_core::tls::install_default_provider();
+        let dir = tempfile::tempdir().unwrap();
+        let cert = dir.path().join("cert.pem");
+        let key = dir.path().join("key.pem");
+        std::fs::write(&cert, TEST_CERT).unwrap();
+        std::fs::write(&key, TEST_KEY).unwrap();
+        let config = havuz_core::tls::server_config(&cert, &key).expect("test certificate must load");
+        (TlsAcceptor::from(config), dir)
+    }
+
+    async fn spawn_per_user_server(
+        with_tls: bool,
+    ) -> (SocketAddr, tokio::task::JoinHandle<ProtoResult<(MaybeTls, HandshakeOutcome)>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let handshake = ClientHandshake::new(TestAuth::per_user());
+        // The directory has to outlive the acceptor's construction only; rustls
+        // has parsed the material by then.
+        let (handshake, _material) = match with_tls {
+            true => {
+                let (acceptor, dir) = tls_acceptor();
+                (handshake.with_tls(acceptor, false), Some(dir))
+            }
+            false => (handshake, None),
+        };
+
+        let handle = tokio::spawn(async move {
+            let (socket, peer) = listener.accept().await.unwrap();
+            handshake.run(socket, peer, "app_main").await
+        });
+        (addr, handle)
+    }
+
+    /// Startup over TLS: SSLRequest, then the same exchange inside the tunnel.
+    async fn client_connect_tls(addr: SocketAddr, user: &str, password: &str) -> Result<(), String> {
+        let mut socket = TcpStream::connect(addr).await.unwrap();
+        StartupPacket::SslRequest.write(&mut socket).await.unwrap();
+
+        let mut answer = [0u8; 1];
+        tokio::io::AsyncReadExt::read_exact(&mut socket, &mut answer).await.unwrap();
+        if answer[0] != b'S' {
+            return Err("server declined TLS".into());
+        }
+
+        // `require` semantics: encrypt, do not authenticate. Enough for a test
+        // certificate that nothing has ever heard of.
+        let config = havuz_core::tls::client_config(havuz_core::SslMode::Require, None).unwrap().unwrap();
+        let connector = tokio_rustls::TlsConnector::from(config);
+        let name = rustls_pki_types::ServerName::try_from("havuz-test").unwrap();
+        let mut stream = MaybeTls::ClientTls(Box::new(connector.connect(name, socket).await.unwrap()));
+
+        StartupPacket::Startup { params: vec![("user".into(), user.into()), ("database".into(), "app_main".into())] }
+            .write(&mut stream)
+            .await
+            .unwrap();
+
+        loop {
+            let msg = Message::read(&mut stream).await.map_err(|e| format!("read: {e}"))?;
+            match msg.tag {
+                b'R' => {
+                    let mut body = msg.body.clone();
+                    match body.get_i32() {
+                        0 => return Ok(()),
+                        3 => {
+                            let mut payload = password.as_bytes().to_vec();
+                            payload.push(0);
+                            Message::new(b'p', Bytes::from(payload)).write(&mut stream).await.unwrap();
+                        }
+                        other => return Err(format!("unexpected auth type {other}")),
+                    }
+                }
+                b'E' => {
+                    let fields = msg.error_fields();
+                    let code = fields.iter().find(|(f, _)| *f == b'C').map(|(_, v)| v.clone()).unwrap_or_default();
+                    let text = fields.iter().find(|(f, _)| *f == b'M').map(|(_, v)| v.clone()).unwrap_or_default();
+                    return Err(format!("{code}: {text}"));
+                }
+                _ => continue,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_per_user_pool_asks_for_the_password_and_hands_it_back() {
+        let (addr, server) = spawn_per_user_server(true).await;
+        let client = tokio::spawn(async move { client_connect_tls(addr, "svc_orders", "hunter2").await });
+
+        let (_, outcome) = server.await.unwrap().expect("the password must verify");
+        client.await.unwrap().expect("client must reach AuthenticationOk");
+
+        let HandshakeOutcome::Established { credential, .. } = outcome else {
+            panic!("expected an established session");
+        };
+        let credential = credential.expect("a per-user pool must come away holding the password");
+        assert_eq!(credential.expose(), "hunter2", "this is what opens the backend connection");
+    }
+
+    #[tokio::test]
+    async fn a_per_user_pool_refuses_to_ask_for_a_password_in_the_clear() {
+        // Not configurable, and checked before the request is sent: a password
+        // on an unencrypted socket is worse than no pooler at all.
+        let (addr, server) = spawn_per_user_server(false).await;
+        let client = tokio::spawn(async move { client_connect(addr, "svc_orders", "app_main", "hunter2").await });
+
+        let err = server.await.unwrap().unwrap_err();
+        assert!(matches!(err, ProtoError::Tls(_)), "got {err:?}");
+        let client_error = client.await.unwrap().unwrap_err();
+        assert!(client_error.contains("TLS"), "the client must be told why: {client_error}");
+    }
+
+    #[tokio::test]
+    async fn a_wrong_password_never_reaches_the_database() {
+        // havuz checks the plaintext against its own verifier first, so a pool
+        // in this mode cannot be used to brute-force database roles.
+        let (addr, server) = spawn_per_user_server(true).await;
+        let client = tokio::spawn(async move { client_connect_tls(addr, "svc_orders", "wrong").await });
+
+        assert!(server.await.unwrap().is_err());
+        let err = client.await.unwrap().unwrap_err();
+        assert!(err.contains("28000"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn a_shared_pool_still_runs_scram_and_learns_no_password() {
+        let (addr, server) = spawn_server().await;
+        let client = tokio::spawn(async move { client_connect(addr, "svc_orders", "app_main", "hunter2").await });
+
+        let (_, outcome) = server.await.unwrap().expect("handshake should succeed");
+        client.await.unwrap().unwrap();
+        let HandshakeOutcome::Established { credential, .. } = outcome else {
+            panic!("expected an established session");
+        };
+        assert!(credential.is_none(), "the default path must not come away holding a password");
+    }
+
+    #[test]
+    fn a_credential_never_renders_itself() {
+        let credential = BackendCredential("hunter2".into());
+        assert!(!format!("{credential:?}").contains("hunter2"));
+    }
+
+    #[test]
+    fn the_fingerprint_tracks_the_password_and_not_the_user() {
+        let a = BackendCredential("hunter2".into());
+        let b = BackendCredential("hunter2".into());
+        let rotated = BackendCredential("hunter3".into());
+        assert_eq!(a.fingerprint(), b.fingerprint());
+        assert_ne!(a.fingerprint(), rotated.fingerprint(), "a rotation must invalidate the old connections");
+    }
+
+    #[tokio::test]
+    async fn a_shared_port_names_the_pools_it_actually_serves() {
+        // "database does not exist" would send an operator to the wrong place:
+        // the pool may exist, just on another port.
+        let (addr, server) = spawn_server().await;
+        let client = tokio::spawn(async move { client_connect(addr, "svc_orders", "payroll", "hunter2").await });
+
+        assert!(server.await.unwrap().is_err());
+        let err = client.await.unwrap().unwrap_err();
+        assert!(err.contains("app_main"), "the error must list what is reachable here, got: {err}");
+        assert!(err.contains("other"), "got: {err}");
     }
 
     #[tokio::test]

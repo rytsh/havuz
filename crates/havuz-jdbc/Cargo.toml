@@ -1,0 +1,30 @@
+[package]
+name = "havuz-jdbc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "JDBC bridge: a PostgreSQL frontend over a JVM sidecar."
+
+[dependencies]
+havuz-control = { workspace = true }
+havuz-core = { workspace = true }
+# The bridge speaks the PostgreSQL wire protocol to its clients, so it uses the
+# PostgreSQL codec, handshake, SCRAM and TLS rather than a second copy of them.
+# It is a PostgreSQL *frontend*; what it is not is a PostgreSQL *relay*.
+havuz-pg = { workspace = true }
+havuz-pool = { workspace = true }
+havuz-proto = { workspace = true }
+havuz-registry = { workspace = true }
+havuz-secrets = { workspace = true }
+
+async-trait = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["process"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time"] }

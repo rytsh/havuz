@@ -12,7 +12,7 @@ mod field;
 mod postgres;
 mod schema;
 
-pub use field::{ConfigField, FieldKind, SelectOption};
+pub use field::{ConfigField, FieldError, FieldKind, FieldRole, SelectOption};
 
 use serde::{Deserialize, Serialize};
 
@@ -177,6 +177,57 @@ impl FamilyDescriptor {
     pub fn json_schema(&self) -> serde_json::Value {
         schema::build(self)
     }
+
+    /// The field carrying a given role, if this family declares one.
+    pub fn field_for(&self, role: FieldRole) -> Option<&'static ConfigField> {
+        self.config_fields.iter().find(|field| field.role == Some(role))
+    }
+
+    /// Pull the pooler-level facts out of a submitted connection form.
+    ///
+    /// The caller does not have to know that Postgres spells the account
+    /// `username` and something else spells it `user`: the family declared
+    /// which field means what, and this reads it back. Missing required values
+    /// are the validator's problem, not this function's, so anything absent
+    /// comes back empty.
+    pub fn connection(&self, settings: &serde_json::Map<String, serde_json::Value>) -> Connection {
+        let text = |role: FieldRole| -> Option<String> {
+            let field = self.field_for(role)?;
+            match settings.get(field.name) {
+                Some(serde_json::Value::String(value)) => Some(value.clone()),
+                Some(serde_json::Value::Number(value)) => Some(value.to_string()),
+                _ => field.default.map(str::to_string),
+            }
+        };
+
+        Connection {
+            host: text(FieldRole::Host).unwrap_or_default(),
+            port: text(FieldRole::Port).and_then(|value| value.parse().ok()).unwrap_or(self.default_port),
+            database: text(FieldRole::Database).unwrap_or_default(),
+            user: text(FieldRole::User).unwrap_or_default(),
+            password: text(FieldRole::Password).filter(|value| !value.is_empty()),
+        }
+    }
+
+    /// Field names whose values must not be persisted in plain state.
+    pub fn secret_fields(&self) -> impl Iterator<Item = &'static str> + '_ {
+        self.config_fields.iter().filter(|field| field.secret).map(|field| field.name)
+    }
+}
+
+/// Where and as whom havuz opens backend connections for a pool.
+///
+/// Assembled from the family's own field names via [`FieldRole`], so the admin
+/// API can build a pool out of a form it has never seen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Connection {
+    pub host: String,
+    pub port: u16,
+    pub database: String,
+    pub user: String,
+    /// `None` when the form left it blank, which is not the same as an empty
+    /// password: a blank field means "do not change what is stored".
+    pub password: Option<String>,
 }
 
 /// Everything havuz knows how to describe.
@@ -184,7 +235,7 @@ impl FamilyDescriptor {
 /// `Planned` entries are intentional: they let the UI show the roadmap without
 /// pretending a driver exists. Nothing dispatches on this list at runtime — the
 /// pool engine resolves behaviour through `havuz_proto::ProtocolFamily`.
-static FAMILIES: &[FamilyDescriptor] = &[postgres::POSTGRES, MYSQL_PLANNED, REDIS_PLANNED, JDBC_PLANNED];
+static FAMILIES: &[FamilyDescriptor] = &[postgres::POSTGRES, JDBC, MYSQL_PLANNED, REDIS_PLANNED];
 
 const MYSQL_PLANNED: FamilyDescriptor = FamilyDescriptor {
     id: "mysql",
@@ -236,30 +287,158 @@ const REDIS_PLANNED: FamilyDescriptor = FamilyDescriptor {
     config_fields: &[],
 };
 
-const JDBC_PLANNED: FamilyDescriptor = FamilyDescriptor {
+const JDBC: FamilyDescriptor = FamilyDescriptor {
     id: "jdbc",
     label: "JDBC bridge",
-    description: "Long-tail databases through a JDBC sidecar process. Planned for phase 5.",
-    maturity: Maturity::Planned,
+    description: "Oracle, DB2, Informix, Snowflake and the rest of the long tail, through a JVM sidecar.",
+    // Experimental, and the word is meant. Every other family relays frames; this
+    // one parses statements and composes result sets, so its correctness depends
+    // on a type mapping that only widens as more databases are tried.
+    maturity: Maturity::Experimental,
+    // There is no default: a JDBC URL names its own port, and a bridge that
+    // guessed 1521 would be guessing Oracle.
     default_port: 0,
-    capabilities: Capabilities::NONE,
+    capabilities: Capabilities {
+        tls: true,
+        scram_sha256: true,
+        md5_auth: false,
+        // The client's prepared statements become the driver's. What is absent
+        // is havuz's own rewriting, which exists to move a statement between
+        // backends and has nothing to move it between here.
+        prepared_statements: true,
+        cancel_request: false,
+        bulk_copy: false,
+        // The agent reports it from the driver rather than inferring it, which
+        // is the same standard the PostgreSQL side holds itself to.
+        reports_transaction_status: true,
+        listen_notify: false,
+        advisory_locks: false,
+    },
     pool_modes: &[PoolMode::Session],
     default_pool_mode: PoolMode::Session,
     profiles: &[DriverProfile {
         id: "generic",
         label: "Generic JDBC",
-        maturity: Maturity::Planned,
+        maturity: Maturity::Experimental,
         default_port: None,
         quirks: Quirks {
             supports_discard_all: false,
             supports_advisory_locks: false,
             supports_listen_notify: false,
-            supports_prepared_statements: false,
+            supports_prepared_statements: true,
             max_pool_mode: PoolMode::Session,
         },
     }],
-    config_fields: &[],
+    config_fields: JDBC_FIELDS,
 };
+
+const JDBC_FIELDS: &[ConfigField] = &[
+    ConfigField {
+        name: "url",
+        label: "JDBC URL",
+        kind: FieldKind::Text,
+        required: true,
+        default: None,
+        help: Some("The driver's own connection string, including host, port and database."),
+        placeholder: Some("jdbc:oracle:thin:@//db.internal:1521/ORCLPDB1"),
+        secret: false,
+        // The URL carries host and port itself, so neither has a field of its
+        // own: two places to write the same host is two places to get it wrong.
+        role: Some(FieldRole::Host),
+    },
+    ConfigField {
+        name: "driver_class",
+        label: "Driver class",
+        kind: FieldKind::Text,
+        required: false,
+        default: None,
+        help: Some("Leave empty for a JAR that declares itself through META-INF/services."),
+        placeholder: Some("oracle.jdbc.OracleDriver"),
+        secret: false,
+        role: None,
+    },
+    ConfigField {
+        name: "driver_paths",
+        label: "Driver JARs",
+        kind: FieldKind::Text,
+        required: true,
+        default: None,
+        help: Some("Absolute paths, comma separated. Vendor drivers are usually not redistributable."),
+        placeholder: Some("/opt/havuz/drivers/ojdbc11.jar"),
+        secret: false,
+        role: None,
+    },
+    ConfigField {
+        name: "username",
+        label: "Database user",
+        kind: FieldKind::Text,
+        required: true,
+        default: None,
+        help: None,
+        placeholder: Some("app"),
+        secret: false,
+        role: Some(FieldRole::User),
+    },
+    ConfigField {
+        name: "password",
+        label: "Database password",
+        kind: FieldKind::Password,
+        required: false,
+        default: None,
+        help: Some("Stored encrypted. Never returned by the API."),
+        placeholder: None,
+        secret: true,
+        role: Some(FieldRole::Password),
+    },
+    ConfigField {
+        name: "reset_query",
+        label: "Reset query",
+        kind: FieldKind::Text,
+        required: false,
+        default: None,
+        help: Some(
+            "Run when a connection returns to the pool. JDBC has no portable equivalent of DISCARD ALL, so without \
+             one a connection is closed rather than reused: temporary tables and session settings would otherwise \
+             reach the next client. Use DISCARD ALL for PostgreSQL, RESET ALL elsewhere.",
+        ),
+        placeholder: Some("DISCARD ALL"),
+        secret: false,
+        role: None,
+    },
+    ConfigField {
+        name: "agent_jar",
+        label: "Agent JAR",
+        kind: FieldKind::Text,
+        required: false,
+        default: None,
+        help: Some("Defaults to the JAR built by agent/build.sh."),
+        placeholder: Some("/usr/share/havuz/havuz-agent.jar"),
+        secret: false,
+        role: None,
+    },
+    ConfigField {
+        name: "java",
+        label: "Java runtime",
+        kind: FieldKind::Text,
+        required: false,
+        default: Some("java"),
+        help: Some("Pin a runtime when the one on PATH is the wrong version. Needs 17 or newer."),
+        placeholder: None,
+        secret: false,
+        role: None,
+    },
+    ConfigField {
+        name: "connect_timeout",
+        label: "Connect timeout",
+        kind: FieldKind::Duration,
+        required: false,
+        default: Some("10s"),
+        help: None,
+        placeholder: None,
+        secret: false,
+        role: None,
+    },
+];
 
 /// All descriptors, including planned ones.
 pub fn families() -> &'static [FamilyDescriptor] {
@@ -303,6 +482,85 @@ pub fn resolve(
         None => family.default_profile(),
     };
     Ok((family, profile))
+}
+
+#[cfg(test)]
+mod connection_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn settings(pairs: &[(&str, serde_json::Value)]) -> serde_json::Map<String, serde_json::Value> {
+        pairs.iter().map(|(k, v)| ((*k).to_string(), v.clone())).collect()
+    }
+
+    #[test]
+    fn a_form_is_read_back_through_roles_not_field_names() {
+        let pg = family("postgres").unwrap();
+        let connection = pg.connection(&settings(&[
+            ("host", json!("pg-primary.internal")),
+            ("port", json!(6543)),
+            ("database", json!("appdb")),
+            ("username", json!("app")),
+            ("password", json!("hunter2")),
+        ]));
+
+        assert_eq!(
+            connection,
+            Connection {
+                host: "pg-primary.internal".into(),
+                port: 6543,
+                database: "appdb".into(),
+                user: "app".into(),
+                password: Some("hunter2".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn an_omitted_port_falls_back_to_the_declared_default() {
+        let pg = family("postgres").unwrap();
+        assert_eq!(pg.connection(&settings(&[("host", json!("db"))])).port, 5432);
+    }
+
+    #[test]
+    fn a_blank_password_is_absent_rather_than_empty() {
+        // An empty string would overwrite a stored credential with nothing.
+        let pg = family("postgres").unwrap();
+        assert_eq!(pg.connection(&settings(&[("password", json!(""))])).password, None);
+        assert_eq!(pg.connection(&settings(&[])).password, None);
+    }
+
+    #[test]
+    fn secret_fields_are_named_so_they_can_be_kept_out_of_state() {
+        let pg = family("postgres").unwrap();
+        assert_eq!(pg.secret_fields().collect::<Vec<_>>(), ["password"]);
+    }
+
+    #[test]
+    fn a_family_without_a_role_reports_nothing_for_it() {
+        // A planned family declares no fields at all, which must be a clean
+        // empty answer rather than a panic.
+        let mysql = family("mysql").unwrap();
+        assert!(mysql.field_for(FieldRole::Host).is_none());
+        assert_eq!(mysql.connection(&settings(&[])).host, "");
+    }
+
+    #[test]
+    fn a_family_may_carry_its_address_in_one_field() {
+        // A JDBC URL names its own host and port. Splitting them into separate
+        // fields would be two places to write the same thing and two places to
+        // get it wrong, so the URL takes the host role and there is no port.
+        let jdbc = family("jdbc").unwrap();
+        assert_eq!(jdbc.field_for(FieldRole::Host).map(|f| f.name), Some("url"));
+        assert!(jdbc.field_for(FieldRole::Port).is_none());
+
+        let connection = jdbc
+            .connection(&settings(&[("url", json!("jdbc:oracle:thin:@//db:1521/ORCL")), ("username", json!("app"))]));
+        assert_eq!(connection.host, "jdbc:oracle:thin:@//db:1521/ORCL");
+        assert_eq!(connection.user, "app");
+        // No port field and no family default, so nothing is invented.
+        assert_eq!(connection.port, 0);
+    }
 }
 
 #[cfg(test)]

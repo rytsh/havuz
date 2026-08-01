@@ -17,13 +17,20 @@ embed-ui = ["havuz-admin/embed-ui"]
 [dependencies]
 havuz-admin = { workspace = true }
 havuz-core = { workspace = true }
+havuz-control = { workspace = true }
+havuz-jdbc = { workspace = true }
 havuz-pg = { workspace = true }
+havuz-registry = { workspace = true }
 havuz-pool = { workspace = true }
 havuz-proto = { workspace = true }
 havuz-secrets = { workspace = true }
 
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros", "signal", "fs"] }
+tokio-rustls = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 axum = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

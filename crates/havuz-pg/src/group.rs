@@ -7,13 +7,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use havuz_control::{ReplicaReport, TargetPool, TargetReport};
 use havuz_core::state::{PoolConfig, TargetRole};
 use havuz_pool::{BreakerConfig, Pool, PoolSnapshot};
 use havuz_proto::{PoolMode, ProtoError};
-use serde::Serialize;
 
 use crate::backend::PgConnector;
-use crate::routing::{ReplicaState, Route, Router, RoutingSnapshot};
+use crate::routing::{ReplicaState, Route, Router};
 
 /// A configured pool: one primary, zero or more replicas, and a router.
 pub struct PoolGroup {
@@ -156,17 +156,17 @@ impl PoolGroup {
         }
     }
 
-    pub fn snapshot(&self) -> GroupSnapshot {
-        GroupSnapshot {
+    pub fn snapshot(&self) -> TargetReport {
+        TargetReport {
             name: self.name.clone(),
             mode: self.mode.as_str().to_string(),
             read_write_split: self.router.config().read_write_split,
-            primary: TargetSnapshot { label: self.primary_label.clone(), pool: self.primary.snapshot() },
+            primary: TargetPool { label: self.primary_label.clone(), pool: self.primary.snapshot() },
             replicas: self
                 .replica_pools
                 .iter()
                 .zip(self.router.replicas())
-                .map(|(pool, state)| ReplicaSnapshotWithPool { routing: state.snapshot(), pool: pool.snapshot() })
+                .map(|(pool, state)| ReplicaReport { routing: state.snapshot(), pool: pool.snapshot() })
                 .collect(),
             routing: self.router.stats().snapshot(),
         }
@@ -176,51 +176,16 @@ impl PoolGroup {
     pub fn combined_pool_snapshot(&self) -> PoolSnapshot {
         let mut combined = self.primary.snapshot();
         combined.name = self.name.clone();
-
         for pool in &self.replica_pools {
-            let replica = pool.snapshot();
-            combined.active += replica.active;
-            combined.idle += replica.idle;
-            combined.open += replica.open;
-            combined.waiting += replica.waiting;
-            combined.created_total += replica.created_total;
-            combined.closed_total += replica.closed_total;
-            combined.checkout_total += replica.checkout_total;
-            combined.timeout_total += replica.timeout_total;
-            combined.connect_error_total += replica.connect_error_total;
-            combined.discarded_total += replica.discarded_total;
-            combined.wait.samples += replica.wait.samples;
-            combined.wait.max_micros = combined.wait.max_micros.max(replica.wait.max_micros);
+            combined.merge(&pool.snapshot());
         }
-
-        // max_size is per target; the meaningful ceiling for the group is the
-        // sum, otherwise the dashboard shows 3 while 9 connections are open.
-        combined.max_size = combined.max_size.saturating_mul(1 + self.replica_pools.len() as u32);
         combined
     }
-}
 
-#[derive(Debug, Clone, Serialize)]
-pub struct GroupSnapshot {
-    pub name: String,
-    pub mode: String,
-    pub read_write_split: bool,
-    pub primary: TargetSnapshot,
-    pub replicas: Vec<ReplicaSnapshotWithPool>,
-    pub routing: RoutingSnapshot,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct TargetSnapshot {
-    pub label: String,
-    pub pool: PoolSnapshot,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct ReplicaSnapshotWithPool {
-    #[serde(flatten)]
-    pub routing: crate::routing::ReplicaSnapshot,
-    pub pool: PoolSnapshot,
+    /// Per-target snapshots in report order: primary, then each replica.
+    pub fn target_snapshots(&self) -> Vec<PoolSnapshot> {
+        std::iter::once(self.primary.snapshot()).chain(self.replica_pools.iter().map(|p| p.snapshot())).collect()
+    }
 }
 
 #[cfg(test)]
@@ -261,10 +226,11 @@ mod tests {
             targets,
             backend_user: "app".into(),
             database: "appdb".into(),
-            listen_port: None,
+            listen_port: 6432,
             limits: PoolLimits { max_size: 3, ..PoolLimits::default() },
             settings: Default::default(),
             routing: RoutingConfig { read_write_split: split, ..RoutingConfig::default() },
+            backend_auth: Default::default(),
             disabled: false,
             description: None,
         }

@@ -28,8 +28,8 @@ pub enum BootstrapError {
          set admin.auth or bind to localhost"
     )]
     UnauthenticatedRemoteAdmin { addr: SocketAddr },
-    #[error("admin and pooler cannot share the listen address {0}")]
-    ListenerCollision(SocketAddr),
+    #[error("server.bind {bind} and the admin listener {admin} would collide on every pool port")]
+    ListenerCollision { bind: IpAddr, admin: SocketAddr },
     #[error("server.tls.cert is set but server.tls.key is not (or vice versa)")]
     IncompleteTls,
 }
@@ -61,9 +61,7 @@ impl Bootstrap {
         if !is_loopback(&self.admin.listen) && matches!(self.admin.auth, AdminAuth::None) {
             return Err(BootstrapError::UnauthenticatedRemoteAdmin { addr: self.admin.listen });
         }
-        if self.admin.listen == self.server.listen {
-            return Err(BootstrapError::ListenerCollision(self.admin.listen));
-        }
+
         if self.server.tls.cert.is_some() != self.server.tls.key.is_some() {
             return Err(BootstrapError::IncompleteTls);
         }
@@ -81,20 +79,35 @@ fn is_loopback(addr: &SocketAddr) -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ServerConfig {
-    /// Address clients connect to with their native database driver.
-    pub listen: SocketAddr,
+    /// Interface every pool port is bound on.
+    ///
+    /// Only the address: there is no process-wide client port. A pool declares
+    /// the port clients reach it on, which is the one piece of routing an
+    /// operator actually thinks about, and it can change without a restart.
+    pub bind: IpAddr,
     /// Worker threads. `0` means one per core.
     pub workers: usize,
-    /// Hard ceiling across all pools. Protects the process from fd exhaustion
-    /// before per-pool limits get a chance to apply.
+    /// Hard ceiling across every pool port. Protects the process from fd
+    /// exhaustion before per-pool limits get a chance to apply.
     pub max_client_connections: u32,
     pub tls: ServerTls,
+}
+
+impl ServerConfig {
+    /// Ports this process must never hand to a pool.
+    ///
+    /// Only the admin listener, and only when it shares our bind address or one
+    /// of the two is a wildcard — otherwise the sockets cannot collide.
+    pub fn reserved_port(&self, admin: SocketAddr) -> Option<u16> {
+        let overlaps = self.bind == admin.ip() || self.bind.is_unspecified() || admin.ip().is_unspecified();
+        overlaps.then_some(admin.port())
+    }
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            listen: "0.0.0.0:5432".parse().expect("valid default"),
+            bind: "0.0.0.0".parse().expect("valid default"),
             workers: 0,
             max_client_connections: 1000,
             tls: ServerTls::default(),
@@ -217,7 +230,7 @@ mod tests {
     fn defaults_are_safe() {
         let config = Bootstrap::default();
         config.validate().expect("defaults must be valid");
-        assert_eq!(config.server.listen.port(), 5432);
+        assert!(config.server.bind.is_unspecified(), "pool ports default to every interface");
         assert_eq!(config.admin.listen.port(), 7432);
         assert!(is_loopback(&config.admin.listen), "admin must default to loopback");
     }
@@ -258,17 +271,41 @@ mod tests {
     }
 
     #[test]
-    fn admin_cannot_share_the_pooler_port() {
-        let err = parse(
+    fn the_admin_port_is_reserved_only_when_the_sockets_could_collide() {
+        // The admin port is reserved against pool ports, and only when the two
+        // bind addresses can actually overlap.
+        let same = parse(
             r#"
             [server]
-            listen = "127.0.0.1:5432"
+            bind = "127.0.0.1"
             [admin]
-            listen = "127.0.0.1:5432"
+            listen = "127.0.0.1:7432"
             "#,
         )
-        .unwrap_err();
-        assert!(matches!(err, BootstrapError::ListenerCollision(_)));
+        .unwrap();
+        assert_eq!(same.server.reserved_port(same.admin.listen), Some(7432));
+
+        let wildcard = parse(
+            r#"
+            [server]
+            bind = "0.0.0.0"
+            [admin]
+            listen = "127.0.0.1:7432"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(wildcard.server.reserved_port(wildcard.admin.listen), Some(7432), "a wildcard bind covers loopback");
+
+        let separate = parse(
+            r#"
+            [server]
+            bind = "10.0.0.5"
+            [admin]
+            listen = "127.0.0.1:7432"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(separate.server.reserved_port(separate.admin.listen), None, "different interfaces cannot collide");
     }
 
     #[test]

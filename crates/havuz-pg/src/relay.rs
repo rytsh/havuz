@@ -18,12 +18,12 @@ use std::collections::{HashMap, VecDeque};
 use std::io;
 
 use bytes::{Buf, Bytes, BytesMut};
+use havuz_control::{KickSignal, TraceContext, TraceSpan, TraceStore};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::protocol::Message;
-use crate::sessions::KickSignal;
 use crate::stream::MaybeTls;
-use crate::trace::{TraceContext, TraceSpan, TraceStore};
+use crate::trace::PgTraceSpan;
 
 const BUF_SIZE: usize = 16 * 1024;
 

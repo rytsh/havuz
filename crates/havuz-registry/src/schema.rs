@@ -91,6 +91,12 @@ fn field_schema(field: &ConfigField) -> Value {
     if field.secret {
         schema.insert("x-havuz-secret".into(), json!(true));
     }
+    // The dashboard shows role-bearing fields under "Connection" and the rest
+    // under "Options", and never has to know that Postgres calls the account
+    // `username`.
+    if let Some(role) = field.role {
+        schema.insert("x-havuz-role".into(), json!(role));
+    }
 
     Value::Object(schema)
 }
@@ -121,6 +127,12 @@ mod tests {
         assert_eq!(schema["properties"]["password"]["writeOnly"], true);
         assert_eq!(schema["properties"]["password"]["x-havuz-secret"], true);
         assert!(schema["properties"]["sslmode"]["enum"].as_array().unwrap().iter().any(|v| v == "verify-full"));
+
+        // The dashboard builds its request from these, not from a hardcoded
+        // list of Postgres field names.
+        assert_eq!(schema["properties"]["username"]["x-havuz-role"], "user");
+        assert_eq!(schema["properties"]["host"]["x-havuz-role"], "host");
+        assert!(schema["properties"]["sslmode"].get("x-havuz-role").is_none(), "options carry no role");
     }
 
     #[test]

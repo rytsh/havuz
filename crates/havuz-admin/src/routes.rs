@@ -6,10 +6,10 @@ use axum::extract::{Path, Query, State};
 use axum::response::IntoResponse;
 use axum::routing::{get, patch, post};
 use axum::{Json, Router};
-use havuz_core::state::{PoolConfig, PoolLimits, RoutingConfig, Target, UserConfig, Warning};
-use havuz_pg::ScramVerifier;
+use havuz_core::state::{BackendAuth, PoolConfig, PoolLimits, RoutingConfig, Target, UserConfig, Warning};
 use havuz_pool::PoolSnapshot;
 use havuz_registry::PoolMode;
+use havuz_secrets::ScramVerifier;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tower_http::compression::CompressionLayer;
@@ -29,6 +29,7 @@ pub fn router(state: AdminState) -> Router {
         .route("/pools/{name}/drain", post(drain_pool))
         .route("/pools/{name}/probe", post(probe_pool))
         .route("/pools/{name}/targets", get(pool_targets))
+        .route("/pools/{name}/identities", get(pool_identities))
         .route("/users", get(list_users).post(create_user))
         .route("/users/{name}", patch(update_user).delete(delete_user))
         .route("/users/{name}/kick", post(kick_user))
@@ -87,7 +88,8 @@ struct PoolView {
     mode: PoolMode,
     database: String,
     backend_user: String,
-    listen_port: Option<u16>,
+    listen_port: u16,
+    backend_auth: BackendAuth,
     /// Whether a password is stored. Never the password itself.
     has_backend_password: bool,
     targets: Vec<Target>,
@@ -99,6 +101,10 @@ struct PoolView {
     description: Option<String>,
     /// Configured best case, `null` in session mode where it cannot happen.
     configured_fan_in: Option<f32>,
+    /// Total backend connections this pool may open, or `null` when clients
+    /// authenticate as themselves and the ceiling depends on how many of them
+    /// are connected at once.
+    backend_ceiling: Option<u32>,
     runtime: Option<PoolSnapshot>,
 }
 
@@ -111,6 +117,7 @@ fn pool_view(name: &str, config: &PoolConfig, state: &havuz_core::State, runtime
         database: config.database.clone(),
         backend_user: config.backend_user.clone(),
         listen_port: config.listen_port,
+        backend_auth: config.backend_auth,
         has_backend_password: state.secrets.contains(&havuz_secrets::pool_backend_password(name)),
         targets: config.targets.clone(),
         limits: config.limits.clone(),
@@ -120,6 +127,7 @@ fn pool_view(name: &str, config: &PoolConfig, state: &havuz_core::State, runtime
         disabled: config.disabled,
         description: config.description.clone(),
         configured_fan_in: config.fan_in(),
+        backend_ceiling: config.backend_ceiling(),
         runtime,
     }
 }
@@ -127,7 +135,7 @@ fn pool_view(name: &str, config: &PoolConfig, state: &havuz_core::State, runtime
 async fn list_pools(State(state): State<AdminState>) -> impl IntoResponse {
     let current = state.store.load();
     let snapshots: BTreeMap<String, PoolSnapshot> =
-        state.family.snapshots().into_iter().map(|s| (s.name.clone(), s)).collect();
+        state.families.pool_snapshots().into_iter().map(|s| (s.name.clone(), s)).collect();
 
     let pools: Vec<_> = current
         .pools
@@ -141,10 +149,18 @@ async fn list_pools(State(state): State<AdminState>) -> impl IntoResponse {
 async fn get_pool(State(state): State<AdminState>, Path(name): Path<String>) -> Result<impl IntoResponse, ApiError> {
     let current = state.store.load();
     let config = current.pools.get(&name).ok_or_else(|| ApiError::NotFound(format!("pool '{name}'")))?;
-    let runtime = state.family.snapshots().into_iter().find(|s| s.name == name);
+    let runtime = state.families.pool_snapshots().into_iter().find(|s| s.name == name);
     Ok(Json(pool_view(&name, config, &current, runtime)))
 }
 
+/// Everything a pool needs, and nothing the family already declared.
+///
+/// The connection details — host, port, database, account, password — arrive in
+/// `settings` under whatever names the family chose, and are read back through
+/// [`havuz_registry::FieldRole`]. That is deliberate: the dashboard used to
+/// lift five hardcoded Postgres field names out of the form before submitting,
+/// so "adding a family never touches the frontend" was true of the rendering
+/// and false of the submitting.
 #[derive(Debug, Deserialize)]
 struct CreatePool {
     name: String,
@@ -153,13 +169,16 @@ struct CreatePool {
     profile: Option<String>,
     #[serde(default)]
     mode: Option<PoolMode>,
-    targets: Vec<Target>,
-    database: String,
-    backend_user: String,
+    /// Optional. Omitted means one primary, built from the connection fields.
+    /// Supplied means the caller is configuring replicas as well.
     #[serde(default)]
-    listen_port: Option<u16>,
+    targets: Option<Vec<Target>>,
+    /// Required: a pool nobody can reach is not a pool.
+    listen_port: u16,
+    /// Whose credentials backend connections are opened with. Defaults to one
+    /// shared service account, which is what every other pooler does.
     #[serde(default)]
-    backend_password: Option<String>,
+    backend_auth: BackendAuth,
     #[serde(default)]
     limits: Option<PoolLimits>,
     #[serde(default)]
@@ -170,14 +189,48 @@ struct CreatePool {
     description: Option<String>,
 }
 
+/// Reject a port before it is persisted, so a bad value is a `400` rather than
+/// a pool that silently never listens.
+///
+/// Sharing a port with another pool is fine and is how a client picks between
+/// them by database name; sharing it with a *different family* is not, and
+/// neither is taking the port this process serves its own API on.
+fn check_listen_port(state: &AdminState, pool: &str, port: u16, family: &str) -> Result<(), ApiError> {
+    if port == 0 {
+        return Err(ApiError::BadRequest("listen_port must be between 1 and 65535".into()));
+    }
+    if state.reserved_port == Some(port) {
+        return Err(ApiError::BadRequest(format!("port {port} is the admin listener")));
+    }
+    let current = state.store.load();
+    if let Some((owner, config)) = current
+        .pools
+        .iter()
+        .find(|(name, config)| name.as_str() != pool && config.listen_port == port && config.family != family)
+    {
+        return Err(ApiError::BadRequest(format!(
+            "port {port} already serves pool '{owner}' of family '{}'; a listener speaks one protocol",
+            config.family
+        )));
+    }
+    Ok(())
+}
+
 async fn create_pool(
     State(state): State<AdminState>,
     Json(body): Json<CreatePool>,
 ) -> Result<impl IntoResponse, ApiError> {
-    state
-        .family
-        .validate_listen_port(&body.name, body.listen_port)
-        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    check_listen_port(&state, &body.name, body.listen_port, &body.family)?;
+    if body.backend_auth.is_per_user() && !state.client_tls {
+        // The handshake refuses this per connection anyway; catching it here
+        // means the operator finds out while creating the pool rather than
+        // when the first client fails to connect to it.
+        return Err(ApiError::BadRequest(
+            "per-user authentication asks clients for their password, so it needs client-facing TLS; \
+             set server.tls.cert and server.tls.key and restart"
+                .into(),
+        ));
+    }
     let (family, profile) = havuz_registry::resolve(&body.family, body.profile.as_deref())
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
@@ -190,21 +243,37 @@ async fn create_pool(
         return Err(ApiError::BadRequest(format!("unknown setting '{unknown}' for family '{}'", family.id)));
     }
 
+    // Read the form back through the roles the family declared, rather than
+    // through field names this crate would otherwise have to know.
+    let connection = family.connection(&body.settings);
+    let targets = match body.targets {
+        Some(targets) if !targets.is_empty() => targets,
+        _ => vec![Target::new(&connection.host, connection.port)],
+    };
+
+    // Credentials never reach the state document; they go to the sealed store
+    // keyed by pool name.
+    let mut settings = body.settings;
+    for secret in family.secret_fields() {
+        settings.remove(secret);
+    }
+
     let mode = body.mode.unwrap_or(family.default_pool_mode);
     let name = body.name.clone();
-    let password = body.backend_password.clone();
+    let password = connection.password.clone();
 
     let config = PoolConfig {
         family: family.id.to_string(),
         profile: Some(profile.id.to_string()),
         mode,
-        targets: body.targets,
-        backend_user: body.backend_user,
-        database: body.database,
+        targets,
+        backend_user: connection.user,
+        database: connection.database,
         listen_port: body.listen_port,
         limits: body.limits.unwrap_or_default(),
-        settings: body.settings,
+        settings,
         routing: body.routing.unwrap_or_default(),
+        backend_auth: body.backend_auth,
         disabled: false,
         description: body.description,
     };
@@ -228,7 +297,7 @@ async fn create_pool(
         return Err(ApiError::Conflict(format!("pool '{}'", body.name)));
     }
 
-    state.family.sync_pools().map_err(|e| ApiError::Internal(e.to_string()))?;
+    state.families.sync_all().map_err(|e| ApiError::Internal(e.to_string()))?;
 
     let current = state.store.load();
     let config = current.pools.get(&body.name).expect("just inserted");
@@ -243,15 +312,8 @@ struct UpdatePool {
     max_size: Option<u32>,
     #[serde(default)]
     max_client_connections: Option<u32>,
-    #[serde(default, deserialize_with = "deserialize_nullable_port")]
-    listen_port: Option<Option<u16>>,
-}
-
-fn deserialize_nullable_port<'de, D>(deserializer: D) -> Result<Option<Option<u16>>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    Option::<u16>::deserialize(deserializer).map(Some)
+    #[serde(default)]
+    listen_port: Option<u16>,
 }
 
 async fn update_pool(
@@ -259,11 +321,11 @@ async fn update_pool(
     Path(name): Path<String>,
     Json(body): Json<UpdatePool>,
 ) -> Result<impl IntoResponse, ApiError> {
+    let Some(family) = state.store.load().pools.get(&name).map(|pool| pool.family.clone()) else {
+        return Err(ApiError::NotFound(format!("pool '{name}'")));
+    };
     if let Some(listen_port) = body.listen_port {
-        state
-            .family
-            .validate_listen_port(&name, listen_port)
-            .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+        check_listen_port(&state, &name, listen_port, &family)?;
     }
     let update_name = name.clone();
     let found = state
@@ -292,10 +354,15 @@ async fn update_pool(
         return Err(ApiError::NotFound(format!("pool '{name}'")));
     }
 
-    state.family.reload_pool(&name).map_err(|e| ApiError::Internal(e.to_string()))?;
+    state
+        .families
+        .get(&family)
+        .ok_or_else(|| ApiError::Internal(format!("no driver for family '{family}'")))?
+        .reload_pool(&name)
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
     let current = state.store.load();
     let config = current.pools.get(&name).expect("updated pool exists");
-    let runtime = state.family.snapshots().into_iter().find(|s| s.name == name);
+    let runtime = state.families.pool_snapshots().into_iter().find(|s| s.name == name);
     Ok(Json(pool_view(&name, config, &current, runtime)))
 }
 
@@ -324,7 +391,7 @@ async fn delete_pool(State(state): State<AdminState>, Path(name): Path<String>) 
     if !removed {
         return Err(ApiError::NotFound(format!("pool '{name}'")));
     }
-    state.family.sync_pools().map_err(|e| ApiError::Internal(e.to_string()))?;
+    state.families.sync_all().map_err(|e| ApiError::Internal(e.to_string()))?;
     Ok(Json(json!({ "deleted": name })))
 }
 
@@ -340,12 +407,11 @@ async fn resume_pool(State(state): State<AdminState>, Path(name): Path<String>) 
 
 async fn set_disabled(state: &AdminState, name: &str, disabled: bool) -> Result<(), ApiError> {
     if !disabled {
+        // Resuming reopens a socket, so the port has to be checked again: it
+        // may have been claimed while this pool was down.
         let current = state.store.load();
         let pool = current.pools.get(name).ok_or_else(|| ApiError::NotFound(format!("pool '{name}'")))?;
-        state
-            .family
-            .validate_listen_port(name, pool.listen_port)
-            .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+        check_listen_port(state, name, pool.listen_port, &pool.family)?;
     }
     let found = state
         .store
@@ -364,7 +430,7 @@ async fn set_disabled(state: &AdminState, name: &str, disabled: bool) -> Result<
     if !found {
         return Err(ApiError::NotFound(format!("pool '{name}'")));
     }
-    state.family.sync_pools().map_err(|e| ApiError::Internal(e.to_string()))
+    state.families.sync_all().map_err(|e| ApiError::Internal(e.to_string()))
 }
 
 async fn drain_pool(State(state): State<AdminState>, Path(name): Path<String>) -> Result<impl IntoResponse, ApiError> {
@@ -375,8 +441,12 @@ async fn drain_pool(State(state): State<AdminState>, Path(name): Path<String>) -
 }
 
 async fn probe_pool(State(state): State<AdminState>, Path(name): Path<String>) -> Result<impl IntoResponse, ApiError> {
-    use havuz_proto::ProtocolFamily;
-    match state.family.probe(&name).await {
+    let family = state
+        .families
+        .for_pool(&state.store.load(), &name)
+        .ok_or_else(|| ApiError::NotFound(format!("pool '{name}'")))?
+        .clone();
+    match family.probe(&name).await {
         Ok(probe) => Ok(Json(json!({ "ok": true, "probe": probe }))),
         // A failed probe is information, not a server fault: the UI shows the
         // reason next to the Test Connection button.
@@ -391,6 +461,9 @@ struct UserView {
     name: String,
     pools: Vec<String>,
     max_client_connections: u32,
+    /// Connects to the database as itself rather than as the pool's service
+    /// account. Only takes effect on pools configured for per-user auth.
+    own_backend_role: bool,
     read_only: bool,
     disabled: bool,
     description: Option<String>,
@@ -404,7 +477,7 @@ async fn list_users(State(state): State<AdminState>) -> impl IntoResponse {
     // Live session counts turn the page from a list of records into something
     // an operator can act on: disabling a user with 40 connections attached
     // means something quite different from disabling one with none.
-    let live = state.family.sessions().counts_by_user();
+    let live = state.registries.sessions.counts_by_user();
     let users: Vec<_> = current
         .users
         .iter()
@@ -412,6 +485,7 @@ async fn list_users(State(state): State<AdminState>) -> impl IntoResponse {
             name: name.clone(),
             pools: u.pools.clone(),
             max_client_connections: u.max_client_connections,
+            own_backend_role: u.own_backend_role,
             read_only: u.read_only,
             disabled: u.disabled,
             description: u.description.clone(),
@@ -430,6 +504,10 @@ struct UpdateUser {
     pools: Option<Vec<String>>,
     #[serde(default)]
     max_client_connections: Option<u32>,
+    /// Move this user on or off its own database role. Existing connections
+    /// under the old identity finish; new ones use the new one.
+    #[serde(default)]
+    own_backend_role: Option<bool>,
     #[serde(default)]
     read_only: Option<bool>,
     #[serde(default)]
@@ -475,6 +553,9 @@ async fn update_user(
                 if let Some(max) = body.max_client_connections {
                     user.max_client_connections = max;
                 }
+                if let Some(own) = body.own_backend_role {
+                    user.own_backend_role = own;
+                }
                 if let Some(read_only) = body.read_only {
                     user.read_only = read_only;
                 }
@@ -498,7 +579,7 @@ async fn update_user(
 
     // Only after the change is durable. Kicking first would drop sessions that
     // a failed validation then leaves entitled to reconnect.
-    let kicked = if body.kick { state.family.sessions().kick_user(&name) } else { 0 };
+    let kicked = if body.kick { state.registries.sessions.kick_user(&name) } else { 0 };
 
     Ok(Json(json!({ "updated": name, "kicked": kicked })))
 }
@@ -512,13 +593,13 @@ async fn kick_user(State(state): State<AdminState>, Path(name): Path<String>) ->
     if !state.store.load().users.contains_key(&name) {
         return Err(ApiError::NotFound(format!("user '{name}'")));
     }
-    let kicked = state.family.sessions().kick_user(&name);
+    let kicked = state.registries.sessions.kick_user(&name);
     Ok(Json(json!({ "user": name, "kicked": kicked })))
 }
 
 /// Who is connected right now.
 async fn list_sessions(State(state): State<AdminState>) -> impl IntoResponse {
-    Json(json!({ "sessions": state.family.sessions().snapshot() }))
+    Json(json!({ "sessions": state.registries.sessions.snapshot() }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -528,6 +609,8 @@ struct CreateUser {
     pools: Vec<String>,
     #[serde(default)]
     max_client_connections: u32,
+    #[serde(default)]
+    own_backend_role: bool,
     #[serde(default)]
     read_only: bool,
     #[serde(default)]
@@ -551,6 +634,7 @@ async fn create_user(
     let config = UserConfig {
         pools: body.pools,
         max_client_connections: body.max_client_connections,
+        own_backend_role: body.own_backend_role,
         read_only: body.read_only,
         disabled: false,
         description: body.description,
@@ -616,7 +700,7 @@ async fn get_config(State(state): State<AdminState>) -> impl IntoResponse {
 }
 
 async fn get_summary(State(state): State<AdminState>) -> impl IntoResponse {
-    let snapshots = state.family.snapshots();
+    let snapshots = state.families.pool_snapshots();
     let current = state.store.load();
 
     let backend: u64 = snapshots.iter().map(|s| s.open).sum();
@@ -645,12 +729,39 @@ async fn pool_targets(
     Path(name): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
     state
-        .family
-        .group_snapshots()
+        .families
+        .target_reports()
         .into_iter()
         .find(|g| g.name == name)
         .map(Json)
         .ok_or_else(|| ApiError::NotFound(format!("pool '{name}'")))
+}
+
+/// Who is holding connections of their own, and how many.
+///
+/// Empty for a pool with one service account, which is the default. The answer
+/// lives here rather than in `/metrics` because it is unbounded in the number
+/// of users, and a Prometheus series per user is how a monitoring bill becomes
+/// an incident.
+async fn pool_identities(
+    State(state): State<AdminState>,
+    Path(name): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let current = state.store.load();
+    let Some(config) = current.pools.get(&name) else {
+        return Err(ApiError::NotFound(format!("pool '{name}'")));
+    };
+    let identities: Vec<_> =
+        state.families.backend_identities().into_iter().filter(|identity| identity.pool == name).collect();
+
+    Ok(Json(json!({
+        "pool": name,
+        "backend_auth": config.backend_auth,
+        // With per-user auth this is a per-user budget, so the total depends on
+        // how many users are connected. Saying so beats printing a guess.
+        "max_size_is_per_user": config.backend_auth.is_per_user(),
+        "identities": identities,
+    })))
 }
 
 /// Why transaction-mode sessions stopped being shareable.
@@ -658,41 +769,41 @@ async fn pool_targets(
 /// The endpoint no competing pooler offers, and the one that turns "my pool is
 /// full" into "turn off `SET application_name` in orders-api".
 async fn get_pins(State(state): State<AdminState>) -> impl IntoResponse {
-    Json(state.family.pins().report())
+    Json(state.registries.pins.report())
 }
 
 async fn reset_pins(State(state): State<AdminState>) -> impl IntoResponse {
-    state.family.pins().reset();
+    state.registries.pins.reset();
     Json(json!({ "reset": true }))
 }
 
 async fn get_traces(
     State(state): State<AdminState>,
-    Query(filter): Query<havuz_pg::TraceFilter>,
+    Query(filter): Query<havuz_control::TraceFilter>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let trace_store = state.family.traces();
+    let trace_store = state.registries.traces;
     let traces = trace_store.list(&filter).map_err(|error| ApiError::Internal(error.to_string()))?;
     let total = trace_store.count(&filter).map_err(|error| ApiError::Internal(error.to_string()))?;
     let limit = filter.limit.unwrap_or(100).clamp(1, 500);
     let offset = filter.offset.unwrap_or(0);
     Ok(Json(json!({
         "active": trace_store.active(),
-        "holders": state.family.holders().snapshot(),
-        "pool_snapshots": state.family.snapshots(),
+        "holders": state.registries.holders.snapshot(),
+        "pool_snapshots": state.families.pool_snapshots(),
         "traces": traces,
         "pagination": { "total": total, "limit": limit, "offset": offset },
-        "retention_days": havuz_pg::trace::RETENTION_DAYS,
+        "retention_days": havuz_control::RETENTION_DAYS,
         "result_limits": {
-            "rows": havuz_pg::trace::MAX_RESULT_ROWS,
-            "bytes": havuz_pg::trace::MAX_RESULT_BYTES,
+            "rows": havuz_control::MAX_RESULT_ROWS,
+            "bytes": havuz_control::MAX_RESULT_BYTES,
         }
     })))
 }
 
 async fn get_trace(State(state): State<AdminState>, Path(id): Path<u64>) -> Result<impl IntoResponse, ApiError> {
     state
-        .family
-        .traces()
+        .registries
+        .traces
         .get(id)
         .map_err(|error| ApiError::Internal(error.to_string()))?
         .map(Json)
@@ -700,15 +811,15 @@ async fn get_trace(State(state): State<AdminState>, Path(id): Path<u64>) -> Resu
 }
 
 async fn clear_traces(State(state): State<AdminState>) -> Result<impl IntoResponse, ApiError> {
-    let deleted = state.family.traces().clear().map_err(|error| ApiError::Internal(error.to_string()))?;
+    let deleted = state.registries.traces.clear().map_err(|error| ApiError::Internal(error.to_string()))?;
     Ok(Json(json!({ "deleted": deleted })))
 }
 
 async fn prometheus(State(state): State<AdminState>) -> impl IntoResponse {
     let body = metrics::render(
-        &state.family.snapshots(),
-        &state.family.group_snapshots(),
-        &state.family.pins().report(),
+        &state.families.pool_snapshots(),
+        &state.families.target_reports(),
+        &state.registries.pins.report(),
         state.uptime_seconds(),
     );
     ([(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")], body)
@@ -727,18 +838,40 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
+    use havuz_control::testing::FakeFamily;
     use havuz_core::{State as CoreState, StateStore};
-    use havuz_pg::PgFamily;
     use havuz_secrets::MasterKey;
     use http_body_util::BodyExt;
     use std::sync::Arc;
     use tower::ServiceExt;
 
     fn app() -> (Router, AdminState) {
+        build_app(None, true)
+    }
+
+    fn app_with_reserved(reserved: Option<u16>) -> (Router, AdminState) {
+        build_app(reserved, true)
+    }
+
+    fn app_without_tls() -> (Router, AdminState) {
+        build_app(None, false)
+    }
+
+    fn build_app(reserved: Option<u16>, client_tls: bool) -> (Router, AdminState) {
         let key = Arc::new(MasterKey::generate());
         let store = Arc::new(StateStore::ephemeral(CoreState::default()));
-        let family = PgFamily::new(store.clone(), key.clone());
-        let state = AdminState::new(store, key, family, &havuz_core::AdminAuth::None, false);
+        let registries = havuz_control::Registries::ephemeral();
+        let families = havuz_control::FamilySet::new(vec![FakeFamily::new(store.clone())]);
+        let state = AdminState::new(
+            store,
+            key,
+            families,
+            registries,
+            reserved,
+            client_tls,
+            &havuz_core::AdminAuth::None,
+            false,
+        );
         (router(state.clone()), state)
     }
 
@@ -784,16 +917,21 @@ mod tests {
         (response.status(), body_json(response).await)
     }
 
+    /// Exactly what the dashboard sends: the form, verbatim, plus the pooler
+    /// settings. No connection field is repeated at the top level.
     fn pool_payload() -> serde_json::Value {
         json!({
             "name": "app_main",
             "family": "postgres",
-            "targets": [{ "host": "pg-primary.internal", "port": 5432 }],
-            "database": "appdb",
-            "backend_user": "app",
-            "backend_password": "hunter2",
             "mode": "session",
-            "settings": { "host": "pg-primary.internal", "database": "appdb", "username": "app" },
+            "listen_port": 6432,
+            "settings": {
+                "host": "pg-primary.internal",
+                "port": 5432,
+                "database": "appdb",
+                "username": "app",
+                "password": "hunter2",
+            },
             "limits": { "max_size": 3, "max_client_connections": 100 }
         })
     }
@@ -826,7 +964,7 @@ mod tests {
         assert_eq!(body["mode"], "transaction");
         assert_eq!(body["limits"]["max_size"], 12);
         assert_eq!(body["limits"]["max_client_connections"], 240);
-        assert!(state.family.snapshots().iter().any(|pool| pool.name == "app_main" && pool.max_size == 12));
+        assert!(state.families.pool_snapshots().iter().any(|pool| pool.name == "app_main" && pool.max_size == 12));
     }
 
     #[tokio::test]
@@ -840,7 +978,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dedicated_port_can_be_created_updated_and_removed() {
+    async fn a_pool_port_can_be_moved_without_recreating_the_pool() {
         let (app, state) = app();
         let mut payload = pool_payload();
         payload["listen_port"] = json!(5544);
@@ -850,23 +988,45 @@ mod tests {
 
         let (_, updated) = patch(&app, "/api/v1/pools/app_main", json!({ "listen_port": 5545 })).await;
         assert_eq!(updated["listen_port"], 5545);
-        let (_, cleared) = patch(&app, "/api/v1/pools/app_main", json!({ "listen_port": null })).await;
-        assert!(cleared["listen_port"].is_null());
-        assert_eq!(state.store.load().pools["app_main"].listen_port, None);
+        assert_eq!(state.store.load().pools["app_main"].listen_port, 5545);
     }
 
     #[tokio::test]
-    async fn occupied_dedicated_port_is_rejected_before_pool_creation() {
+    async fn two_pools_may_share_a_port() {
+        // This is how a client picks between them by database name, and it is
+        // the reason a port is not unique per pool.
         let (app, state) = app();
-        let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = occupied.local_addr().unwrap().port();
-        state.family.configure_listeners("127.0.0.1:5432".parse().unwrap(), 100);
+        let mut first = pool_payload();
+        first["listen_port"] = json!(5544);
+        let (status, body) = post(&app, "/api/v1/pools", first).await;
+        assert_eq!(status, StatusCode::CREATED, "body: {body}");
+
+        let mut second = pool_payload();
+        second["name"] = json!("reports");
+        second["listen_port"] = json!(5544);
+        let (status, body) = post(&app, "/api/v1/pools", second).await;
+        assert_eq!(status, StatusCode::CREATED, "body: {body}");
+        assert_eq!(state.store.load().listeners()[&5544].pools, ["app_main", "reports"]);
+    }
+
+    #[tokio::test]
+    async fn a_pool_cannot_claim_the_admin_port() {
+        let (app, state) = app_with_reserved(Some(7432));
         let mut payload = pool_payload();
-        payload["listen_port"] = json!(port);
+        payload["listen_port"] = json!(7432);
 
         let (status, body) = post(&app, "/api/v1/pools", payload).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
-        assert!(state.store.load().pools.is_empty(), "rejected bind must not persist the pool");
+        assert!(state.store.load().pools.is_empty(), "a rejected port must not persist the pool");
+    }
+
+    #[tokio::test]
+    async fn a_listen_port_of_zero_is_rejected() {
+        let (app, _) = app();
+        let mut payload = pool_payload();
+        payload["listen_port"] = json!(0);
+        let (status, _) = post(&app, "/api/v1/pools", payload).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -1066,7 +1226,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["kicked"], 0);
 
-        let sessions = state.family.sessions();
+        let sessions = state.registries.sessions;
         let _a = sessions.register("svc", "app_main", None, "10.0.0.1:5000", 0).unwrap();
         let _b = sessions.register("svc", "app_main", None, "10.0.0.2:5000", 0).unwrap();
         let _other = sessions.register("someone_else", "app_main", None, "10.0.0.3:5000", 0).unwrap();
@@ -1087,7 +1247,7 @@ mod tests {
         post(&app, "/api/v1/pools", pool_payload()).await;
         post(&app, "/api/v1/users", json!({ "name": "svc", "password": "p", "pools": ["app_main"] })).await;
 
-        let sessions = state.family.sessions();
+        let sessions = state.registries.sessions;
         let live = sessions.register("svc", "app_main", None, "10.0.0.1:5000", 0).unwrap();
 
         let (status, body) = patch(&app, "/api/v1/users/svc", json!({ "disabled": true, "kick": true })).await;
@@ -1100,7 +1260,7 @@ mod tests {
     #[tokio::test]
     async fn live_sessions_are_listed_for_an_operator() {
         let (app, state) = app();
-        let sessions = state.family.sessions();
+        let sessions = state.registries.sessions;
         let _live = sessions.register("svc", "app_main", Some("orders-api"), "10.0.0.1:5000", 0).unwrap();
 
         let (status, body) = get(&app, "/api/v1/sessions").await;
@@ -1165,9 +1325,7 @@ mod tests {
     #[tokio::test]
     async fn probing_an_unreachable_backend_reports_the_reason_instead_of_failing() {
         let (app, _) = app();
-        let mut payload = pool_payload();
-        payload["targets"] = json!([{ "host": "127.0.0.1", "port": 1 }]);
-        post(&app, "/api/v1/pools", payload).await;
+        post(&app, "/api/v1/pools", pool_payload()).await;
 
         let (status, body) = post(&app, "/api/v1/pools/app_main/probe", json!({})).await;
         assert_eq!(status, StatusCode::OK, "a failed probe is information, not a server error");
@@ -1271,6 +1429,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_shared_pool_reports_no_backend_identities() {
+        let (app, _) = app();
+        post(&app, "/api/v1/pools", pool_payload()).await;
+
+        let (status, body) = get(&app, "/api/v1/pools/app_main/identities").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["backend_auth"], "shared");
+        assert_eq!(body["max_size_is_per_user"], false);
+        assert!(body["identities"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_per_user_pool_says_that_max_size_is_a_per_user_budget() {
+        let (app, _) = app();
+        let mut payload = pool_payload();
+        payload["backend_auth"] = json!("per_user");
+        let (status, body) = post(&app, "/api/v1/pools", payload).await;
+        assert_eq!(status, StatusCode::CREATED, "body: {body}");
+        assert_eq!(body["backend_auth"], "per_user");
+        // There is no honest total: it depends on how many users connect.
+        assert!(body["backend_ceiling"].is_null());
+
+        let (_, identities) = get(&app, "/api/v1/pools/app_main/identities").await;
+        assert_eq!(identities["max_size_is_per_user"], true);
+    }
+
+    #[tokio::test]
+    async fn per_user_authentication_is_refused_without_client_tls() {
+        // It asks clients for their password. Catching it here beats letting
+        // every connection to the pool fail afterwards.
+        let (app, state) = app_without_tls();
+        let mut payload = pool_payload();
+        payload["backend_auth"] = json!("per_user");
+
+        let (status, body) = post(&app, "/api/v1/pools", payload).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+        assert!(body["error"]["message"].as_str().unwrap_or_default().contains("TLS"), "body: {body}");
+        assert!(state.store.load().pools.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_user_can_be_moved_onto_its_own_database_role_and_back() {
+        let (app, state) = app();
+        post(&app, "/api/v1/pools", pool_payload()).await;
+        post(&app, "/api/v1/users", json!({ "name": "svc_orders", "password": "p", "pools": ["app_main"] })).await;
+
+        // Off by default, so flipping a pool into per-user mode changes nothing
+        // until each user is moved deliberately.
+        assert!(!state.store.load().users["svc_orders"].own_backend_role);
+
+        patch(&app, "/api/v1/users/svc_orders", json!({ "own_backend_role": true })).await;
+        assert!(state.store.load().users["svc_orders"].own_backend_role);
+
+        let (_, users) = get(&app, "/api/v1/users").await;
+        let user = users["users"].as_array().unwrap().iter().find(|u| u["name"] == "svc_orders").unwrap();
+        assert_eq!(user["own_backend_role"], true);
+
+        patch(&app, "/api/v1/users/svc_orders", json!({ "own_backend_role": false })).await;
+        assert!(!state.store.load().users["svc_orders"].own_backend_role);
+    }
+
+    #[tokio::test]
+    async fn a_per_user_pool_cannot_keep_connections_warm() {
+        let (app, _) = app();
+        let mut payload = pool_payload();
+        payload["backend_auth"] = json!("per_user");
+        payload["limits"] = json!({ "max_size": 3, "max_client_connections": 100, "min_idle": 2 });
+
+        let (status, body) = post(&app, "/api/v1/pools", payload).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    }
+
+    #[tokio::test]
+    async fn identities_of_an_unknown_pool_is_a_404() {
+        let (app, _) = app();
+        let (status, _) = get(&app, "/api/v1/pools/ghost/identities").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
     async fn targets_of_an_unknown_pool_is_a_404() {
         let (app, _) = app();
         let (status, _) = get(&app, "/api/v1/pools/ghost/targets").await;
@@ -1280,8 +1518,8 @@ mod tests {
     #[tokio::test]
     async fn the_pin_report_names_who_broke_multiplexing() {
         let (app, state) = app();
-        state.family.pins().record("svc_orders", Some("orders-api"), havuz_proto::PinReason::SessionParameter);
-        state.family.pins().record_clean();
+        state.registries.pins.record("svc_orders", Some("orders-api"), havuz_proto::PinReason::SessionParameter);
+        state.registries.pins.record_clean();
 
         let (status, body) = get(&app, "/api/v1/pins").await;
         assert_eq!(status, StatusCode::OK);
@@ -1300,7 +1538,7 @@ mod tests {
     #[tokio::test]
     async fn pin_statistics_can_be_reset_after_a_fix_is_deployed() {
         let (app, state) = app();
-        state.family.pins().record("svc", None, havuz_proto::PinReason::Listen);
+        state.registries.pins.record("svc", None, havuz_proto::PinReason::Listen);
 
         let response = app
             .clone()
@@ -1316,15 +1554,15 @@ mod tests {
     #[tokio::test]
     async fn query_traces_expose_active_history_detail_and_filters() {
         let (app, state) = app();
-        let context = havuz_pg::TraceContext {
+        let context = havuz_control::TraceContext {
             pool: "app_main".into(),
             user: "svc_orders".into(),
             application: Some("orders-api".into()),
             client_addr: "127.0.0.1:5000".into(),
         };
-        let holder = state.family.holders().session(context.clone(), havuz_core::PoolMode::Transaction);
+        let holder = state.registries.holders.session(context.clone(), havuz_core::PoolMode::Transaction);
         holder.idle_in_transaction("primary/127.0.0.1:5432".into(), Some(4242));
-        let mut span = state.family.traces().begin(&context, "select 42");
+        let mut span = state.registries.traces.begin(&context, "select 42");
         span.assign("primary/127.0.0.1:5432", Some(4242));
 
         let (status, active) = get(&app, "/api/v1/traces?pool=app_main&user=svc_orders&limit=1&offset=0").await;
@@ -1359,13 +1597,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        assert!(state.family.traces().list(&havuz_pg::TraceFilter::default()).unwrap().is_empty());
+        assert!(state.registries.traces.list(&havuz_control::TraceFilter::default()).unwrap().is_empty());
     }
 
     #[tokio::test]
     async fn pin_metrics_are_exported() {
         let (app, state) = app();
-        state.family.pins().record("svc", Some("api"), havuz_proto::PinReason::SessionParameter);
+        state.registries.pins.record("svc", Some("api"), havuz_proto::PinReason::SessionParameter);
 
         let response =
             app.clone().oneshot(Request::builder().uri("/metrics").body(Body::empty()).unwrap()).await.unwrap();
@@ -1392,11 +1630,15 @@ mod tests {
         std::env::set_var("HAVUZ_TEST_ROUTES_TOKEN", "s3cret");
         let key = Arc::new(MasterKey::generate());
         let store = Arc::new(StateStore::ephemeral(CoreState::default()));
-        let family = PgFamily::new(store.clone(), key.clone());
+        let registries = havuz_control::Registries::ephemeral();
+        let families = havuz_control::FamilySet::new(vec![FakeFamily::new(store.clone())]);
         let state = AdminState::new(
             store,
             key,
-            family,
+            families,
+            registries,
+            None,
+            true,
             &havuz_core::AdminAuth::Bearer { token_env: "HAVUZ_TEST_ROUTES_TOKEN".into() },
             false,
         );

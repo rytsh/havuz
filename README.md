@@ -28,11 +28,18 @@ PostgreSQL, with pin analysis on top.
 | Prepared statement rewriting | working |
 | Read/write split with read-after-write safety | working |
 | Replica health, lag gating, circuit breaker | working |
-| MySQL, Redis, JDBC bridge | not yet, visible in the UI as planned |
+| Per-pool client ports, rebound without a restart | working |
+| Client-facing TLS | working |
+| Per-user backend authentication | working |
+| Multi-family plumbing: registry-driven, `dyn` all the way to the socket | working, one family shipped |
+| JDBC bridge (Oracle, DB2, Informix, …) | working, experimental |
+| MySQL, Redis | not yet, visible in the UI as planned |
 
 ### Measured
 
-Against PostgreSQL 16, release build, `pgbench -S`:
+Against PostgreSQL 16, release build, `pgbench -S`. All figures are for a pool
+with a shared service account; per-user authentication multiplies backend
+connections by the number of connected users by design.
 
 | Test | Result |
 |---|---|
@@ -60,14 +67,31 @@ cp havuz.example.toml havuz.toml
 Open <http://127.0.0.1:7432>, add a database, create a user, then connect:
 
 ```sh
-psql "postgresql://svc_orders:yourpassword@127.0.0.1:5432/app_main"
+psql "postgresql://svc_orders:yourpassword@127.0.0.1:6432/app_main"
 ```
 
-The shared listener (`5432` by default) routes by database name. A pool can
-optionally have a dedicated client port, configured when it is created or from
-**Databases -> Configure**. A dedicated port routes directly to that pool even
-if the client omits the database name, and is opened only while the pool exists
-and is enabled. Port changes take effect without restarting havuz.
+### Ports belong to pools
+
+There is no process-wide client port. Every pool declares the port it is
+reached on, which is the one piece of routing an operator actually thinks
+about, and it can be changed from **Databases -> Configure** without restarting
+havuz.
+
+Pools may share a port, and that is what the database name is for:
+
+| Pools on the port | What the database name does |
+|---|---|
+| one | ignored — the connection string may omit it entirely |
+| several | picks between them; an unknown name is refused with the list of what is there |
+
+Every pool on a port must belong to the same family, because the listener has
+to decide which handshake to run before it has read a byte. The admin port is
+reserved, and a disabled pool closes its socket rather than accepting and then
+refusing.
+
+This is also what makes a second protocol possible at all: the old shared
+listener routed on the startup packet's `database` field, which only Postgres
+defines, so no other family could ever have had a socket.
 
 The dashboard is served from the binary when built with
 `--features havuz-admin/embed-ui`, or from disk via `HAVUZ_UI_DIR=ui/dist`.
@@ -75,19 +99,50 @@ The dashboard is served from the binary when built with
 ## How it is put together
 
 ```
+agent/             The JDBC sidecar. Java, no dependencies, built by javac.
 crates/
-  havuz-registry   Database families as data. UI forms are generated from this,
-                   so adding a family never touches the frontend.
-  havuz-secrets    AES-256-GCM secret store. Credentials entered in the UI
-                   cannot live in an environment variable.
+  havuz-registry   Database families as data, including which form field means
+                   host, port, database, account and password. UI forms are
+                   generated from this and submitted back through it, so adding
+                   a family never touches the frontend.
+  havuz-secrets    AES-256-GCM secret store and the SCRAM verifier format.
+                   Credentials entered in the UI cannot live in an environment
+                   variable.
   havuz-core       Bootstrap config, runtime state, atomic persistence, TLS.
-  havuz-proto      The seam every protocol family plugs into.
+  havuz-proto      The data-plane seam: given a socket and the pools behind it,
+                   serve the client.
   havuz-pool       Protocol-agnostic pool engine.
+  havuz-control    The control-plane seam: four methods about pools, plus the
+                   process-wide session, pin, holder and trace registries every
+                   family shares.
   havuz-pg         PostgreSQL: framing, SCRAM, backend, session, relay, cancel.
+  havuz-jdbc       The JDBC bridge. A PostgreSQL frontend, not a relay: it
+                   composes result sets rather than copying them.
   havuz-admin      HTTP API, Prometheus, dashboard serving.
-  havuz-server     The binary.
-ui/                Svelte + Vite dashboard (22 kB gzipped).
+  havuz-server     The binary. Owns every listener.
+ui/                Svelte + Vite dashboard.
 ```
+
+Three rules keep the seam honest, and each of them used to be violated.
+
+**No crate above the seam names a protocol crate.** `havuz-admin` depends on
+`havuz-control`, not on `havuz-pg` — not even in its tests, which run against a
+protocol-less `FakeFamily`. If the admin API could only be exercised against
+Postgres, "the admin API does not depend on Postgres" would be an assertion
+nobody was checking.
+
+**Families own no sockets.** `havuz-server` binds every port and hands over
+accepted connections. A family that owns listeners owns the process.
+
+**The frontend lifts nothing.** The dashboard sends the connection form
+verbatim; the server reads host, port, database, account and password back out
+of it through the roles the family declared. Before that, the submit handler
+hardcoded five Postgres field names, so the claim was true of the rendering and
+false of the submitting.
+
+Families are constructed from the registry, so a descriptor promoted out of
+`planned` without a driver behind it fails at startup rather than showing an
+enabled card that rejects every pool.
 
 ### The feature that does not exist elsewhere
 
@@ -123,6 +178,93 @@ That is a sentence an operator can act on, rather than "your pool is full".
 `havuz_session_pin_rate` is the metric to alert on: above a few percent in
 transaction mode, the configured fan-in is fiction.
 
+### Per-user backend authentication
+
+A pool set to `backend_auth = per_user` opens its connections as the client
+rather than as a service account. Each user gets a set of connections of its
+own, so `max_size` becomes a per-user budget:
+
+| | shared | per user |
+|---|---|---|
+| 10 users × 10 clients, `max_size = 3` | 100 clients → 3 backends | 100 clients → 30 backends |
+| fan-in | 33:1 | 10:1 **per user**, 3.3:1 overall |
+
+Fan-in does not disappear; it becomes per-user. Whether that is worth it depends
+entirely on whether you need the database to know who is asking.
+
+SCRAM cannot be proxied — the proof is computed over nonces chosen by both
+endpoints — so havuz has to hold the plaintext to authenticate outward. It gets
+it by asking the client for it directly, and three things follow, all enforced
+rather than configured:
+
+* **It is only ever asked for over TLS.** A cleartext request on an unencrypted
+  socket is refused outright. This is why the client-facing listener needs a
+  certificate before such a pool can be created at all.
+* **It is checked against havuz's own verifier first**, so a wrong password is
+  refused here and never reaches the database. Without that, the pool would be a
+  credential-stuffing proxy pointed at PostgreSQL.
+* **It is never stored.** It lives as long as the user has connections, and goes
+  when the last one closes. Rotating it drains the connections opened with the
+  old one.
+
+Two consequences worth planning for. `min_idle` must be `0`: havuz cannot warm a
+connection for a user whose password it does not hold. And the service account
+does not disappear — health probes and *Test Connection* run on a timer with no
+client attached, so they keep using it, as do users who have not been moved
+across.
+
+That last part is the migration path. Flipping a pool to `per_user` changes
+nothing until each user is switched over individually on the **Users** page, so
+you can move one application at a time and watch what it costs.
+
+### The JDBC bridge, and why it is a different kind of thing
+
+Everything above describes a relay. havuz reads a frame, writes it to a backend
+and copies the answer back without understanding it, and every number in this
+README follows from that.
+
+**The JDBC bridge does not relay.** JDBC is a Java API, not a wire protocol;
+nothing comes back that a PostgreSQL client could read. So havuz parses the
+client's statements, runs them through a JVM sidecar, and *composes*
+`RowDescription`, `DataRow` and `CommandComplete` itself. It is a PostgreSQL
+server rather than a pooler, and that is a different job with different costs.
+
+What it buys is the long tail: Oracle, DB2, Informix, Teradata, Snowflake and
+everything else with a JDBC driver and no Rust one, reached with `psql` or any
+PostgreSQL client.
+
+```sh
+./agent/build.sh          # a 20 kB JAR, no dependencies, javac and jar only
+```
+
+The sidecar is deliberately small and deliberately not a pool: one JVM per pool,
+one JDBC connection per pooled session on it. A second pool inside the agent
+would make the number an operator configured stop being the number the database
+sees, which is the one promise a pooler exists to keep.
+
+Three things are worth knowing before turning it on.
+
+**A Java runtime is required**, 17 or newer, on `PATH` or named per pool. havuz
+says so at startup rather than failing on the first connection.
+
+**A reset query is required to reuse connections.** JDBC has no portable
+equivalent of `DISCARD ALL`, so without one havuz closes a connection rather
+than returning it: a temporary table or a changed `search_path` reaching the
+next client is a correctness bug, not a tuning choice. Set `DISCARD ALL` for
+PostgreSQL and whatever your database calls one elsewhere.
+
+**Session mode only.** Transaction mode would need session state — schema,
+isolation level, autocommit — carried between backends, and that is a decision
+worth making with a second database in hand rather than in advance.
+
+What is checkable, and checked: `tests/e2e/jdbc.sh` puts PostgreSQL behind the
+bridge, which looks like a strange choice for a feature about databases that are
+not PostgreSQL. It is the only choice that makes the answer verifiable. Every
+query runs twice, once natively and once through the bridge, and the outputs
+must be byte-identical — integers, text, booleans, `numeric`, `bytea`, dates,
+timestamps, `json`, arrays, `uuid`, unicode and nulls all included. Against
+Oracle there would be nothing to compare against.
+
 ### Read/write split, and why it is off by default
 
 This is the feature most likely to break an application silently. A misrouted
@@ -149,16 +291,17 @@ is within `max_replica_lag`. Never measured is not the same as caught up.
 
 ### Three decisions worth knowing about
 
-**Clients authenticate against havuz, not against PostgreSQL.** Every backend
-connection in a pool uses one service account. This is not a shortcut — it is
-the mechanism that makes a backend connection reusable at all. If each client's
-own database role were carried through, you would need one pool per role and the
-fan-in would collapse to the number of roles. It is also forced: SCRAM cannot be
-proxied, because the proof is computed over nonces chosen by both endpoints.
+**Clients authenticate against havuz, not against PostgreSQL.** By default every
+backend connection in a pool uses one service account, and clients prove
+themselves to havuz with SCRAM against a verifier havuz stores. That sharing is
+what makes a backend connection reusable by any client, which is where the
+fan-in comes from. havuz stores a verifier, never a password, so a stolen state
+file hands over nothing.
 
-havuz stores a SCRAM verifier per user, never a password, and injects the client
-identity into `application_name` so `pg_stat_activity` still attributes work to a
-real caller.
+The cost is that the database cannot tell your users apart. A pool can be
+switched to per-user authentication instead — see below — which trades fan-in
+for `pg_stat_activity.usename`, row-level security and real `GRANT`
+enforcement.
 
 **Named prepared statements are rewritten, not pinned.** The extended query
 protocol lets a client `Parse` under a name and `Bind` later; asyncpg, JDBC,
@@ -187,10 +330,13 @@ Connection — where a round trip more or less does not matter.
 
 Two planes, deliberately separated:
 
-* `havuz.toml` — listen addresses, TLS, state location. Changing these means
-  rebinding sockets, so they require a restart.
-* `state.json` — pools, users, sealed secrets. Written by the dashboard and the
-  API, validated before every write, persisted atomically.
+* `havuz.toml` — bind address, TLS, state location, the admin listener. These
+  decide sockets the process holds for its own lifetime, so they require a
+  restart.
+* `state.json` — pools, users, sealed secrets, and the client ports. Written by
+  the dashboard and the API, validated before every write, persisted
+  atomically. Pool ports live here rather than in the config file precisely
+  because adding a database must not need a restart.
 
 ## Observability
 
@@ -240,10 +386,21 @@ Integration tests need a real PostgreSQL and are not part of `cargo test`:
 docker compose -f tests/e2e/docker-compose.yml up -d
 ./tests/e2e/run.sh                  # pooling, prepared statements, pin detection
 
+./tests/e2e/per-user.sh             # per-user backend roles, over real TLS
+./tests/e2e/jdbc.sh                 # the JDBC bridge, compared against native
+
 ./tests/e2e/replica-setup.sh up     # a real streaming standby via pg_basebackup
 ./tests/e2e/split.sh                # read/write split, lag, failover, recovery
 ./tests/e2e/replica-setup.sh down
 ```
+
+`per-user.sh` creates two real PostgreSQL roles and asserts that
+`pg_stat_activity.usename` names the connecting client rather than the service
+account, which is the only claim the feature actually makes. It also checks the
+parts that are easy to lose while making that true: a wrong password never
+reaches the database, an unencrypted client is refused, pooling still happens
+within each user, and the flat pool list stays one row and one metric series
+however many identities are live.
 
 The replica suite builds an actual standby rather than a second independent
 database. That distinction matters: the entire risk in read/write split is

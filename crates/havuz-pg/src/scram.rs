@@ -15,16 +15,16 @@
 //! SCRAM.
 
 use base64::Engine as _;
-use hmac::{Hmac, Mac};
+use havuz_secrets::{hmac, salted_password};
+
+pub use havuz_secrets::ScramVerifier;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 
-type HmacSha256 = Hmac<Sha256>;
+pub use havuz_secrets::VerifierError;
 
 const KEY_LEN: usize = 32;
-const DEFAULT_ITERATIONS: u32 = 4096;
 const NONCE_LEN: usize = 18;
-const SALT_LEN: usize = 16;
 
 const B64: base64::engine::general_purpose::GeneralPurpose = base64::engine::general_purpose::STANDARD;
 
@@ -40,89 +40,8 @@ pub enum ScramError {
     BadServerSignature,
     #[error("SCRAM exchange used out of order")]
     OutOfOrder,
-    #[error("malformed stored verifier: {0}")]
-    BadVerifier(&'static str),
-}
-
-/// What havuz stores for a client user.
-///
-/// Same shape Postgres uses in `pg_authid.rolpassword`, so verifiers can be
-/// copied in either direction:
-/// `SCRAM-SHA-256$<iterations>:<salt>$<StoredKey>:<ServerKey>`
-#[derive(Clone, PartialEq, Eq)]
-pub struct ScramVerifier {
-    iterations: u32,
-    salt: Vec<u8>,
-    stored_key: [u8; KEY_LEN],
-    server_key: [u8; KEY_LEN],
-}
-
-impl std::fmt::Debug for ScramVerifier {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // The verifier is not a password, but it is still credential-adjacent
-        // and must not end up in a log line.
-        f.debug_struct("ScramVerifier").field("iterations", &self.iterations).finish_non_exhaustive()
-    }
-}
-
-impl ScramVerifier {
-    /// Derive a verifier from a plaintext password. Used once, when a user is
-    /// created in the UI; the password is not kept afterwards.
-    pub fn from_password(password: &str) -> Self {
-        let mut salt = vec![0u8; SALT_LEN];
-        rand::thread_rng().fill_bytes(&mut salt);
-        Self::from_password_with(password, &salt, DEFAULT_ITERATIONS)
-    }
-
-    pub fn from_password_with(password: &str, salt: &[u8], iterations: u32) -> Self {
-        let normalized = normalize(password);
-        let salted = hi(normalized.as_bytes(), salt, iterations);
-        let client_key = hmac(&salted, b"Client Key");
-        let stored_key: [u8; KEY_LEN] = Sha256::digest(client_key).into();
-        let server_key = hmac(&salted, b"Server Key");
-
-        Self { iterations, salt: salt.to_vec(), stored_key, server_key }
-    }
-
-    pub fn iterations(&self) -> u32 {
-        self.iterations
-    }
-
-    /// Serialise in Postgres' `rolpassword` format.
-    pub fn encode(&self) -> String {
-        format!(
-            "SCRAM-SHA-256${}:{}${}:{}",
-            self.iterations,
-            B64.encode(&self.salt),
-            B64.encode(self.stored_key),
-            B64.encode(self.server_key)
-        )
-    }
-
-    pub fn parse(input: &str) -> Result<Self, ScramError> {
-        let rest = input.strip_prefix("SCRAM-SHA-256$").ok_or(ScramError::BadVerifier("wrong mechanism prefix"))?;
-        let (params, keys) = rest.split_once('$').ok_or(ScramError::BadVerifier("missing key section"))?;
-        let (iterations, salt) = params.split_once(':').ok_or(ScramError::BadVerifier("missing salt"))?;
-        let (stored, server) = keys.split_once(':').ok_or(ScramError::BadVerifier("missing server key"))?;
-
-        let iterations: u32 = iterations.parse().map_err(|_| ScramError::BadVerifier("iteration count"))?;
-        if iterations == 0 {
-            return Err(ScramError::BadVerifier("iteration count"));
-        }
-        let salt = B64.decode(salt).map_err(|_| ScramError::BadVerifier("salt encoding"))?;
-        let stored_key: [u8; KEY_LEN] = B64
-            .decode(stored)
-            .map_err(|_| ScramError::BadVerifier("stored key encoding"))?
-            .try_into()
-            .map_err(|_| ScramError::BadVerifier("stored key length"))?;
-        let server_key: [u8; KEY_LEN] = B64
-            .decode(server)
-            .map_err(|_| ScramError::BadVerifier("server key encoding"))?
-            .try_into()
-            .map_err(|_| ScramError::BadVerifier("server key length"))?;
-
-        Ok(Self { iterations, salt, stored_key, server_key })
-    }
+    #[error(transparent)]
+    BadVerifier(#[from] VerifierError),
 }
 
 /// havuz authenticating an incoming client.
@@ -165,7 +84,7 @@ impl ScramServer {
         }
 
         let nonce = format!("{client_nonce}{}", make_nonce());
-        let server_first = format!("r={nonce},s={},i={}", B64.encode(&self.verifier.salt), self.verifier.iterations);
+        let server_first = format!("r={nonce},s={},i={}", B64.encode(self.verifier.salt()), self.verifier.iterations());
 
         self.state = ServerState::AwaitingFinal {
             client_first_bare: bare.to_string(),
@@ -200,18 +119,18 @@ impl ScramServer {
             .ok_or(ScramError::Malformed("missing proof separator"))?;
         let auth_message = format!("{client_first_bare},{server_first},{without_proof}");
 
-        let client_signature = hmac(&self.verifier.stored_key, auth_message.as_bytes());
+        let client_signature = hmac(self.verifier.stored_key(), auth_message.as_bytes());
         let mut client_key = [0u8; KEY_LEN];
         for i in 0..KEY_LEN {
             client_key[i] = proof[i] ^ client_signature[i];
         }
         let candidate: [u8; KEY_LEN] = Sha256::digest(client_key).into();
 
-        if !constant_time_eq(&candidate, &self.verifier.stored_key) {
+        if !constant_time_eq(&candidate, self.verifier.stored_key()) {
             return Err(ScramError::AuthenticationFailed);
         }
 
-        let server_signature = hmac(&self.verifier.server_key, auth_message.as_bytes());
+        let server_signature = hmac(self.verifier.server_key(), auth_message.as_bytes());
         self.state = ServerState::Done;
         Ok(format!("v={}", B64.encode(server_signature)).into_bytes())
     }
@@ -281,7 +200,7 @@ impl ScramClient {
             return Err(ScramError::Malformed("iteration count"));
         }
 
-        let salted = hi(normalize(&self.password).as_bytes(), &salt, iterations);
+        let salted = salted_password(&self.password, &salt, iterations);
         let client_key = hmac(&salted, b"Client Key");
         let stored_key: [u8; KEY_LEN] = Sha256::digest(client_key).into();
 
@@ -332,40 +251,6 @@ impl ScramClient {
     pub fn is_done(&self) -> bool {
         matches!(self.state, ClientState::Done)
     }
-}
-
-/// `Hi()` from RFC 5802: PBKDF2-HMAC-SHA256 with a one-block output.
-fn hi(password: &[u8], salt: &[u8], iterations: u32) -> [u8; KEY_LEN] {
-    let mut salted = [0u8; KEY_LEN];
-
-    let mut block = Vec::with_capacity(salt.len() + 4);
-    block.extend_from_slice(salt);
-    block.extend_from_slice(&1u32.to_be_bytes());
-
-    let mut u = hmac(password, &block);
-    salted.copy_from_slice(&u);
-
-    for _ in 1..iterations {
-        u = hmac(password, &u);
-        for i in 0..KEY_LEN {
-            salted[i] ^= u[i];
-        }
-    }
-    salted
-}
-
-fn hmac(key: &[u8], data: &[u8]) -> [u8; KEY_LEN] {
-    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts keys of any length");
-    mac.update(data);
-    mac.finalize().into_bytes().into()
-}
-
-/// SASLprep, falling back to the raw value.
-///
-/// Postgres does the same: a password that cannot be prepared is used verbatim
-/// rather than rejected, so existing accounts keep working.
-fn normalize(password: &str) -> String {
-    stringprep::saslprep(password).map(|c| c.into_owned()).unwrap_or_else(|_| password.to_string())
 }
 
 fn make_nonce() -> String {
@@ -443,63 +328,6 @@ mod tests {
     #[test]
     fn unicode_passwords_are_normalized_consistently() {
         handshake("parolam-ğüşiöç", "parolam-ğüşiöç").unwrap();
-    }
-
-    #[test]
-    fn known_answer_test_against_rfc_7677() {
-        // RFC 7677 section 3 worked example, which pins our Hi/HMAC/key
-        // derivation against an external source rather than against ourselves.
-        let salt = B64.decode("W22ZaJ0SNY7soEsUEjb6gQ==").unwrap();
-        let verifier = ScramVerifier::from_password_with("pencil", &salt, 4096);
-
-        assert_eq!(B64.encode(verifier.stored_key), "WG5d8oPm3OtcPnkdi4Uo7BkeZkBFzpcXkuLmtbsT4qY=");
-        assert_eq!(B64.encode(verifier.server_key), "wfPLwcE6nTWhTAmQ7tl2KeoiWGPlZqQxSrmfPwDl2dU=");
-    }
-
-    #[test]
-    fn verifier_uses_the_postgres_storage_format() {
-        let verifier = ScramVerifier::from_password("hunter2");
-        let encoded = verifier.encode();
-
-        assert!(encoded.starts_with("SCRAM-SHA-256$4096:"), "got {encoded}");
-        assert!(!encoded.contains("hunter2"), "a verifier must never contain the password");
-
-        let parsed = ScramVerifier::parse(&encoded).unwrap();
-        assert_eq!(parsed, verifier, "roundtrip must be lossless");
-    }
-
-    #[test]
-    fn a_verifier_copied_from_postgres_can_be_used_directly() {
-        let salt = B64.decode("W22ZaJ0SNY7soEsUEjb6gQ==").unwrap();
-        let ours = ScramVerifier::from_password_with("pencil", &salt, 4096);
-
-        // The exact string Postgres would store in pg_authid.rolpassword.
-        let from_pg = "SCRAM-SHA-256$4096:W22ZaJ0SNY7soEsUEjb6gQ==$\
-                       WG5d8oPm3OtcPnkdi4Uo7BkeZkBFzpcXkuLmtbsT4qY=:\
-                       wfPLwcE6nTWhTAmQ7tl2KeoiWGPlZqQxSrmfPwDl2dU=";
-        assert_eq!(ScramVerifier::parse(from_pg).unwrap(), ours);
-    }
-
-    #[test]
-    fn malformed_verifiers_are_rejected_with_a_reason() {
-        for bad in [
-            "MD5$4096:aaaa$bbbb:cccc",
-            "SCRAM-SHA-256$4096",
-            "SCRAM-SHA-256$4096:aaaa",
-            "SCRAM-SHA-256$notanumber:aaaa$bbbb:cccc",
-            "SCRAM-SHA-256$0:aaaa$bbbb:cccc",
-            "SCRAM-SHA-256$4096:!!!$bbbb:cccc",
-        ] {
-            assert!(ScramVerifier::parse(bad).is_err(), "should have rejected {bad}");
-        }
-    }
-
-    #[test]
-    fn debug_output_does_not_leak_key_material() {
-        let verifier = ScramVerifier::from_password("hunter2");
-        let rendered = format!("{verifier:?}");
-        assert!(!rendered.contains("hunter2"));
-        assert!(!rendered.contains(&B64.encode(verifier.stored_key)));
     }
 
     #[test]
@@ -619,20 +447,5 @@ mod tests {
         assert!(!constant_time_eq(b"abc", b"abd"));
         assert!(!constant_time_eq(b"abc", b"abcd"));
         assert!(constant_time_eq(b"", b""));
-    }
-
-    #[test]
-    fn iteration_count_actually_affects_the_derived_keys() {
-        let salt = b"same-salt-here!!";
-        let a = ScramVerifier::from_password_with("pencil", salt, 4096);
-        let b = ScramVerifier::from_password_with("pencil", salt, 8192);
-        assert_ne!(a.stored_key, b.stored_key);
-    }
-
-    #[test]
-    fn different_salts_produce_different_verifiers_for_the_same_password() {
-        let a = ScramVerifier::from_password("hunter2");
-        let b = ScramVerifier::from_password("hunter2");
-        assert_ne!(a, b, "a random salt per user is what stops rainbow tables");
     }
 }

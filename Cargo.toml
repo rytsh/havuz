@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/havuz-registry", "crates/havuz-secrets", "crates/havuz-core", "crates/havuz-proto", "crates/havuz-pool", "crates/havuz-pg", "crates/havuz-admin", "crates/havuz-server"]
+members = ["crates/havuz-registry", "crates/havuz-secrets", "crates/havuz-core", "crates/havuz-proto", "crates/havuz-pool", "crates/havuz-control", "crates/havuz-pg", "crates/havuz-jdbc", "crates/havuz-admin", "crates/havuz-server"]
 
 [workspace.package]
 version = "0.1.0"
@@ -16,7 +16,9 @@ havuz-core = { path = "crates/havuz-core" }
 havuz-proto = { path = "crates/havuz-proto" }
 havuz-stats = { path = "crates/havuz-stats" }
 havuz-pool = { path = "crates/havuz-pool" }
+havuz-control = { path = "crates/havuz-control" }
 havuz-pg = { path = "crates/havuz-pg" }
+havuz-jdbc = { path = "crates/havuz-jdbc" }
 havuz-admin = { path = "crates/havuz-admin" }
 
 # runtime

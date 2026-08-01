@@ -4,7 +4,7 @@
 //! `havuz-pg` driver; only the quirk flags differ. This is why a single driver
 //! covers most of what competitors advertise as separate "database support".
 
-use crate::field::{ConfigField, FieldKind, SelectOption};
+use crate::field::{ConfigField, FieldKind, FieldRole, SelectOption};
 use crate::{Capabilities, DriverProfile, FamilyDescriptor, Maturity, PoolMode, Quirks};
 
 pub(crate) const POSTGRES: FamilyDescriptor = FamilyDescriptor {
@@ -119,6 +119,7 @@ const FIELDS: &[ConfigField] = &[
         help: None,
         placeholder: Some("pg-primary.internal"),
         secret: false,
+        role: Some(FieldRole::Host),
     },
     ConfigField {
         name: "port",
@@ -129,6 +130,7 @@ const FIELDS: &[ConfigField] = &[
         help: None,
         placeholder: None,
         secret: false,
+        role: Some(FieldRole::Port),
     },
     ConfigField {
         name: "database",
@@ -139,6 +141,7 @@ const FIELDS: &[ConfigField] = &[
         help: Some("Database havuz opens backend connections against."),
         placeholder: Some("appdb"),
         secret: false,
+        role: Some(FieldRole::Database),
     },
     ConfigField {
         name: "username",
@@ -149,6 +152,7 @@ const FIELDS: &[ConfigField] = &[
         help: Some("Service account havuz uses. Clients authenticate with their own havuz users, not this one."),
         placeholder: Some("app"),
         secret: false,
+        role: Some(FieldRole::User),
     },
     ConfigField {
         name: "password",
@@ -159,6 +163,7 @@ const FIELDS: &[ConfigField] = &[
         help: Some("Stored encrypted. Never returned by the API."),
         placeholder: None,
         secret: true,
+        role: Some(FieldRole::Password),
     },
     ConfigField {
         name: "sslmode",
@@ -169,6 +174,7 @@ const FIELDS: &[ConfigField] = &[
         help: Some("Matches libpq semantics. verify-ca checks the chain but not the hostname."),
         placeholder: None,
         secret: false,
+        role: None,
     },
     ConfigField {
         name: "ssl_root_cert",
@@ -179,6 +185,7 @@ const FIELDS: &[ConfigField] = &[
         help: Some("PEM bundle used for verify-ca and verify-full. Falls back to the system roots."),
         placeholder: Some("/etc/havuz/tls/ca.pem"),
         secret: false,
+        role: None,
     },
     ConfigField {
         name: "connect_timeout",
@@ -189,6 +196,7 @@ const FIELDS: &[ConfigField] = &[
         help: None,
         placeholder: None,
         secret: false,
+        role: None,
     },
 ];
 

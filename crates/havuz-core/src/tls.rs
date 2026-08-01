@@ -43,6 +43,8 @@ pub enum TlsError {
         #[source]
         source: std::io::Error,
     },
+    #[error("{0} contains no private key")]
+    NoPrivateKey(String),
     #[error("tls configuration rejected: {0}")]
     Rustls(#[from] RustlsError),
     #[error("no rustls crypto provider is installed")]
@@ -141,6 +143,53 @@ pub fn client_config(mode: SslMode, ca_path: Option<&Path>) -> Result<Option<Arc
     };
 
     Ok(Some(Arc::new(config)))
+}
+
+/// Build a rustls server configuration for the client-facing listeners.
+///
+/// This is the other half of the picture. `client_config` above secures the leg
+/// between havuz and the database; without this one the leg between the
+/// application and havuz is plaintext, which matters a great deal for pools
+/// that ask clients for a password rather than running SCRAM.
+///
+/// Client certificates are deliberately not required: SCRAM, or the backend's
+/// own authentication, is what identifies a client. TLS here is about
+/// confidentiality on the wire.
+pub fn server_config(cert_path: &Path, key_path: &Path) -> Result<Arc<rustls::ServerConfig>, TlsError> {
+    let certs = load_certs(cert_path)?;
+    let key = load_key(key_path)?;
+
+    let provider =
+        CryptoProvider::get_default().cloned().unwrap_or_else(|| Arc::new(rustls::crypto::ring::default_provider()));
+
+    let config = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()?
+        .with_no_client_auth()
+        .with_single_cert(certs, key)?;
+
+    Ok(Arc::new(config))
+}
+
+fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>, TlsError> {
+    let display = path.display().to_string();
+    let pem = std::fs::read(path).map_err(|source| TlsError::ReadCa { path: display.clone(), source })?;
+    let certs = rustls_pemfile::certs(&mut pem.as_slice())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| TlsError::BadCa { path: display.clone(), source })?;
+    if certs.is_empty() {
+        return Err(TlsError::EmptyCa(display));
+    }
+    Ok(certs)
+}
+
+fn load_key(path: &Path) -> Result<rustls::pki_types::PrivateKeyDer<'static>, TlsError> {
+    let display = path.display().to_string();
+    let pem = std::fs::read(path).map_err(|source| TlsError::ReadCa { path: display.clone(), source })?;
+    // PKCS#8, SEC1 and PKCS#1 all appear in the wild; accepting only one of
+    // them would reject perfectly ordinary keys for no reason.
+    rustls_pemfile::private_key(&mut pem.as_slice())
+        .map_err(|source| TlsError::BadCa { path: display.clone(), source })?
+        .ok_or(TlsError::NoPrivateKey(display))
 }
 
 /// Install the process-wide crypto provider. Idempotent.
@@ -352,5 +401,49 @@ mod tests {
         assert_eq!(serde_json::to_string(&SslMode::VerifyFull).unwrap(), "\"verify-full\"");
         let parsed: SslMode = serde_json::from_str("\"verify-ca\"").unwrap();
         assert_eq!(parsed, SslMode::VerifyCa);
+    }
+
+    const TEST_CERT: &str = include_str!("../tests/fixtures/test-cert.pem");
+    const TEST_KEY: &str = include_str!("../tests/fixtures/test-key.pem");
+
+    fn write(dir: &Path, name: &str, body: &str) -> std::path::PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    #[test]
+    fn a_certificate_and_key_produce_a_usable_server_config() {
+        install_default_provider();
+        let dir = tempfile::tempdir().unwrap();
+        let cert = write(dir.path(), "cert.pem", TEST_CERT);
+        let key = write(dir.path(), "key.pem", TEST_KEY);
+
+        let config = server_config(&cert, &key).expect("a self-signed pair must load");
+        assert!(!config.crypto_provider().cipher_suites.is_empty());
+    }
+
+    #[test]
+    fn a_certificate_without_its_key_is_refused_rather_than_starting_insecure() {
+        install_default_provider();
+        let dir = tempfile::tempdir().unwrap();
+        let cert = write(dir.path(), "cert.pem", TEST_CERT);
+        // A PEM file with no key section at all.
+        let key = write(dir.path(), "key.pem", TEST_CERT);
+
+        assert!(matches!(server_config(&cert, &key).unwrap_err(), TlsError::NoPrivateKey(_)));
+    }
+
+    #[test]
+    fn an_empty_or_missing_certificate_is_reported_by_path() {
+        install_default_provider();
+        let dir = tempfile::tempdir().unwrap();
+        let key = write(dir.path(), "key.pem", TEST_KEY);
+
+        let empty = write(dir.path(), "empty.pem", "# nothing\n");
+        assert!(matches!(server_config(&empty, &key).unwrap_err(), TlsError::EmptyCa(_)));
+
+        let missing = dir.path().join("absent.pem");
+        assert!(matches!(server_config(&missing, &key).unwrap_err(), TlsError::ReadCa { .. }));
     }
 }

@@ -55,8 +55,21 @@ pub enum StateError {
     ZeroMaxSize(String),
     #[error("pool '{0}': listen_port must be between 1 and 65535")]
     ZeroListenPort(String),
-    #[error("pools '{first}' and '{second}' both request listen port {port}")]
-    DuplicateListenPort { first: String, second: String, port: u16 },
+    #[error(
+        "pools '{first}' ({first_family}) and '{second}' ({second_family}) share listen port {port}, \
+         but a listener can only speak one protocol"
+    )]
+    MixedFamiliesOnPort { first: String, first_family: String, second: String, second_family: String, port: u16 },
+    #[error(
+        "pool '{0}' authenticates per user, so min_idle must be 0: havuz cannot warm a connection \
+         for a user whose password it does not hold"
+    )]
+    PerUserWarmup(String),
+    #[error(
+        "pool '{0}' authenticates per user and enables read/write split, which needs a service \
+         account to measure replica lag with; set a backend user and password"
+    )]
+    PerUserSplitWithoutProbe(String),
     #[error("user '{user}' is granted unknown pool '{pool}'")]
     UnknownPoolGrant { user: String, pool: String },
     #[error("user '{0}' has no pool grants and could never connect")]
@@ -73,20 +86,16 @@ impl State {
             return Err(StateError::UnsupportedVersion { found: self.version, expected: STATE_VERSION });
         }
 
-        let mut listen_ports = BTreeMap::new();
+        // Routing first, then the pools themselves. A port shared by two
+        // families is a mistake about the port, and saying so is more useful
+        // than the driver complaint one of those pools would also produce.
+        self.validate_listeners()?;
+
         for (name, pool) in &self.pools {
             if !is_valid_name(name) {
                 return Err(StateError::BadPoolName(name.clone()));
             }
             pool.validate(name)?;
-            if let Some(port) = pool.listen_port {
-                if port == 0 {
-                    return Err(StateError::ZeroListenPort(name.clone()));
-                }
-                if let Some(first) = listen_ports.insert(port, name.clone()) {
-                    return Err(StateError::DuplicateListenPort { first, second: name.clone(), port });
-                }
-            }
         }
 
         for (name, user) in &self.users {
@@ -108,6 +117,51 @@ impl State {
 
     /// Non-fatal observations worth showing in the UI.
     ///
+    /// Every port is real and every port speaks one protocol.
+    ///
+    /// Pools sharing a port is the normal case — that is how a client picks
+    /// between them by database name — but they must all belong to one family,
+    /// because the listener has to decide which handshake to run before it has
+    /// read a single byte.
+    fn validate_listeners(&self) -> Result<(), StateError> {
+        let mut ports: BTreeMap<u16, (&String, &String)> = BTreeMap::new();
+        for (name, pool) in &self.pools {
+            if pool.listen_port == 0 {
+                return Err(StateError::ZeroListenPort(name.clone()));
+            }
+            let (first, first_family) = *ports.entry(pool.listen_port).or_insert((name, &pool.family));
+            if first_family != &pool.family {
+                return Err(StateError::MixedFamiliesOnPort {
+                    first: first.clone(),
+                    first_family: first_family.clone(),
+                    second: name.clone(),
+                    second_family: pool.family.clone(),
+                    port: pool.listen_port,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// The listeners this configuration asks for, keyed by port.
+    ///
+    /// This is the whole routing table. There is no shared listener and no
+    /// process-wide client port: a pool declares the port clients reach it on,
+    /// and pools that declare the same port share one socket.
+    ///
+    /// Disabled pools are excluded, so disabling the last pool on a port closes
+    /// it rather than leaving a socket that accepts and then refuses.
+    pub fn listeners(&self) -> BTreeMap<u16, Listener> {
+        let mut out: BTreeMap<u16, Listener> = BTreeMap::new();
+        for (name, pool) in self.pools.iter().filter(|(_, pool)| !pool.disabled) {
+            out.entry(pool.listen_port)
+                .or_insert_with(|| Listener { port: pool.listen_port, family: pool.family.clone(), pools: Vec::new() })
+                .pools
+                .push(name.clone());
+        }
+        out
+    }
+
     /// The most important one by far: a small `max_size` on a session-mode pool
     /// does not save backend connections, it just queues clients. This is the
     /// single most common misconfiguration in every pooler.
@@ -206,6 +260,68 @@ pub enum Warning {
     },
 }
 
+/// One client-facing socket and the pools reachable through it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Listener {
+    pub port: u16,
+    /// Every pool on a listener speaks the same protocol; [`State::validate`]
+    /// refuses anything else.
+    pub family: String,
+    /// Sorted, because `pools` is a `BTreeMap`.
+    pub pools: Vec<String>,
+}
+
+impl Listener {
+    /// The pool a client reaches when it names none.
+    ///
+    /// `Some` only when this listener has exactly one pool: with several, the
+    /// client has to say which, and guessing would silently connect it to the
+    /// wrong database.
+    pub fn sole_pool(&self) -> Option<&str> {
+        match self.pools.as_slice() {
+            [only] => Some(only),
+            _ => None,
+        }
+    }
+}
+
+/// Which identity havuz opens backend connections as.
+///
+/// The default is what every pooler does, and it is what makes a backend
+/// connection reusable by any client: one service account, shared. The
+/// alternative buys things no amount of pooler cleverness can otherwise
+/// provide — `pg_stat_activity.usename`, row-level security, real `GRANT`
+/// enforcement, database-side audit — and costs fan-in, which becomes per-user
+/// rather than per-pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackendAuth {
+    /// One service account for the whole pool.
+    #[default]
+    Shared,
+    /// Each client's own database role, using the password it supplied.
+    ///
+    /// havuz never stores that password: it asks the client for it, checks it
+    /// against the stored verifier, and forwards it to the backend. The
+    /// consequences are real and are enforced at validation time — the client
+    /// leg must be encrypted, and connections cannot be opened for a user who
+    /// is not currently connected.
+    PerUser,
+}
+
+impl BackendAuth {
+    pub fn is_per_user(self) -> bool {
+        matches!(self, BackendAuth::PerUser)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BackendAuth::Shared => "shared",
+            BackendAuth::PerUser => "per_user",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PoolConfig {
     /// Registry family id, e.g. `postgres`.
@@ -217,19 +333,29 @@ pub struct PoolConfig {
     pub targets: Vec<Target>,
     /// Backend service account. The password lives in the secret store, keyed
     /// by `havuz_secrets::pool_backend_password(pool_name)`.
+    ///
+    /// Still required under [`BackendAuth::PerUser`], where it stops being the
+    /// account clients run as and becomes the account health probes and "Test
+    /// Connection" use — those have no client, so they have no credential to
+    /// borrow. It also serves users who have no database role of their own.
     pub backend_user: String,
     /// Database opened on the backend.
     pub database: String,
-    /// Optional client-facing port dedicated to this pool. When absent, clients
-    /// use the shared listener and select the pool by database name.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub listen_port: Option<u16>,
+    /// Client-facing port. Required: a pool nobody can reach is not a pool.
+    ///
+    /// Pools may share a port. With one pool on a port the client's database
+    /// field is ignored; with several, it names which one. See
+    /// [`State::listeners`].
+    pub listen_port: u16,
     pub limits: PoolLimits,
     /// Family-specific settings validated against the registry's config fields.
     #[serde(default)]
     pub settings: serde_json::Map<String, serde_json::Value>,
     #[serde(default)]
     pub routing: RoutingConfig,
+    /// Whose credentials backend connections are opened with.
+    #[serde(default)]
+    pub backend_auth: BackendAuth,
     #[serde(default)]
     pub disabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -278,7 +404,30 @@ impl PoolConfig {
                 max_size: self.limits.max_size,
             });
         }
+
+        if self.backend_auth.is_per_user() {
+            // A warm connection has to be opened before anyone asks for one,
+            // and under per-user auth the credential arrives with the client.
+            if self.limits.min_idle > 0 {
+                return Err(StateError::PerUserWarmup(name.into()));
+            }
+            // Health probing runs on a timer with no client attached, so it
+            // has nothing to authenticate as unless a service account exists.
+            if self.routing.read_write_split && self.backend_user.is_empty() {
+                return Err(StateError::PerUserSplitWithoutProbe(name.into()));
+            }
+        }
         Ok(())
+    }
+
+    /// Backend connections this pool may open in total.
+    ///
+    /// Under per-user auth `max_size` is a *per-user* budget, so the ceiling
+    /// scales with however many distinct users are connected at once. There is
+    /// no honest single number, which is exactly what an operator needs to be
+    /// told rather than shown a comforting one.
+    pub fn backend_ceiling(&self) -> Option<u32> {
+        (!self.backend_auth.is_per_user()).then_some(self.limits.max_size)
     }
 
     /// Best-case client-to-backend ratio this pool can deliver.
@@ -442,6 +591,19 @@ pub struct UserConfig {
     /// Per-user share of the pool's client budget. `0` means "no personal cap".
     #[serde(default)]
     pub max_client_connections: u32,
+    /// Connect to the database as this user rather than as the pool's service
+    /// account.
+    ///
+    /// Only meaningful on a pool with `backend_auth = per_user`, and off by
+    /// default so that flipping a pool into that mode changes nothing until
+    /// each user is moved deliberately. That is the whole migration path: one
+    /// user at a time, with the rest still pooling normally behind the service
+    /// account.
+    ///
+    /// A user with this set must exist as a database role with the same name
+    /// and the same password it uses to reach havuz.
+    #[serde(default)]
+    pub own_backend_role: bool,
     /// Reject anything the protocol layer classifies as a write.
     #[serde(default)]
     pub read_only: bool,
@@ -453,7 +615,14 @@ pub struct UserConfig {
 
 impl UserConfig {
     pub fn new(pools: Vec<String>) -> Self {
-        Self { pools, max_client_connections: 0, read_only: false, disabled: false, description: None }
+        Self {
+            pools,
+            max_client_connections: 0,
+            own_backend_role: false,
+            read_only: false,
+            disabled: false,
+            description: None,
+        }
     }
 }
 
@@ -477,10 +646,11 @@ mod tests {
             targets: vec![Target::new("pg-primary.internal", 5432)],
             backend_user: "app".into(),
             database: "appdb".into(),
-            listen_port: None,
+            listen_port: 6432,
             limits: PoolLimits::default(),
             settings: Default::default(),
             routing: Default::default(),
+            backend_auth: Default::default(),
             disabled: false,
             description: None,
         }
@@ -565,20 +735,92 @@ mod tests {
     }
 
     #[test]
-    fn dedicated_listen_ports_must_be_nonzero_and_unique() {
-        let mut zero = pool();
-        zero.listen_port = Some(0);
-        assert_eq!(state_with_pool("zero", zero).validate().unwrap_err(), StateError::ZeroListenPort("zero".into()));
-
-        let mut state = state_with_pool("first", pool());
-        state.pools.get_mut("first").unwrap().listen_port = Some(5544);
-        let mut second = pool();
-        second.listen_port = Some(5544);
-        state.pools.insert("second".into(), second);
+    fn a_per_user_pool_cannot_keep_connections_warm() {
+        // There is no credential to open one with until a client shows up.
+        let mut p = pool();
+        p.backend_auth = BackendAuth::PerUser;
+        p.limits.min_idle = 2;
         assert_eq!(
-            state.validate().unwrap_err(),
-            StateError::DuplicateListenPort { first: "first".into(), second: "second".into(), port: 5544 }
+            state_with_pool("app_main", p).validate().unwrap_err(),
+            StateError::PerUserWarmup("app_main".into())
         );
+    }
+
+    #[test]
+    fn a_per_user_pool_may_split_reads_only_if_it_can_probe() {
+        let mut p = pool();
+        p.backend_auth = BackendAuth::PerUser;
+        p.routing.read_write_split = true;
+        p.backend_user = String::new();
+        assert_eq!(
+            state_with_pool("app_main", p.clone()).validate().unwrap_err(),
+            StateError::PerUserSplitWithoutProbe("app_main".into())
+        );
+
+        p.backend_user = "havuz_probe".into();
+        state_with_pool("app_main", p).validate().expect("a service account makes probing possible again");
+    }
+
+    #[test]
+    fn per_user_pools_have_no_single_backend_ceiling() {
+        // max_size becomes a per-user budget, so any total we printed would be
+        // a guess about how many users connect at once.
+        let mut p = pool();
+        assert_eq!(p.backend_ceiling(), Some(p.limits.max_size));
+        p.backend_auth = BackendAuth::PerUser;
+        assert_eq!(p.backend_ceiling(), None);
+    }
+
+    #[test]
+    fn backend_auth_defaults_to_shared_so_existing_state_files_load_unchanged() {
+        let json = serde_json::to_value(pool()).unwrap();
+        let mut without = json.as_object().unwrap().clone();
+        without.remove("backend_auth");
+        let parsed: PoolConfig = serde_json::from_value(serde_json::Value::Object(without)).unwrap();
+        assert_eq!(parsed.backend_auth, BackendAuth::Shared);
+    }
+
+    #[test]
+    fn a_listen_port_of_zero_is_rejected() {
+        let mut zero = pool();
+        zero.listen_port = 0;
+        assert_eq!(state_with_pool("zero", zero).validate().unwrap_err(), StateError::ZeroListenPort("zero".into()));
+    }
+
+    #[test]
+    fn pools_may_share_a_port_and_are_then_selected_by_name() {
+        let mut state = state_with_pool("orders", pool());
+        state.pools.insert("reports".into(), pool());
+        state.validate().expect("sharing a port is the normal case, not an error");
+
+        let listeners = state.listeners();
+        assert_eq!(listeners.len(), 1);
+        let listener = &listeners[&6432];
+        assert_eq!(listener.pools, ["orders", "reports"]);
+        assert_eq!(listener.sole_pool(), None, "with two pools the client has to say which");
+    }
+
+    #[test]
+    fn a_port_with_one_pool_needs_no_database_name() {
+        let state = state_with_pool("orders", pool());
+        assert_eq!(state.listeners()[&6432].sole_pool(), Some("orders"));
+    }
+
+    #[test]
+    fn a_disabled_pool_does_not_hold_its_port_open() {
+        let mut state = state_with_pool("orders", pool());
+        state.pools.get_mut("orders").unwrap().disabled = true;
+        assert!(state.listeners().is_empty(), "the socket must close, not accept and then refuse");
+    }
+
+    #[test]
+    fn two_families_cannot_share_one_socket() {
+        // Nothing could decide which handshake to run before reading a byte.
+        let mut state = state_with_pool("orders", pool());
+        let mut other = pool();
+        other.family = "mysql".into();
+        state.pools.insert("analytics".into(), other);
+        assert!(matches!(state.validate().unwrap_err(), StateError::MixedFamiliesOnPort { port: 6432, .. }));
     }
 
     #[test]

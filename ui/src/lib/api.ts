@@ -4,6 +4,7 @@ import type {
   LiveSession,
   PinReport,
   Pool,
+  PoolIdentities,
   Summary,
   TraceDetail,
   TraceResponse,
@@ -72,6 +73,8 @@ export const api = {
   trace: (id: number) => request<TraceDetail>(`/api/v1/traces/${id}`),
   clearTraces: () => request<{ deleted: number }>("/api/v1/traces", { method: "DELETE" }),
   poolTargets: (name: string) => request<GroupSnapshot>(`/api/v1/pools/${encodeURIComponent(name)}/targets`),
+  poolIdentities: (name: string) =>
+    request<PoolIdentities>(`/api/v1/pools/${encodeURIComponent(name)}/identities`),
   resetPins: () => request<unknown>("/api/v1/pins", { method: "DELETE" }),
 
   createPool: (body: unknown) => request<Pool>("/api/v1/pools", { method: "POST", body: JSON.stringify(body) }),

@@ -44,6 +44,9 @@ export interface PoolLimits {
   max_lifetime: string;
 }
 
+/** Whose credentials backend connections are opened with. */
+export type BackendAuth = "shared" | "per_user";
+
 export interface Pool {
   name: string;
   family: string;
@@ -51,7 +54,9 @@ export interface Pool {
   mode: PoolMode;
   database: string;
   backend_user: string;
-  listen_port: number | null;
+  backend_auth: BackendAuth;
+  /** The port clients reach this pool on. Pools may share one. */
+  listen_port: number;
   /** Whether a password is stored. The password itself is never served. */
   has_backend_password: boolean;
   targets: Target[];
@@ -63,7 +68,27 @@ export interface Pool {
   replica_count: number;
   /** Null in session mode, where multiplexing cannot happen. */
   configured_fan_in: number | null;
+  /**
+   * Total backend connections this pool may open, or null under per-user
+   * authentication where max_size is a per-user budget and the ceiling depends
+   * on how many users are connected at once.
+   */
+  backend_ceiling: number | null;
   runtime: PoolSnapshot | null;
+}
+
+/** One user running as its own database role. */
+export interface BackendIdentity {
+  pool: string;
+  user: string;
+  pool_snapshot: PoolSnapshot;
+}
+
+export interface PoolIdentities {
+  pool: string;
+  backend_auth: BackendAuth;
+  max_size_is_per_user: boolean;
+  identities: BackendIdentity[];
 }
 
 export type Warning =
@@ -89,6 +114,11 @@ export interface User {
   name: string;
   pools: string[];
   max_client_connections: number;
+  /**
+   * Connects to the database as itself rather than as the pool's service
+   * account. Only takes effect on pools with backend_auth = per_user.
+   */
+  own_backend_role: boolean;
   read_only: boolean;
   disabled: boolean;
   description: string | null;
@@ -115,6 +145,9 @@ export interface DriverProfile {
   default_port: number | null;
 }
 
+/** What a field means to the pooler, as opposed to what the family calls it. */
+export type FieldRole = "host" | "port" | "database" | "user" | "password";
+
 export interface SchemaProperty {
   title?: string;
   type?: string;
@@ -127,6 +160,13 @@ export interface SchemaProperty {
   "x-havuz-placeholder"?: string;
   "x-havuz-secret"?: boolean;
   "x-havuz-labels"?: { value: string; label: string }[];
+  /**
+   * Present on the handful of fields the pooler itself needs. The form does
+   * not act on it beyond grouping: the server reads the values back through
+   * the same roles, so nothing here has to know that Postgres spells the
+   * backend account `username`.
+   */
+  "x-havuz-role"?: FieldRole;
 }
 
 export interface FamilySchema {

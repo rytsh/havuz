@@ -13,8 +13,8 @@ default = []
 embed-ui = ["dep:rust-embed"]
 
 [dependencies]
+havuz-control = { workspace = true }
 havuz-core = { workspace = true }
-havuz-pg = { workspace = true }
 havuz-pool = { workspace = true }
 havuz-proto = { workspace = true }
 havuz-registry = { workspace = true }
@@ -32,6 +32,10 @@ mime_guess = { workspace = true }
 rust-embed = { workspace = true, optional = true }
 
 [dev-dependencies]
+# A protocol-less family. Not `havuz-pg`: if the admin API could only be tested
+# against a real codec, "this crate does not depend on Postgres" would be an
+# assertion nobody checks.
+havuz-control = { workspace = true, features = ["testing"] }
 tokio = { workspace = true, features = ["rt", "macros"] }
 tower = { workspace = true, features = ["util"] }
 http-body-util = "0.1"

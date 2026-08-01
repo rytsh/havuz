@@ -8,6 +8,7 @@ description = "PostgreSQL wire protocol driver for havuz."
 
 [dependencies]
 havuz-core = { workspace = true }
+havuz-control = { workspace = true }
 havuz-proto = { workspace = true }
 havuz-registry = { workspace = true }
 havuz-pool = { workspace = true }
@@ -15,7 +16,6 @@ havuz-secrets = { workspace = true }
 
 serde = { workspace = true }
 serde_json = { workspace = true }
-rusqlite = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
@@ -30,6 +30,7 @@ sha2 = { workspace = true }
 rand = { workspace = true }
 base64 = { workspace = true }
 stringprep = { workspace = true }
+zeroize = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time", "io-util"] }

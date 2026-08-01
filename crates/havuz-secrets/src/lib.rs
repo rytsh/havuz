@@ -16,9 +16,11 @@
 
 mod key;
 mod store;
+mod verifier;
 
 pub use key::{MasterKey, MasterKeyError};
 pub use store::{SealedSecret, SecretRef, SecretStore, StoreError};
+pub use verifier::{hmac, salted_password, ScramVerifier, VerifierError};
 
 /// Namespaced handle to a secret, e.g. `pool/app_main/backend_password`.
 ///

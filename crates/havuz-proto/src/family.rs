@@ -1,6 +1,7 @@
 //! The object-safe entry point a listener holds.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use havuz_registry::FamilyDescriptor;
@@ -9,16 +10,57 @@ use tokio::net::TcpStream;
 use crate::error::ProtoResult;
 use crate::flow::PinReason;
 
-/// Who connected, resolved during the family's handshake.
+/// The pools reachable through the listener a connection arrived on.
 ///
-/// The pool name comes from the protocol's own routing information — for
-/// Postgres that is the `database` field of the startup packet — so a single
-/// listener serves every pool of that family.
+/// Routing is decided by configuration, not by the protocol: a pool declares
+/// its port, and pools that declare the same port share one socket. That leaves
+/// the family two cases and no guessing.
+///
+/// * One pool on the port — the client's database field is not routing
+///   information at all, and is ignored. This is what lets a connection string
+///   omit the database entirely.
+/// * Several pools — the client names one. A name that is not on this listener
+///   is refused with the list of names that are, rather than with "database
+///   does not exist", which sends an operator looking in the wrong place.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoolRoute {
+    pools: Arc<[String]>,
+}
+
+impl PoolRoute {
+    /// Panics if `pools` is empty: a listener with no pools should have been
+    /// closed rather than bound.
+    pub fn new(pools: impl Into<Arc<[String]>>) -> Self {
+        let pools = pools.into();
+        assert!(!pools.is_empty(), "a listener must serve at least one pool");
+        Self { pools }
+    }
+
+    /// The pool a client reaches without naming one, if there is no ambiguity.
+    pub fn sole(&self) -> Option<&str> {
+        match &*self.pools {
+            [only] => Some(only),
+            _ => None,
+        }
+    }
+
+    pub fn contains(&self, pool: &str) -> bool {
+        self.pools.iter().any(|candidate| candidate == pool)
+    }
+
+    /// For the error message a client sees when it names the wrong pool.
+    pub fn names(&self) -> &[String] {
+        &self.pools
+    }
+}
+
+/// Who connected, resolved during the family's handshake.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientIdentity {
     /// havuz user, not the backend service account.
     pub user: String,
-    /// Pool the client asked for.
+    /// Pool this connection landed on, already resolved against the listener's
+    /// [`PoolRoute`].
     pub pool: String,
     /// Client-supplied application name, when the protocol carries one. Echoed
     /// into the backend so `pg_stat_activity` can still attribute work to a
@@ -48,10 +90,10 @@ impl ServeOutcome {
 
 /// One wire-protocol family.
 ///
-/// Object-safe on purpose: `havuz-server` binds a listener and stores
-/// `Arc<dyn ProtocolFamily>` without knowing which family it got. Adding MySQL
-/// later means implementing this trait and registering a descriptor — no
-/// changes to the listener, the pool engine, the admin API or the UI.
+/// Object-safe on purpose: `havuz-server` binds every listener and stores
+/// `Arc<dyn ProtocolFamily>` without knowing which family it got. Families do
+/// not own sockets — that is what let one family monopolise the process before
+/// per-pool ports existed.
 #[async_trait]
 pub trait ProtocolFamily: Send + Sync + 'static {
     /// Static metadata, used by the admin API and to validate configuration.
@@ -59,9 +101,10 @@ pub trait ProtocolFamily: Send + Sync + 'static {
 
     /// Take ownership of an accepted socket and run the session to completion.
     ///
-    /// The family performs its own handshake, resolves the [`ClientIdentity`],
-    /// checks it out of the pool and relays until either side hangs up.
-    async fn serve(&self, io: TcpStream, peer: SocketAddr) -> ProtoResult<ServeOutcome>;
+    /// The family performs its own handshake, resolves the [`ClientIdentity`]
+    /// within `route`, checks a backend out of the pool and relays until either
+    /// side hangs up.
+    async fn serve(&self, io: TcpStream, peer: SocketAddr, route: &PoolRoute) -> ProtoResult<ServeOutcome>;
 
     /// Best-effort probe used by "Test Connection" in the UI and by the
     /// background health checker.
@@ -95,6 +138,28 @@ mod tests {
         assert_eq!(outcome.pinned, None);
         assert_eq!(outcome.bytes_to_client, 0);
         assert_eq!(outcome.bytes_to_backend, 0);
+    }
+
+    #[test]
+    fn a_listener_with_one_pool_needs_no_database_name() {
+        let route = PoolRoute::new(vec!["app_main".to_string()]);
+        assert_eq!(route.sole(), Some("app_main"));
+        assert!(route.contains("app_main"));
+    }
+
+    #[test]
+    fn a_shared_listener_refuses_to_guess() {
+        let route = PoolRoute::new(vec!["orders".to_string(), "reports".to_string()]);
+        assert_eq!(route.sole(), None, "picking one would silently connect the client to the wrong database");
+        assert!(route.contains("reports"));
+        assert!(!route.contains("payroll"));
+        assert_eq!(route.names(), ["orders", "reports"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "at least one pool")]
+    fn a_listener_with_no_pools_is_a_bug_not_a_state() {
+        let _ = PoolRoute::new(Vec::<String>::new());
     }
 
     #[test]

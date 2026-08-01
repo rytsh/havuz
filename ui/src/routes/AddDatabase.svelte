@@ -2,7 +2,7 @@
   import { push } from "svelte-spa-router";
   import { iconFor } from "../lib/icons";
   import { api } from "../lib/api";
-  import type { DriverProfile, Family, PoolMode, SchemaProperty } from "../lib/types";
+  import type { BackendAuth, DriverProfile, Family, FieldRole, PoolMode, SchemaProperty } from "../lib/types";
   import PoolModeGuide from "../components/PoolModeGuide.svelte";
 
   let families = $state<Family[]>([]);
@@ -19,6 +19,7 @@
   let maxSize = $state(10);
   let maxClients = $state(100);
   let listenPort = $state<number | undefined>(undefined);
+  let backendAuth = $state<BackendAuth>("shared");
   let search = $state("");
   let category = $state("relational");
   let layout = $state<"grid" | "list">("grid");
@@ -61,14 +62,22 @@
     selected = family;
     profileId = profile.id;
     mode = family.default_pool_mode;
+    backendAuth = "shared";
     // Seed defaults straight from the schema so the form starts valid.
     const seeded: Record<string, unknown> = {};
     for (const key of family.schema["x-havuz-order"] ?? []) {
       const prop = family.schema.properties[key];
       if (prop?.default !== undefined) seeded[key] = prop.default;
     }
-    if (profile.default_port !== null) seeded.port = profile.default_port;
+    const portField = roleField(family, "port");
+    if (portField && profile.default_port !== null) seeded[portField] = profile.default_port;
     settings = seeded;
+    listenPort = undefined;
+  }
+
+  /** The field a family uses for a given pooler role, if it declares one. */
+  function roleField(family: Family, role: FieldRole): string | undefined {
+    return Object.entries(family.schema.properties).find(([, prop]) => prop["x-havuz-role"] === role)?.[0];
   }
 
   function backToCatalog() {
@@ -101,26 +110,18 @@
     submitting = true;
     error = null;
 
-    // The connection fields live in `settings`; the pooler also needs a few of
-    // them at the top level, so they are lifted rather than duplicated by hand.
-    const host = String(settings.host ?? "");
-    const port = Number(settings.port ?? selected.default_port);
-    const password = settings.password ? String(settings.password) : undefined;
-
+    // The form goes over verbatim. The server reads host, port, database,
+    // account and password back out of it through the roles the family
+    // declared, so this file never learns what those fields are called.
     const body = {
       name,
       family: selected.id,
       profile: profileId || undefined,
       mode,
-      targets: [{ host, port }],
-      database: String(settings.database ?? ""),
-      backend_user: String(settings.username ?? ""),
-      listen_port: listenPort || undefined,
-      backend_password: password,
+      listen_port: listenPort,
+      backend_auth: backendAuth,
       limits: { max_size: maxSize, max_client_connections: maxClients },
-      // The password is a credential, not configuration; it must not be echoed
-      // back in the pool document.
-      settings: Object.fromEntries(Object.entries(settings).filter(([k]) => k !== "password")),
+      settings,
     };
 
     try {
@@ -224,11 +225,12 @@
     </div>
 
     <div class="field">
-      <label for="listen-port">Dedicated listen port <span class="muted font-normal">(optional)</span></label>
+      <label for="listen-port">Client port</label>
       <div class="help">
-        Opens a client-facing port only for this pool. Leave empty to use the shared listener and database-name routing.
+        The port clients connect to for this pool. Pools may share a port, in which case clients pick between them by
+        pool name; a port with a single pool ignores the database name entirely.
       </div>
-      <input id="listen-port" type="number" min="1" max="65535" bind:value={listenPort} placeholder="5544" />
+      <input id="listen-port" type="number" min="1" max="65535" bind:value={listenPort} required placeholder="6432" />
     </div>
 
     <!-- Rendered from the server's schema: a new family needs no UI change. -->
@@ -288,13 +290,43 @@
     <PoolModeGuide {mode} />
 
     <div class="field">
+      <label for="backend-auth">Backend identity</label>
+      <div class="help">
+        Who Havuz connects to the database as. A shared service account is what makes one backend connection reusable by
+        any client. Connecting as each user instead gives you <code>pg_stat_activity.usename</code>, row-level security
+        and real <code>GRANT</code> enforcement, at the cost of a separate set of connections per user.
+      </div>
+      <select id="backend-auth" bind:value={backendAuth}>
+        <option value="shared">One shared service account</option>
+        <option value="per_user">Each user, with its own credentials</option>
+      </select>
+    </div>
+
+    {#if backendAuth === "per_user"}
+      <div class="help notice">
+        Requires client-facing TLS: Havuz has to ask each client for its password, and will only do so over an encrypted
+        connection. Users keep using the service account until you switch them over individually on the Users page.
+      </div>
+    {/if}
+
+    <div class="field">
       <label for="max-clients">Max client connections</label>
       <input id="max-clients" type="number" min="1" bind:value={maxClients} />
     </div>
 
     <div class="field">
-      <label for="max-size">Max backend connections</label>
-      <div class="help">The number that protects your database.</div>
+      <label for="max-size">
+        Max backend connections {#if backendAuth === "per_user"}<span class="muted font-normal">(per user)</span>{/if}
+      </label>
+      <div class="help">
+        {#if backendAuth === "per_user"}
+          Applied to each user separately, so the total depends on how many are connected at once. PostgreSQL's own
+          <code>CONNECTION LIMIT</code> per role is the backstop; this is what gives a client a queue instead of an
+          error.
+        {:else}
+          The number that protects your database.
+        {/if}
+      </div>
       <input id="max-size" type="number" min="1" bind:value={maxSize} />
     </div>
 

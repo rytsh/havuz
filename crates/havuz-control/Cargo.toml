@@ -1,0 +1,33 @@
+[package]
+name = "havuz-control"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "What the control plane needs from any protocol family."
+
+[features]
+default = []
+# A protocol-less family, so crates above the seam can be tested without
+# linking a wire codec. Enabling it in a `[dependencies]` entry is a mistake.
+testing = []
+
+[dependencies]
+havuz-core = { workspace = true }
+havuz-pool = { workspace = true }
+havuz-proto = { workspace = true }
+havuz-registry = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+rusqlite = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+havuz-control = { workspace = true, features = ["testing"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time"] }
+serde_json = { workspace = true }
+tempfile = "3"

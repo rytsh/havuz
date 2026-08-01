@@ -21,7 +21,7 @@ mod pins;
 
 pub use conn::{BackendConn, BackendConnector, ResetOutcome};
 pub use error::{ProtoError, ProtoResult};
-pub use family::{ClientIdentity, Probe, ProtocolFamily, ServeOutcome};
+pub use family::{ClientIdentity, PoolRoute, Probe, ProtocolFamily, ServeOutcome};
 pub use flow::{FlowEvent, PinReason, SessionState};
 pub use pins::{PinOffender, PinRegistry, PinReport, ReasonCount};
 

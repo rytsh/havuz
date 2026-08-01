@@ -30,6 +30,32 @@ pub enum FieldKind {
     Duration,
 }
 
+/// What a field means to the pooler, as opposed to what it is called.
+///
+/// Field *names* belong to the family — `host` here, `jdbc_url` there — but the
+/// pooler needs to know a handful of things about every pool regardless: where
+/// to connect, as what, and with which credential. Declaring that here is what
+/// lets the admin API assemble a [`havuz_core`-style] pool from a form it has
+/// never seen, and is why adding a family does not touch the frontend.
+///
+/// Before this existed the dashboard hardcoded five Postgres field names when
+/// submitting the form, so "adding a family never touches the frontend" was
+/// true of the rendering and false of the submitting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FieldRole {
+    /// Hostname or address havuz connects to. For a bridge, the sidecar.
+    Host,
+    /// TCP port that goes with [`FieldRole::Host`].
+    Port,
+    /// Database, schema or namespace opened on the backend.
+    Database,
+    /// Backend service account. Not a client's havuz user.
+    User,
+    /// Backend credential. Always sealed, never returned.
+    Password,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct ConfigField {
     pub name: &'static str,
@@ -41,6 +67,9 @@ pub struct ConfigField {
     pub placeholder: Option<&'static str>,
     /// Value is routed to the encrypted secret store, never to state JSON.
     pub secret: bool,
+    /// What the pooler should do with this value, if anything. `None` means the
+    /// field is family-specific and is simply stored in `settings`.
+    pub role: Option<FieldRole>,
 }
 
 impl ConfigField {
@@ -150,6 +179,7 @@ mod tests {
         help: None,
         placeholder: None,
         secret: false,
+        role: Some(FieldRole::Host),
     };
 
     const PORT: ConfigField = ConfigField {
@@ -161,6 +191,7 @@ mod tests {
         help: None,
         placeholder: None,
         secret: false,
+        role: Some(FieldRole::Port),
     };
 
     const SSLMODE: ConfigField = ConfigField {
@@ -177,6 +208,7 @@ mod tests {
         help: None,
         placeholder: None,
         secret: false,
+        role: None,
     };
 
     #[test]

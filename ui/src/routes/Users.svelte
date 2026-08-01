@@ -15,9 +15,17 @@
 
   /** The user being edited, and the draft of the changes. */
   let editing = $state<string | null>(null);
-  let draft = $state<{ pools: string[]; readOnly: boolean; maxConnections: number; description: string; password: string }>({
+  let draft = $state<{
+    pools: string[];
+    readOnly: boolean;
+    ownBackendRole: boolean;
+    maxConnections: number;
+    description: string;
+    password: string;
+  }>({
     pools: [],
     readOnly: false,
+    ownBackendRole: false,
     maxConnections: 0,
     description: "",
     password: "",
@@ -54,6 +62,7 @@
     draft = {
       pools: [...user.pools],
       readOnly: user.read_only,
+      ownBackendRole: user.own_backend_role,
       maxConnections: user.max_client_connections,
       description: user.description ?? "",
       password: "",
@@ -66,6 +75,7 @@
     const body: Record<string, unknown> = {
       pools: draft.pools,
       read_only: draft.readOnly,
+      own_backend_role: draft.ownBackendRole,
       max_client_connections: draft.maxConnections,
       description: draft.description.trim() === "" ? null : draft.description.trim(),
     };
@@ -291,6 +301,18 @@
                     Enforced by PostgreSQL through <code>default_transaction_read_only</code>, so a write hidden inside
                     a function is caught too. Session-mode pools cannot enforce it — havuz does not inspect statements
                     there.
+                  </div>
+                </div>
+
+                <div class="field">
+                  <label class="font-normal">
+                    <input type="checkbox" bind:checked={draft.ownBackendRole} />
+                    Connect to the database as this user
+                  </label>
+                  <div class="help">
+                    Only takes effect on pools configured for per-user authentication; elsewhere the pool's service
+                    account is used either way. Requires a database role with this name and the same password, and gives
+                    this user a set of backend connections of its own.
                   </div>
                 </div>
 

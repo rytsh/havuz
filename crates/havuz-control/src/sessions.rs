@@ -26,7 +26,7 @@
 //! client goes immediately; a client with a query in flight goes when that
 //! query finishes. The alternative is a corrupted pool.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -168,6 +168,22 @@ impl SessionRegistry {
         counts
     }
 
+    /// Users currently holding a session on one pool.
+    ///
+    /// A pool that keeps a set of backend connections per user needs to know
+    /// when a user has gone, and the answer has to be scoped to the pool:
+    /// someone connected to `reporting` is no reason to keep their `orders`
+    /// connections open.
+    pub fn users_in_pool(&self, pool: &str) -> BTreeSet<String> {
+        self.entries
+            .read()
+            .expect("session registry poisoned")
+            .values()
+            .filter(|entry| entry.public.pool == pool)
+            .map(|entry| entry.public.user.clone())
+            .collect()
+    }
+
     pub fn len(&self) -> usize {
         self.entries.read().expect("session registry poisoned").len()
     }
@@ -212,6 +228,14 @@ impl Drop for SessionHandle {
 /// sender they must then keep alive.
 #[derive(Clone)]
 pub struct KickSignal(Option<watch::Receiver<bool>>);
+
+impl Default for KickSignal {
+    /// A session assembled without a registry cannot be kicked, so the default
+    /// must be the signal that never fires rather than one that fires at once.
+    fn default() -> Self {
+        Self::never()
+    }
+}
 
 impl KickSignal {
     /// A signal that never fires.
@@ -377,6 +401,18 @@ mod tests {
         assert!(registry.kick_session(a.id()));
         assert!(a.signal().is_kicked());
         assert!(!registry.kick_session(9999), "an unknown id kicks nothing");
+    }
+
+    #[test]
+    fn live_users_are_reported_per_pool_not_globally() {
+        // A session on one pool must not keep another pool's backends alive.
+        let registry = registry();
+        let _a = registry.register("svc_orders", "orders", None, "a", 0).unwrap();
+        let _b = registry.register("svc_reports", "reporting", None, "b", 0).unwrap();
+
+        assert_eq!(registry.users_in_pool("orders"), ["svc_orders".to_string()].into());
+        assert_eq!(registry.users_in_pool("reporting"), ["svc_reports".to_string()].into());
+        assert!(registry.users_in_pool("nothing").is_empty());
     }
 
     #[test]

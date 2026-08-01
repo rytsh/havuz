@@ -23,11 +23,12 @@ HAVUZ="$ROOT/target/debug/havuz"
 
 # psql runs in a container so the host needs no PostgreSQL client installed.
 psql_client() {
-  docker run --rm --add-host host.docker.internal:host-gateway -e PGPASSWORD=clientpass postgres:16 \
-    psql -qtAX -h host.docker.internal -p "$POOL_PORT" -U svc_orders -d app_main "$@"
+  psql_on "$POOL_PORT" "$@"
 }
 
-psql_dedicated() {
+# The database name is deliberately not the pool name: a port with one pool
+# ignores it entirely, and that is the whole convenience of per-pool ports.
+psql_on() {
   local port="$1"
   shift
   docker run --rm --add-host host.docker.internal:host-gateway -e PGPASSWORD=clientpass postgres:16 \
@@ -71,7 +72,7 @@ cargo build -q -p havuz-server
 echo "==> starting havuz (state in $WORK)"
 cat > "$WORK/havuz.toml" <<TOML
 [server]
-listen = "0.0.0.0:$POOL_PORT"
+bind = "0.0.0.0"
 [admin]
 listen = "127.0.0.1:$ADMIN_PORT"
 [state]
@@ -89,29 +90,33 @@ for _ in $(seq 1 30); do
 done
 
 echo "==> configuring pool and user"
+# No target, database or account at the top level: the server reads them out of
+# the connection form through the roles the registry declares.
 api /api/v1/pools -H 'content-type: application/json' -d "{
   \"name\": \"app_main\", \"family\": \"postgres\", \"mode\": \"session\",
-  \"targets\": [{\"host\": \"127.0.0.1\", \"port\": $PG_PORT}],
-  \"database\": \"appdb\", \"backend_user\": \"app\", \"backend_password\": \"hunter2\",
   \"listen_port\": $DEDICATED_PORT,
   \"settings\": {\"host\": \"127.0.0.1\", \"port\": $PG_PORT, \"database\": \"appdb\",
-                 \"username\": \"app\", \"sslmode\": \"disable\"},
+                 \"username\": \"app\", \"password\": \"hunter2\", \"sslmode\": \"disable\"},
   \"limits\": {\"max_size\": $MAX_SIZE, \"max_client_connections\": 100}}" > /dev/null
 
 api /api/v1/users -H 'content-type: application/json' \
   -d '{"name":"svc_orders","password":"clientpass","pools":["app_main"]}' > /dev/null
 
-echo "==> dedicated pool listener"
-dedicated_result="$(psql_dedicated "$DEDICATED_PORT" -c "select 77;")"
-[[ "$dedicated_result" == "77" ]] || { echo "FAIL: dedicated listener returned '$dedicated_result'"; exit 1; }
+echo "==> pool port opens, moves and closes without a restart"
+port_result="$(psql_on "$DEDICATED_PORT" -c "select 77;")"
+[[ "$port_result" == "77" ]] || { echo "FAIL: pool port returned '$port_result'"; exit 1; }
 api /api/v1/pools/app_main -X PATCH -H 'content-type: application/json' \
   -d "{\"listen_port\":$DEDICATED_PORT_2}" > /dev/null
-if psql_dedicated "$DEDICATED_PORT" -c "select 1;" > /dev/null 2>&1; then
-  echo "FAIL: old dedicated port stayed open after reconfiguration"
+if psql_on "$DEDICATED_PORT" -c "select 1;" > /dev/null 2>&1; then
+  echo "FAIL: old port stayed open after reconfiguration"
   exit 1
 fi
-dedicated_result="$(psql_dedicated "$DEDICATED_PORT_2" -c "select 78;")"
-[[ "$dedicated_result" == "78" ]] || { echo "FAIL: reconfigured listener returned '$dedicated_result'"; exit 1; }
+port_result="$(psql_on "$DEDICATED_PORT_2" -c "select 78;")"
+[[ "$port_result" == "78" ]] || { echo "FAIL: moved port returned '$port_result'"; exit 1; }
+
+# Everything below talks to POOL_PORT, so settle there.
+api /api/v1/pools/app_main -X PATCH -H 'content-type: application/json' \
+  -d "{\"listen_port\":$POOL_PORT}" > /dev/null
 
 echo "==> test connection"
 api /api/v1/pools/app_main/probe -X POST | grep -q '"ok":true' \
@@ -189,17 +194,15 @@ PY
 echo
 echo "==> switching app_main to transaction mode"
 api /api/v1/pools/app_main -X DELETE > /dev/null
-if psql_dedicated "$DEDICATED_PORT_2" -c "select 1;" > /dev/null 2>&1; then
-  echo "FAIL: dedicated port stayed open after pool deletion"
+if psql_on "$POOL_PORT" -c "select 1;" > /dev/null 2>&1; then
+  echo "FAIL: port stayed open after pool deletion"
   exit 1
 fi
 api /api/v1/pools -H 'content-type: application/json' -d "{
   \"name\": \"app_main\", \"family\": \"postgres\", \"mode\": \"transaction\",
-  \"targets\": [{\"host\": \"127.0.0.1\", \"port\": $PG_PORT}],
-  \"database\": \"appdb\", \"backend_user\": \"app\", \"backend_password\": \"hunter2\",
-  \"listen_port\": $DEDICATED_PORT_2,
+  \"listen_port\": $POOL_PORT,
   \"settings\": {\"host\": \"127.0.0.1\", \"port\": $PG_PORT, \"database\": \"appdb\",
-                 \"username\": \"app\", \"sslmode\": \"disable\"},
+                 \"username\": \"app\", \"password\": \"hunter2\", \"sslmode\": \"disable\"},
   \"limits\": {\"max_size\": $MAX_SIZE, \"max_client_connections\": 100}}" > /dev/null
 api /api/v1/users -H 'content-type: application/json' \
   -d '{"name":"svc_orders","password":"clientpass","pools":["app_main"]}' > /dev/null 2>&1 || true

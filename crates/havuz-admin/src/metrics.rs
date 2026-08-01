@@ -5,11 +5,11 @@
 
 use std::fmt::Write;
 
-use havuz_pg::GroupSnapshot;
+use havuz_control::TargetReport;
 use havuz_pool::PoolSnapshot;
 use havuz_proto::PinReport;
 
-pub fn render(pools: &[PoolSnapshot], groups: &[GroupSnapshot], pins: &PinReport, uptime_seconds: u64) -> String {
+pub fn render(pools: &[PoolSnapshot], targets: &[TargetReport], pins: &PinReport, uptime_seconds: u64) -> String {
     let mut out = String::with_capacity(2048);
 
     metric(
@@ -97,7 +97,7 @@ pub fn render(pools: &[PoolSnapshot], groups: &[GroupSnapshot], pins: &PinReport
     let mut lag_samples = Vec::new();
     let mut breaker_samples = Vec::new();
 
-    for group in groups {
+    for group in targets {
         let pool = escape(&group.name);
         routing_samples.push((format!("{{pool=\"{pool}\",target=\"primary\"}}"), group.routing.to_primary as f64));
         routing_samples.push((format!("{{pool=\"{pool}\",target=\"replica\"}}"), group.routing.to_replica as f64));

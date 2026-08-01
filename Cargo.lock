@@ -519,8 +519,8 @@ name = "havuz-admin"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "havuz-control",
  "havuz-core",
- "havuz-pg",
  "havuz-pool",
  "havuz-proto",
  "havuz-registry",
@@ -535,6 +535,25 @@ dependencies = [
  "tokio",
  "tower",
  "tower-http",
+ "tracing",
+]
+
+[[package]]
+name = "havuz-control"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "havuz-control",
+ "havuz-core",
+ "havuz-pool",
+ "havuz-proto",
+ "havuz-registry",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
  "tracing",
 ]
 
@@ -560,12 +579,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "havuz-jdbc"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "havuz-control",
+ "havuz-core",
+ "havuz-pg",
+ "havuz-pool",
+ "havuz-proto",
+ "havuz-registry",
+ "havuz-secrets",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "havuz-pg"
 version = "0.1.0"
 dependencies = [
  "async-trait",
  "base64",
  "bytes",
+ "havuz-control",
  "havuz-core",
  "havuz-pool",
  "havuz-proto",
@@ -573,7 +613,6 @@ dependencies = [
  "havuz-secrets",
  "hmac",
  "rand",
- "rusqlite",
  "rustls",
  "rustls-pki-types",
  "serde",
@@ -585,6 +624,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]
@@ -629,10 +669,12 @@ version = "0.1.0"
 dependencies = [
  "aes-gcm",
  "base64",
+ "hmac",
  "rand",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "stringprep",
  "thiserror",
  "tracing",
  "zeroize",
@@ -645,12 +687,17 @@ dependencies = [
  "anyhow",
  "axum",
  "havuz-admin",
+ "havuz-control",
  "havuz-core",
+ "havuz-jdbc",
  "havuz-pg",
  "havuz-pool",
  "havuz-proto",
+ "havuz-registry",
  "havuz-secrets",
+ "tempfile",
  "tokio",
+ "tokio-rustls",
  "tracing",
  "tracing-subscriber",
 ]

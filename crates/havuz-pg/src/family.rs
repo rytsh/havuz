@@ -1,181 +1,190 @@
 //! Wiring: state -> pools -> sessions.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use havuz_control::{BackendIdentity as BackendIdentityReport, ControlPlane, Registries, TargetReport, TraceContext};
 use havuz_core::state::{PoolConfig, State};
 use havuz_core::{SslMode, StateStore};
+use havuz_pool::PoolSnapshot;
 use havuz_proto::{
-    BackendConn, PinRegistry, PoolMode, Probe, ProtoError, ProtoResult, ProtocolFamily, ResetOutcome, ServeOutcome,
+    BackendConn, PoolMode, PoolRoute, Probe, ProtoError, ProtoResult, ProtocolFamily, ResetOutcome, ServeOutcome,
     SessionState,
 };
 use havuz_registry::FamilyDescriptor;
 use havuz_secrets::MasterKey;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
+use tokio_rustls::TlsAcceptor;
 
 use crate::backend::{BackendConfig, PgConnector};
 use crate::cancel::{CancelKey, CancelRegistry, CancelTarget};
-use crate::group::{GroupSnapshot, PoolGroup};
-use crate::holder::HolderRegistry;
+use crate::group::PoolGroup;
 use crate::protocol::{sqlstate, Message};
 use crate::scram::ScramVerifier;
-use crate::session::{complete_startup, AuthDenial, Authenticator, ClientHandshake, HandshakeOutcome};
-use crate::sessions::SessionRegistry;
-use crate::trace::{TraceContext, TraceError, TraceStore};
+use crate::session::{
+    complete_startup, AuthDenial, Authenticator, BackendCredential, ClientAuth, ClientHandshake, HandshakeOutcome,
+};
 
 const CANCEL_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// Postgres family: one listener, many pools.
+/// The registry id this family serves. Pools configured for anything else are
+/// not ours, and are skipped rather than mishandled.
+pub const FAMILY_ID: &str = "postgres";
+
+/// How often idle per-user pools are swept away.
+const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Postgres pools.
+///
+/// Owns no sockets: `havuz-server` binds every pool port and calls
+/// [`ProtocolFamily::serve`] with the pools behind it. What is left here is the
+/// handshake, the pool map and the relay.
 pub struct PgFamily {
+    /// A handle to ourselves for the idle sweeper, which outlives any one call.
+    me: Weak<Self>,
     state: Arc<StateStore>,
     master_key: Arc<MasterKey>,
-    pools: RwLock<HashMap<String, Arc<PoolGroup>>>,
+    pools: RwLock<HashMap<String, Arc<PoolEntry>>>,
     cancels: Arc<CancelRegistry>,
-    pins: Arc<PinRegistry>,
-    traces: Arc<TraceStore>,
-    holders: Arc<HolderRegistry>,
-    listener_base: RwLock<Option<ListenerBase>>,
-    dedicated_listeners: Mutex<HashMap<String, DedicatedListener>>,
-    listener_routes: RwLock<HashMap<u16, String>>,
-    live_clients: Arc<AtomicU64>,
-    max_clients: AtomicU64,
-    sessions: Arc<SessionRegistry>,
+    registries: Registries,
     handshake: ClientHandshake<StateAuthenticator>,
+    /// Started the first time a per-user pool is actually used, so a
+    /// conventional deployment never pays for it.
+    sweeper: Mutex<Option<JoinHandle<()>>>,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct ListenerBase {
-    ip: IpAddr,
-    shared_port: u16,
+/// One configured pool: the service account's connections, plus a set per user
+/// that runs as itself.
+struct PoolEntry {
+    config: PoolConfig,
+    /// Used by every client under `BackendAuth::Shared`, by users that have not
+    /// been moved onto their own role, and always by health probes and "Test
+    /// Connection" — those run on a timer with no client attached, so they have
+    /// no credential to borrow.
+    shared: Arc<PoolGroup>,
+    per_user: RwLock<HashMap<String, Arc<UserGroup>>>,
 }
 
-struct DedicatedListener {
-    port: u16,
-    handle: JoinHandle<()>,
+/// One user's own connections to a pool.
+struct UserGroup {
+    group: Arc<PoolGroup>,
+    /// Which password these connections were opened with.
+    ///
+    /// A client arriving with a different one means the password was rotated
+    /// between two connections, and the existing backends are now authenticated
+    /// as a credential the operator has revoked. They have to go.
+    fingerprint: [u8; 32],
 }
 
-pub struct ClientPermit {
-    live: Arc<AtomicU64>,
-}
+impl PoolEntry {
+    /// One row for the flat pool list, summed across every identity.
+    ///
+    /// Deliberately collapsed to the pool name. A per-user breakdown belongs on
+    /// the pool page, not in `/metrics`: thirteen series multiplied by every
+    /// user who has ever connected is how a monitoring bill becomes a incident.
+    fn combined_snapshot(&self) -> PoolSnapshot {
+        let mut combined = self.shared.combined_pool_snapshot();
+        for user in self.per_user.read().expect("per-user pool map poisoned").values() {
+            combined.merge(&user.group.combined_pool_snapshot());
+        }
+        combined
+    }
 
-impl Drop for PgFamily {
-    fn drop(&mut self) {
-        if let Ok(listeners) = self.dedicated_listeners.get_mut() {
-            for listener in listeners.values() {
-                listener.handle.abort();
+    /// Per-target detail, with each target's counters summed across identities.
+    ///
+    /// The structure — which replica, how far behind, is its breaker open —
+    /// comes from the service account's group, because routing and health are
+    /// properties of the target rather than of whoever is connected to it.
+    fn report(&self) -> TargetReport {
+        let mut report = self.shared.snapshot();
+        let per_user: Vec<Vec<PoolSnapshot>> = self
+            .per_user
+            .read()
+            .expect("per-user pool map poisoned")
+            .values()
+            .map(|user| user.group.target_snapshots())
+            .collect();
+
+        for targets in &per_user {
+            if let Some(primary) = targets.first() {
+                report.primary.pool.merge(primary);
             }
+            for (replica, snapshot) in report.replicas.iter_mut().zip(targets.iter().skip(1)) {
+                replica.pool.merge(snapshot);
+            }
+        }
+        report
+    }
+
+    /// Users currently running as themselves, with what each is holding.
+    fn identities(&self) -> Vec<(String, PoolSnapshot)> {
+        let mut out: Vec<_> = self
+            .per_user
+            .read()
+            .expect("per-user pool map poisoned")
+            .iter()
+            .map(|(user, held)| (user.clone(), held.group.combined_pool_snapshot()))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    fn drain(&self) {
+        self.shared.drain();
+        for user in self.per_user.read().expect("per-user pool map poisoned").values() {
+            user.group.drain();
         }
     }
 }
 
-impl Drop for ClientPermit {
-    fn drop(&mut self) {
-        self.live.fetch_sub(1, Ordering::Relaxed);
+/// How clients reach havuz: plaintext, or TLS with these settings.
+#[derive(Clone, Default)]
+pub struct ClientTls {
+    pub acceptor: Option<TlsAcceptor>,
+    /// Refuse clients that decline TLS. Meaningless without an acceptor.
+    pub require: bool,
+}
+
+impl std::fmt::Debug for ClientTls {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientTls").field("enabled", &self.acceptor.is_some()).field("require", &self.require).finish()
     }
 }
 
 impl PgFamily {
-    pub fn new(state: Arc<StateStore>, master_key: Arc<MasterKey>) -> Arc<Self> {
-        Self::with_traces(state, master_key, TraceStore::memory())
+    pub fn new(state: Arc<StateStore>, master_key: Arc<MasterKey>, registries: Registries) -> Arc<Self> {
+        Self::with_tls(state, master_key, registries, ClientTls::default())
     }
 
-    pub fn persistent(
+    pub fn with_tls(
         state: Arc<StateStore>,
         master_key: Arc<MasterKey>,
-        trace_path: impl AsRef<std::path::Path>,
-    ) -> Result<Arc<Self>, TraceError> {
-        Ok(Self::with_traces(state, master_key, TraceStore::open(trace_path)?))
-    }
-
-    fn with_traces(state: Arc<StateStore>, master_key: Arc<MasterKey>, traces: Arc<TraceStore>) -> Arc<Self> {
+        registries: Registries,
+        tls: ClientTls,
+    ) -> Arc<Self> {
         let authenticator = Arc::new(StateAuthenticator { state: state.clone(), master_key: master_key.clone() });
-        Arc::new(Self {
+        let mut handshake = ClientHandshake::new(authenticator);
+        if let Some(acceptor) = tls.acceptor {
+            handshake = handshake.with_tls(acceptor, tls.require);
+        }
+        Arc::new_cyclic(|me| Self {
+            me: me.clone(),
             state,
             master_key,
             pools: RwLock::new(HashMap::new()),
             cancels: Arc::new(CancelRegistry::new()),
-            pins: Arc::new(PinRegistry::new()),
-            traces,
-            holders: HolderRegistry::new(),
-            listener_base: RwLock::new(None),
-            dedicated_listeners: Mutex::new(HashMap::new()),
-            listener_routes: RwLock::new(HashMap::new()),
-            live_clients: Arc::new(AtomicU64::new(0)),
-            max_clients: AtomicU64::new(u64::MAX),
-            sessions: SessionRegistry::new(),
-            handshake: ClientHandshake::new(authenticator),
+            registries,
+            handshake,
+            sweeper: Mutex::new(None),
         })
-    }
-
-    /// Who is connected right now, and the only way to disconnect them.
-    pub fn sessions(&self) -> &Arc<SessionRegistry> {
-        &self.sessions
     }
 
     pub fn cancels(&self) -> &Arc<CancelRegistry> {
         &self.cancels
-    }
-
-    /// Why sessions stopped being shareable. Served by the admin API.
-    pub fn pins(&self) -> &Arc<PinRegistry> {
-        &self.pins
-    }
-
-    pub fn traces(&self) -> &Arc<TraceStore> {
-        &self.traces
-    }
-
-    pub fn holders(&self) -> &Arc<HolderRegistry> {
-        &self.holders
-    }
-
-    pub fn configure_listeners(&self, shared: SocketAddr, max_clients: u32) {
-        *self.listener_base.write().expect("listener base poisoned") =
-            Some(ListenerBase { ip: shared.ip(), shared_port: shared.port() });
-        self.max_clients.store(max_clients as u64, Ordering::Relaxed);
-    }
-
-    pub fn try_acquire_client(&self) -> Option<ClientPermit> {
-        let max = self.max_clients.load(Ordering::Relaxed);
-        self.live_clients
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |live| (live < max).then_some(live + 1))
-            .ok()
-            .map(|_| ClientPermit { live: self.live_clients.clone() })
-    }
-
-    pub fn live_clients(&self) -> u64 {
-        self.live_clients.load(Ordering::Relaxed)
-    }
-
-    pub fn validate_listen_port(&self, pool: &str, port: Option<u16>) -> Result<(), ProtoError> {
-        let Some(port) = port else { return Ok(()) };
-        if port == 0 {
-            return Err(ProtoError::backend("dedicated listen port must be between 1 and 65535"));
-        }
-        let Some(base) = *self.listener_base.read().expect("listener base poisoned") else {
-            return Ok(());
-        };
-        if port == base.shared_port {
-            return Err(ProtoError::backend(format!(
-                "dedicated listen port {port} conflicts with the shared listener"
-            )));
-        }
-        let listeners = self.dedicated_listeners.lock().expect("dedicated listener map poisoned");
-        if listeners.get(pool).is_some_and(|listener| listener.port == port) {
-            return Ok(());
-        }
-        if let Some((owner, _)) = listeners.iter().find(|(_, listener)| listener.port == port) {
-            return Err(ProtoError::backend(format!("dedicated listen port {port} is already used by pool '{owner}'")));
-        }
-        drop(listeners);
-        std::net::TcpListener::bind(SocketAddr::new(base.ip, port))
-            .map(drop)
-            .map_err(|error| ProtoError::backend(format!("cannot bind dedicated listen port {port}: {error}")))
     }
 
     /// Configured pooling mode for a pool, defaulting to the safest option if
@@ -188,145 +197,69 @@ impl PgFamily {
     ///
     /// Pools that disappeared are drained rather than dropped, so in-flight
     /// clients finish their work instead of getting a reset connection.
-    pub fn sync_pools(self: &Arc<Self>) -> Result<(), ProtoError> {
+    fn rebuild_pools(&self) -> Result<(), ProtoError> {
         let state = self.state.load();
         let mut pools = self.pools.write().expect("pool map poisoned");
 
         for (name, config) in &state.pools {
-            if config.family != "postgres" || config.disabled {
+            if config.family != FAMILY_ID || config.disabled {
                 continue;
             }
             if pools.contains_key(name) {
                 continue;
             }
-            let group = PoolGroup::build(name, config, |target| self.connector_for(name, config, &state, target))?;
-            let replicas = group.router().replicas().len();
-            pools.insert(name.clone(), group);
+            let shared = PoolGroup::build(name, config, |target| {
+                self.connector_for(name, config, &state, target, BackendIdentity::Service)
+            })?;
+            let replicas = shared.router().replicas().len();
+            pools.insert(
+                name.clone(),
+                Arc::new(PoolEntry { config: config.clone(), shared, per_user: RwLock::new(HashMap::new()) }),
+            );
             tracing::info!(
                 pool = %name,
                 mode = config.mode.as_str(),
                 replicas,
                 read_write_split = config.routing.read_write_split,
+                backend_auth = config.backend_auth.as_str(),
                 "pool ready"
             );
         }
 
-        pools.retain(|name, group| {
-            let live = state.pools.get(name).is_some_and(|c| c.family == "postgres" && !c.disabled);
+        pools.retain(|name, entry| {
+            let live = state.pools.get(name).is_some_and(|c| c.family == FAMILY_ID && !c.disabled);
             if !live {
                 tracing::info!(pool = %name, "pool removed from configuration, draining");
-                group.drain();
+                entry.drain();
             }
             live
         });
 
-        drop(pools);
-        self.sync_dedicated_listeners(&state)
-    }
-
-    /// Rebuild one pool after its runtime settings change.
-    ///
-    /// Existing sessions keep an `Arc` to the retired group and can finish;
-    /// subsequent lookups use the freshly configured group. The old group must
-    /// stay active because an idle transaction-mode client may need to borrow
-    /// another backend before it disconnects.
-    pub fn reload_pool(self: &Arc<Self>, name: &str) -> Result<(), ProtoError> {
-        self.pools.write().expect("pool map poisoned").remove(name);
-        self.sync_pools()
-    }
-
-    pub fn stop_dedicated_listeners(&self) {
-        let mut listeners = self.dedicated_listeners.lock().expect("dedicated listener map poisoned");
-        for (_, listener) in listeners.drain() {
-            listener.handle.abort();
-        }
-        self.listener_routes.write().expect("listener routes poisoned").clear();
-    }
-
-    fn sync_dedicated_listeners(self: &Arc<Self>, state: &State) -> Result<(), ProtoError> {
-        let Some(base) = *self.listener_base.read().expect("listener base poisoned") else {
-            return Ok(());
-        };
-        let desired: HashMap<String, u16> = state
-            .pools
-            .iter()
-            .filter(|(_, config)| config.family == "postgres" && !config.disabled)
-            .filter_map(|(name, config)| config.listen_port.map(|port| (name.clone(), port)))
-            .collect();
-
-        let mut listeners = self.dedicated_listeners.lock().expect("dedicated listener map poisoned");
-        let retired: Vec<_> = listeners
-            .iter()
-            .filter(|(name, listener)| desired.get(*name) != Some(&listener.port))
-            .map(|(name, _)| name.clone())
-            .collect();
-        for name in retired {
-            if let Some(listener) = listeners.remove(&name) {
-                listener.handle.abort();
-                self.listener_routes.write().expect("listener routes poisoned").remove(&listener.port);
-                tracing::info!(pool = %name, port = listener.port, "dedicated pool listener stopped");
-            }
-        }
-
-        for (name, port) in desired {
-            if listeners.contains_key(&name) {
-                continue;
-            }
-            if port == base.shared_port {
-                return Err(ProtoError::backend(format!(
-                    "pool '{name}' dedicated listen port {port} conflicts with the shared listener"
-                )));
-            }
-            let addr = SocketAddr::new(base.ip, port);
-            let std_listener = std::net::TcpListener::bind(addr)
-                .map_err(|error| ProtoError::backend(format!("pool '{name}' cannot listen on {addr}: {error}")))?;
-            std_listener
-                .set_nonblocking(true)
-                .map_err(|error| ProtoError::backend(format!("pool '{name}' cannot configure {addr}: {error}")))?;
-            let listener = TcpListener::from_std(std_listener)
-                .map_err(|error| ProtoError::backend(format!("pool '{name}' cannot use {addr}: {error}")))?;
-            self.listener_routes.write().expect("listener routes poisoned").insert(port, name.clone());
-            let weak = Arc::downgrade(self);
-            let listener_pool = name.clone();
-            let handle = tokio::spawn(async move {
-                loop {
-                    let (socket, peer) = match listener.accept().await {
-                        Ok(accepted) => accepted,
-                        Err(error) => {
-                            tracing::warn!(pool = %listener_pool, %addr, %error, "dedicated listener accept failed");
-                            tokio::time::sleep(Duration::from_millis(50)).await;
-                            continue;
-                        }
-                    };
-                    let Some(family) = weak.upgrade() else { return };
-                    let Some(permit) = family.try_acquire_client() else {
-                        tracing::warn!(pool = %listener_pool, %peer, "refusing dedicated connection, global client limit reached");
-                        drop(socket);
-                        continue;
-                    };
-                    tokio::spawn(async move {
-                        if let Err(error) = family.serve(socket, peer).await {
-                            tracing::debug!(%peer, error = %error, kind = error.kind(), "dedicated session failed");
-                        }
-                        drop(permit);
-                    });
-                }
-            });
-            listeners.insert(name.clone(), DedicatedListener { port, handle });
-            tracing::info!(pool = %name, %addr, "dedicated pool listener ready");
-        }
         Ok(())
     }
 
+    /// Whose credentials a set of backend connections is opened with.
     fn connector_for(
         &self,
         name: &str,
         config: &PoolConfig,
         state: &State,
         target: &havuz_core::Target,
+        identity: BackendIdentity<'_>,
     ) -> Result<PgConnector, ProtoError> {
-        let password =
-            state.secrets.get(&self.master_key, &havuz_secrets::pool_backend_password(name)).unwrap_or_default();
+        let (user, password, application_name) = match identity {
+            BackendIdentity::Service => (
+                config.backend_user.clone(),
+                state.secrets.get(&self.master_key, &havuz_secrets::pool_backend_password(name)).unwrap_or_default(),
+                format!("havuz/{name}"),
+            ),
+            // Carrying the havuz user into `application_name` as well as into
+            // the role means `pg_stat_activity` finally attributes work to a
+            // real caller, which the shared service account never could.
+            BackendIdentity::User { name: user, password } => {
+                (user.to_string(), password.to_string(), format!("havuz/{name}/{user}"))
+            }
+        };
 
         let ssl_mode = config
             .settings
@@ -352,31 +285,170 @@ impl PgFamily {
             host: target.host.clone(),
             port: target.port,
             database: config.database.clone(),
-            user: config.backend_user.clone(),
+            user,
             password,
             ssl_mode,
             tls,
-            application_name: format!("havuz/{name}"),
+            application_name,
             supports_discard_all: profile.quirks.supports_discard_all,
         }))
     }
 
-    fn pool(&self, name: &str) -> Option<Arc<PoolGroup>> {
+    fn entry(&self, name: &str) -> Option<Arc<PoolEntry>> {
         self.pools.read().expect("pool map poisoned").get(name).cloned()
     }
 
-    pub fn snapshots(&self) -> Vec<havuz_pool::PoolSnapshot> {
+    /// The connections this client should borrow from.
+    ///
+    /// Without a credential — a shared pool, or a user still on the service
+    /// account — this is the pool's own group and nothing else happens. With
+    /// one, the user gets a group of its own, built on first use.
+    fn group_for(
+        &self,
+        entry: &Arc<PoolEntry>,
+        pool: &str,
+        user: &str,
+        credential: Option<&BackendCredential>,
+    ) -> Result<Arc<PoolGroup>, ProtoError> {
+        let Some(credential) = credential else {
+            return Ok(entry.shared.clone());
+        };
+        let fingerprint = credential.fingerprint();
+
+        if let Some(existing) = entry.per_user.read().expect("per-user pool map poisoned").get(user) {
+            if existing.fingerprint == fingerprint {
+                return Ok(existing.group.clone());
+            }
+        }
+
+        let state = self.state.load();
+        let mut groups = entry.per_user.write().expect("per-user pool map poisoned");
+
+        // Re-check: another connection for the same user may have built it
+        // while we were not holding the lock.
+        if let Some(existing) = groups.get(user) {
+            if existing.fingerprint == fingerprint {
+                return Ok(existing.group.clone());
+            }
+            // Established sessions keep an `Arc` and finish against the old
+            // group; nothing new is handed out from it.
+            tracing::info!(%pool, %user, "backend password changed, replacing this user's connections");
+            existing.group.drain();
+        }
+
+        let group = PoolGroup::build(pool, &entry.config, |target| {
+            self.connector_for(
+                pool,
+                &entry.config,
+                &state,
+                target,
+                BackendIdentity::User { name: user, password: credential.expose() },
+            )
+        })?;
+        groups.insert(user.to_string(), Arc::new(UserGroup { group: group.clone(), fingerprint }));
+        tracing::info!(%pool, %user, held = groups.len(), "opened a backend identity for this user");
+        drop(groups);
+
+        self.ensure_sweeper();
+        Ok(group)
+    }
+
+    /// Start the idle sweeper once, lazily.
+    ///
+    /// Lazily because a deployment that never uses per-user authentication
+    /// should not pay for a timer, and because this is the first point at which
+    /// we are guaranteed to be inside a Tokio runtime.
+    fn ensure_sweeper(&self) {
+        let mut slot = self.sweeper.lock().expect("sweeper slot poisoned");
+        if slot.is_some() {
+            return;
+        }
+        let weak = self.me.clone();
+        *slot = Some(tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(SWEEP_INTERVAL);
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                let Some(family) = weak.upgrade() else { return };
+                family.sweep_idle_users();
+            }
+        }));
+    }
+
+    /// Drop the connection sets of users who have gone.
+    ///
+    /// Two conditions, both required: no live session on that pool, and no open
+    /// backend connection left. The second is what the pool's own reaper
+    /// produces after `idle_timeout`, so this does not close anything early —
+    /// it only reclaims the empty shell, and with it the client's password.
+    fn sweep_idle_users(&self) {
+        let entries: Vec<(String, Arc<PoolEntry>)> =
+            self.pools.read().expect("pool map poisoned").iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+
+        for (pool, entry) in entries {
+            let live = self.registries.sessions.users_in_pool(&pool);
+            let mut groups = entry.per_user.write().expect("per-user pool map poisoned");
+            groups.retain(|user, held| {
+                let keep = live.contains(user) || held.group.combined_pool_snapshot().open > 0;
+                if !keep {
+                    tracing::debug!(%pool, %user, "releasing an idle backend identity");
+                    held.group.drain();
+                }
+                keep
+            });
+        }
+    }
+}
+
+/// Whose credentials a backend connection is opened with.
+enum BackendIdentity<'a> {
+    Service,
+    User { name: &'a str, password: &'a str },
+}
+
+impl ControlPlane for PgFamily {
+    fn sync_pools(&self) -> ProtoResult<()> {
+        self.rebuild_pools()
+    }
+
+    /// Rebuild one pool after its runtime settings change.
+    ///
+    /// Existing sessions keep an `Arc` to the retired group and can finish;
+    /// subsequent lookups use the freshly configured group. The old group must
+    /// stay active because an idle transaction-mode client may need to borrow
+    /// another backend before it disconnects.
+    fn reload_pool(&self, name: &str) -> ProtoResult<()> {
+        self.pools.write().expect("pool map poisoned").remove(name);
+        self.rebuild_pools()
+    }
+
+    fn pool_snapshots(&self) -> Vec<PoolSnapshot> {
         let pools = self.pools.read().expect("pool map poisoned");
-        let mut out: Vec<_> = pools.values().map(|g| g.combined_pool_snapshot()).collect();
+        let mut out: Vec<_> = pools.values().map(|entry| entry.combined_snapshot()).collect();
         out.sort_by(|a, b| a.name.cmp(&b.name));
         out
     }
 
-    /// Per-target detail: replica health, lag and routing distribution.
-    pub fn group_snapshots(&self) -> Vec<GroupSnapshot> {
+    fn target_reports(&self) -> Vec<TargetReport> {
         let pools = self.pools.read().expect("pool map poisoned");
-        let mut out: Vec<_> = pools.values().map(|g| g.snapshot()).collect();
+        let mut out: Vec<_> = pools.values().map(|entry| entry.report()).collect();
         out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
+    }
+
+    fn backend_identities(&self) -> Vec<BackendIdentityReport> {
+        let pools = self.pools.read().expect("pool map poisoned");
+        let mut out: Vec<_> = pools
+            .iter()
+            .flat_map(|(pool, entry)| {
+                entry.identities().into_iter().map(move |(user, pool_snapshot)| BackendIdentityReport {
+                    pool: pool.clone(),
+                    user,
+                    pool_snapshot,
+                })
+            })
+            .collect();
+        out.sort_by(|a, b| (&a.pool, &a.user).cmp(&(&b.pool, &b.user)));
         out
     }
 }
@@ -387,12 +459,10 @@ impl ProtocolFamily for PgFamily {
         havuz_registry::family("postgres").expect("postgres is always registered")
     }
 
-    async fn serve(&self, io: TcpStream, peer: SocketAddr) -> ProtoResult<ServeOutcome> {
-        let local_port = io.local_addr().map_err(ProtoError::Io)?.port();
-        let forced_pool = self.listener_routes.read().expect("listener routes poisoned").get(&local_port).cloned();
-        let (mut client, outcome) = self.handshake.run_for_pool(io, peer, forced_pool.as_deref()).await?;
+    async fn serve(&self, io: TcpStream, peer: SocketAddr, route: &PoolRoute) -> ProtoResult<ServeOutcome> {
+        let (mut client, outcome) = self.handshake.run_for_pool(io, peer, route).await?;
 
-        let (identity, startup_params) = match outcome {
+        let (identity, startup_params, credential) = match outcome {
             HandshakeOutcome::Cancel { process_id, secret_key } => {
                 // Unauthenticated by design: the key pair is the credential.
                 // An unknown key cancels nothing, which is the whole point of
@@ -408,15 +478,29 @@ impl ProtocolFamily for PgFamily {
                 }
                 return Ok(ServeOutcome::rejected());
             }
-            HandshakeOutcome::Established { identity, startup_params } => (identity, startup_params),
+            HandshakeOutcome::Established { identity, startup_params, credential } => {
+                (identity, startup_params, credential)
+            }
         };
 
-        let Some(group) = self.pool(&identity.pool) else {
+        let Some(entry) = self.entry(&identity.pool) else {
             let _ =
                 Message::fatal(sqlstate::UNDEFINED_DATABASE, &format!("pool \"{}\" is not available", identity.pool))
                     .write(&mut client)
                     .await;
             return Err(ProtoError::NoRoute(identity.pool));
+        };
+
+        // Under per-user authentication this is where the client's own database
+        // role gets its connections; otherwise it is the pool's service account
+        // and nothing new happens.
+        let group = match self.group_for(&entry, &identity.pool, &identity.user, credential.as_ref()) {
+            Ok(group) => group,
+            Err(e) => {
+                let text = format!("cannot prepare backend connections for \"{}\": {e}", identity.user);
+                let _ = Message::fatal(sqlstate::CANNOT_CONNECT_NOW, &text).write(&mut client).await;
+                return Err(ProtoError::backend(text));
+            }
         };
 
         // What this user is allowed to do, read once at connect time. Changing
@@ -432,7 +516,7 @@ impl ProtocolFamily for PgFamily {
 
         // The per-user connection budget. Counted here rather than at accept
         // time because that is the first point the user is known.
-        let session = match self.sessions.register(
+        let session = match self.registries.sessions.register(
             &identity.user,
             &identity.pool,
             identity.application_name.as_deref(),
@@ -457,7 +541,7 @@ impl ProtocolFamily for PgFamily {
             application: identity.application_name.clone(),
             client_addr: identity.peer.to_string(),
         };
-        let holder = self.holders.session(trace_context.clone(), mode);
+        let holder = self.registries.holders.session(trace_context.clone(), mode);
         holder.waiting_for_startup();
 
         // The startup checkout always comes from the primary: the client needs
@@ -486,13 +570,14 @@ impl ProtocolFamily for PgFamily {
             Ok(checkout) => checkout,
             Err(e) => {
                 let (code, text) = match &e {
-                    havuz_pool::PoolError::Timeout { .. } => {
-                        (sqlstate::TOO_MANY_CONNECTIONS, format!("{e}; {}", self.holders.timeout_hint(&identity.pool)))
-                    }
+                    havuz_pool::PoolError::Timeout { .. } => (
+                        sqlstate::TOO_MANY_CONNECTIONS,
+                        format!("{e}; {}", self.registries.holders.timeout_hint(&identity.pool)),
+                    ),
                     havuz_pool::PoolError::Unavailable { .. } => (sqlstate::CANNOT_CONNECT_NOW, e.to_string()),
                     havuz_pool::PoolError::Connect { .. } => (sqlstate::CANNOT_CONNECT_NOW, e.to_string()),
                 };
-                self.traces.record_failure(
+                self.registries.traces.record_failure(
                     &trace_context,
                     "connection checkout",
                     checkout_started.elapsed(),
@@ -543,7 +628,7 @@ impl ProtocolFamily for PgFamily {
                 &mut state,
                 &mut params,
                 policy,
-                &self.traces,
+                &self.registries.traces,
                 &trace_context,
                 &holder,
             )
@@ -593,7 +678,7 @@ impl ProtocolFamily for PgFamily {
             let relay = crate::relay::session_relay_traced(
                 &mut client,
                 checkout.stream_mut(),
-                &self.traces,
+                &self.registries.traces,
                 &trace_context,
                 target,
                 backend_pid,
@@ -647,7 +732,7 @@ impl ProtocolFamily for PgFamily {
                 Some(reason) => {
                     // The product's most valuable signal: this session stopped
                     // being shareable, and here is exactly who did it and why.
-                    self.pins.record(&identity.user, identity.application_name.as_deref(), reason);
+                    self.registries.pins.record(&identity.user, identity.application_name.as_deref(), reason);
                     tracing::info!(
                         user = %identity.user,
                         pool = %identity.pool,
@@ -656,7 +741,7 @@ impl ProtocolFamily for PgFamily {
                         "session was pinned and could not be multiplexed"
                     );
                 }
-                None => self.pins.record_clean(),
+                None => self.registries.pins.record_clean(),
             }
         }
 
@@ -664,7 +749,12 @@ impl ProtocolFamily for PgFamily {
     }
 
     async fn probe(&self, pool_name: &str) -> ProtoResult<Probe> {
-        let group = self.pool(pool_name).ok_or_else(|| ProtoError::NoRoute(pool_name.to_string()))?;
+        // Probing runs on the service account: there is no client here, so
+        // there is no credential to borrow.
+        let group = self
+            .entry(pool_name)
+            .map(|entry| entry.shared.clone())
+            .ok_or_else(|| ProtoError::NoRoute(pool_name.to_string()))?;
         let started = std::time::Instant::now();
         let checkout = group.primary().acquire().await.map_err(|e| ProtoError::backend(e.to_string()))?;
 
@@ -684,13 +774,24 @@ impl ProtocolFamily for PgFamily {
 }
 
 /// Authenticates clients against the state store.
-struct StateAuthenticator {
+///
+/// Public because the JDBC bridge authenticates its clients the same way: they
+/// are havuz users reaching a havuz pool, and which protocol lives behind that
+/// pool is not the authenticator's business. A second copy of this would be a
+/// second place for the rules about `disabled` and pool grants to drift.
+pub struct StateAuthenticator {
     state: Arc<StateStore>,
     master_key: Arc<MasterKey>,
 }
 
+impl StateAuthenticator {
+    pub fn new(state: Arc<StateStore>, master_key: Arc<MasterKey>) -> Self {
+        Self { state, master_key }
+    }
+}
+
 impl Authenticator for StateAuthenticator {
-    fn verifier(&self, user: &str, pool: &str) -> Result<ScramVerifier, AuthDenial> {
+    fn resolve(&self, user: &str, pool: &str) -> Result<ClientAuth, AuthDenial> {
         let state = self.state.load();
 
         let Some(pool_config) = state.pools.get(pool) else {
@@ -715,23 +816,28 @@ impl Authenticator for StateAuthenticator {
             .get(&self.master_key, &havuz_secrets::user_verifier(user))
             .map_err(|_| AuthDenial::UnknownUser)?;
 
-        ScramVerifier::parse(&stored).map_err(|e| {
+        let verifier = ScramVerifier::parse(&stored).map_err(|e| {
             tracing::error!(%user, error = %e, "stored verifier is unusable");
             AuthDenial::UnknownUser
-        })
+        })?;
+
+        // Both sides have to opt in: the pool must be in per-user mode, and the
+        // user must have been moved onto its own database role. Anything else
+        // keeps the SCRAM path and the service account, which is what makes the
+        // migration incremental.
+        let needs_plaintext = pool_config.backend_auth.is_per_user() && user_config.own_backend_role;
+        Ok(ClientAuth { verifier, needs_plaintext })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use havuz_core::state::{PoolLimits, Target, UserConfig};
+    use havuz_core::state::{BackendAuth, PoolLimits, Target, UserConfig};
     use havuz_registry::PoolMode;
 
-    async fn family_with(state: State) -> (Arc<PgFamily>, Arc<MasterKey>) {
-        let key = Arc::new(MasterKey::generate());
-        let store = Arc::new(StateStore::ephemeral(state));
-        (PgFamily::new(store, key.clone()), key)
+    fn family_for(store: Arc<StateStore>, key: MasterKey) -> Arc<PgFamily> {
+        PgFamily::new(store, Arc::new(key), Registries::ephemeral())
     }
 
     fn pool_config() -> PoolConfig {
@@ -742,10 +848,11 @@ mod tests {
             targets: vec![Target::new("127.0.0.1", 1)],
             backend_user: "app".into(),
             database: "appdb".into(),
-            listen_port: None,
+            listen_port: 6432,
             limits: PoolLimits::default(),
             settings: Default::default(),
             routing: Default::default(),
+            backend_auth: Default::default(),
             disabled: false,
             description: None,
         }
@@ -767,10 +874,10 @@ mod tests {
         let key = MasterKey::generate();
         let state = state_with_user("hunter2", &key);
         let store = Arc::new(StateStore::ephemeral(state));
-        let family = PgFamily::new(store, Arc::new(key));
+        let family = family_for(store, key);
 
         family.sync_pools().unwrap();
-        let snapshots = family.snapshots();
+        let snapshots = family.pool_snapshots();
         assert_eq!(snapshots.len(), 1);
         assert_eq!(snapshots[0].name, "app_main");
         assert_eq!(snapshots[0].open, 0, "pools start empty; connections are opened on demand");
@@ -783,9 +890,9 @@ mod tests {
         state.pools.get_mut("app_main").unwrap().disabled = true;
 
         let store = Arc::new(StateStore::ephemeral(state));
-        let family = PgFamily::new(store, Arc::new(key));
+        let family = family_for(store, key);
         family.sync_pools().unwrap();
-        assert!(family.snapshots().is_empty());
+        assert!(family.pool_snapshots().is_empty());
     }
 
     #[tokio::test]
@@ -793,12 +900,12 @@ mod tests {
         let key = MasterKey::generate();
         let state = state_with_user("hunter2", &key);
         let store = Arc::new(StateStore::ephemeral(state));
-        let family = PgFamily::new(store, Arc::new(key));
+        let family = family_for(store, key);
 
         family.sync_pools().unwrap();
-        let first = Arc::as_ptr(&family.pool("app_main").unwrap());
+        let first = Arc::as_ptr(&family.entry("app_main").unwrap().shared.clone());
         family.sync_pools().unwrap();
-        let second = Arc::as_ptr(&family.pool("app_main").unwrap());
+        let second = Arc::as_ptr(&family.entry("app_main").unwrap().shared.clone());
 
         assert_eq!(first, second, "resyncing must not tear down a working pool");
     }
@@ -808,9 +915,9 @@ mod tests {
         let key = MasterKey::generate();
         let state = state_with_user("hunter2", &key);
         let store = Arc::new(StateStore::ephemeral(state));
-        let family = PgFamily::new(store.clone(), Arc::new(key));
+        let family = family_for(store.clone(), key);
         family.sync_pools().unwrap();
-        let old = family.pool("app_main").unwrap();
+        let old = family.entry("app_main").unwrap().shared.clone();
 
         store
             .update(|s| {
@@ -820,7 +927,7 @@ mod tests {
             .unwrap();
         family.reload_pool("app_main").unwrap();
 
-        let new = family.pool("app_main").unwrap();
+        let new = family.entry("app_main").unwrap().shared.clone();
         assert!(!Arc::ptr_eq(&old, &new), "new connections must use the replacement");
         assert_eq!(new.mode(), PoolMode::Transaction);
         assert_eq!(
@@ -830,40 +937,116 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn dedicated_listener_follows_pool_configuration() {
-        let reserved = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let dedicated_port = reserved.local_addr().unwrap().port();
-        drop(reserved);
-        let shared = TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap();
+    fn credential(password: &str) -> BackendCredential {
+        BackendCredential::for_test(password)
+    }
 
+    /// A pool whose clients authenticate against the database as themselves.
+    async fn per_user_family() -> (Arc<PgFamily>, Registries) {
         let key = MasterKey::generate();
         let mut state = state_with_user("hunter2", &key);
-        state.pools.get_mut("app_main").unwrap().listen_port = Some(dedicated_port);
-        let store = Arc::new(StateStore::ephemeral(state));
-        let family = PgFamily::new(store.clone(), Arc::new(key));
-        family.configure_listeners(shared, 100);
-        family.sync_pools().unwrap();
+        state.pools.get_mut("app_main").unwrap().backend_auth = BackendAuth::PerUser;
+        state.users.get_mut("svc_orders").unwrap().own_backend_role = true;
 
-        let socket = TcpStream::connect(("127.0.0.1", dedicated_port)).await.expect("dedicated port must open");
-        drop(socket);
-
-        store.update(|state| state.pools.get_mut("app_main").unwrap().listen_port = None).await.unwrap();
+        let registries = Registries::ephemeral();
+        let family = PgFamily::new(Arc::new(StateStore::ephemeral(state)), Arc::new(key), registries.clone());
         family.sync_pools().unwrap();
-        assert!(TcpStream::connect(("127.0.0.1", dedicated_port)).await.is_err(), "removed port must close");
+        (family, registries)
     }
 
     #[tokio::test]
-    async fn occupied_or_shared_dedicated_ports_are_rejected_before_state_changes() {
-        let occupied = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let occupied_port = occupied.local_addr().unwrap().port();
-        let shared = TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap();
-        let key = MasterKey::generate();
-        let family = PgFamily::new(Arc::new(StateStore::ephemeral(state_with_user("hunter2", &key))), Arc::new(key));
-        family.configure_listeners(shared, 100);
+    async fn each_user_gets_its_own_connections_and_the_service_account_stays_put() {
+        let (family, _) = per_user_family().await;
+        let entry = family.entry("app_main").unwrap();
 
-        assert!(family.validate_listen_port("app_main", Some(occupied_port)).is_err());
-        assert!(family.validate_listen_port("app_main", Some(shared.port())).is_err());
+        let orders = family.group_for(&entry, "app_main", "svc_orders", Some(&credential("hunter2"))).unwrap();
+        let reports = family.group_for(&entry, "app_main", "svc_reports", Some(&credential("other"))).unwrap();
+
+        assert!(!Arc::ptr_eq(&orders, &reports), "two users must not share a set of backend connections");
+        assert!(!Arc::ptr_eq(&orders, &entry.shared), "and neither may borrow the service account's");
+        assert_eq!(family.backend_identities().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn the_same_user_reconnecting_reuses_its_connections() {
+        // Otherwise per-user auth would cost a fresh pool on every connection
+        // and there would be no pooling left at all.
+        let (family, _) = per_user_family().await;
+        let entry = family.entry("app_main").unwrap();
+
+        let first = family.group_for(&entry, "app_main", "svc_orders", Some(&credential("hunter2"))).unwrap();
+        let second = family.group_for(&entry, "app_main", "svc_orders", Some(&credential("hunter2"))).unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[tokio::test]
+    async fn a_rotated_password_replaces_the_connections_opened_with_the_old_one() {
+        // Those backends are authenticated as a credential the operator has
+        // just revoked. Keeping them would quietly defeat the rotation.
+        let (family, _) = per_user_family().await;
+        let entry = family.entry("app_main").unwrap();
+
+        let before = family.group_for(&entry, "app_main", "svc_orders", Some(&credential("hunter2"))).unwrap();
+        let after = family.group_for(&entry, "app_main", "svc_orders", Some(&credential("hunter3"))).unwrap();
+
+        assert!(!Arc::ptr_eq(&before, &after));
+        assert_eq!(before.primary().status(), havuz_pool::PoolStatus::Draining);
+        assert_eq!(family.backend_identities().len(), 1, "the old set is replaced, not accumulated");
+    }
+
+    #[tokio::test]
+    async fn a_client_without_a_credential_falls_back_to_the_service_account() {
+        // The migration path: a pool can be in per-user mode while users move
+        // onto their own database roles one at a time.
+        let (family, _) = per_user_family().await;
+        let entry = family.entry("app_main").unwrap();
+
+        let group = family.group_for(&entry, "app_main", "svc_legacy", None).unwrap();
+        assert!(Arc::ptr_eq(&group, &entry.shared));
+        assert!(family.backend_identities().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_user_that_has_gone_gives_its_connections_and_its_password_back() {
+        let (family, registries) = per_user_family().await;
+        let entry = family.entry("app_main").unwrap();
+
+        let session = registries.sessions.register("svc_orders", "app_main", None, "127.0.0.1:1", 0).unwrap();
+        family.group_for(&entry, "app_main", "svc_orders", Some(&credential("hunter2"))).unwrap();
+
+        family.sweep_idle_users();
+        assert_eq!(family.backend_identities().len(), 1, "a connected user keeps its connections");
+
+        drop(session);
+        family.sweep_idle_users();
+        assert!(family.backend_identities().is_empty(), "and loses them, and its password, once it is gone");
+    }
+
+    #[tokio::test]
+    async fn a_session_on_another_pool_does_not_keep_these_connections_alive() {
+        let (family, registries) = per_user_family().await;
+        let entry = family.entry("app_main").unwrap();
+
+        let _elsewhere = registries.sessions.register("svc_orders", "reporting", None, "127.0.0.1:1", 0).unwrap();
+        family.group_for(&entry, "app_main", "svc_orders", Some(&credential("hunter2"))).unwrap();
+
+        family.sweep_idle_users();
+        assert!(family.backend_identities().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_flat_pool_list_stays_one_row_per_pool() {
+        // Thirteen metric series multiplied by every user who has ever
+        // connected is how a monitoring bill becomes an incident.
+        let (family, _) = per_user_family().await;
+        let entry = family.entry("app_main").unwrap();
+        family.group_for(&entry, "app_main", "svc_orders", Some(&credential("hunter2"))).unwrap();
+        family.group_for(&entry, "app_main", "svc_reports", Some(&credential("other"))).unwrap();
+
+        let snapshots = family.pool_snapshots();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].name, "app_main");
+        assert_eq!(family.target_reports().len(), 1);
     }
 
     #[tokio::test]
@@ -871,7 +1054,7 @@ mod tests {
         let key = MasterKey::generate();
         let state = state_with_user("hunter2", &key);
         let store = Arc::new(StateStore::ephemeral(state));
-        let family = PgFamily::new(store.clone(), Arc::new(key));
+        let family = family_for(store.clone(), key);
         family.sync_pools().unwrap();
 
         // Pools and users must go together: a user granted a missing pool is a
@@ -885,7 +1068,7 @@ mod tests {
             .unwrap();
 
         family.sync_pools().unwrap();
-        assert!(family.snapshots().is_empty());
+        assert!(family.pool_snapshots().is_empty());
     }
 
     #[tokio::test]
@@ -894,7 +1077,7 @@ mod tests {
         let state = state_with_user("hunter2", &key);
         let auth = StateAuthenticator { state: Arc::new(StateStore::ephemeral(state)), master_key: key };
 
-        assert!(auth.verifier("svc_orders", "app_main").is_ok());
+        assert!(auth.resolve("svc_orders", "app_main").is_ok());
     }
 
     #[tokio::test]
@@ -914,16 +1097,16 @@ mod tests {
 
         let auth = StateAuthenticator { state: Arc::new(StateStore::ephemeral(state)), master_key: key };
 
-        assert_eq!(auth.verifier("ghost", "app_main").unwrap_err(), AuthDenial::UnknownUser);
+        assert_eq!(auth.resolve("ghost", "app_main").unwrap_err(), AuthDenial::UnknownUser);
         assert_eq!(
-            auth.verifier("svc_orders", "missing").unwrap_err(),
+            auth.resolve("svc_orders", "missing").unwrap_err(),
             AuthDenial::UnknownPool { pool: "missing".into() }
         );
         assert_eq!(
-            auth.verifier("svc_orders", "other").unwrap_err(),
+            auth.resolve("svc_orders", "other").unwrap_err(),
             AuthDenial::NotGranted { user: "svc_orders".into(), pool: "other".into() }
         );
-        assert_eq!(auth.verifier("blocked", "app_main").unwrap_err(), AuthDenial::Disabled);
+        assert_eq!(auth.resolve("blocked", "app_main").unwrap_err(), AuthDenial::Disabled);
     }
 
     #[tokio::test]
@@ -935,19 +1118,19 @@ mod tests {
         // No secret stored for this user.
 
         let auth = StateAuthenticator { state: Arc::new(StateStore::ephemeral(state)), master_key: key };
-        assert_eq!(auth.verifier("svc_orders", "app_main").unwrap_err(), AuthDenial::UnknownUser);
+        assert_eq!(auth.resolve("svc_orders", "app_main").unwrap_err(), AuthDenial::UnknownUser);
     }
 
     #[tokio::test]
     async fn the_descriptor_is_the_registry_entry() {
-        let (family, _) = family_with(State::default()).await;
+        let family = family_for(Arc::new(StateStore::ephemeral(State::default())), MasterKey::generate());
         assert_eq!(family.descriptor().id, "postgres");
         assert!(family.descriptor().capabilities.scram_sha256);
     }
 
     #[tokio::test]
     async fn probing_an_unconfigured_pool_reports_no_route() {
-        let (family, _) = family_with(State::default()).await;
+        let family = family_for(Arc::new(StateStore::ephemeral(State::default())), MasterKey::generate());
         assert!(matches!(family.probe("nope").await.unwrap_err(), ProtoError::NoRoute(_)));
     }
 }

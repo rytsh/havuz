@@ -121,6 +121,36 @@ impl PoolSnapshot {
     pub fn is_exhausted(&self) -> bool {
         self.waiting > 0 && self.active >= self.max_size as u64
     }
+
+    /// Fold another pool's numbers into this one.
+    ///
+    /// Used wherever several `Pool`s add up to one thing an operator thinks of
+    /// as a single pool: a primary and its replicas, and — when clients
+    /// authenticate as themselves — one set of connections per user.
+    ///
+    /// `max_size` is summed too, because it is a per-`Pool` ceiling and a
+    /// combined view that reported one target's limit while showing every
+    /// target's connections would read as permanently over budget. The mean
+    /// wait is recomputed from the totals rather than averaged, which would
+    /// weight a pool with three samples the same as one with three thousand.
+    pub fn merge(&mut self, other: &PoolSnapshot) {
+        self.active += other.active;
+        self.idle += other.idle;
+        self.open += other.open;
+        self.waiting += other.waiting;
+        self.created_total += other.created_total;
+        self.closed_total += other.closed_total;
+        self.checkout_total += other.checkout_total;
+        self.timeout_total += other.timeout_total;
+        self.connect_error_total += other.connect_error_total;
+        self.discarded_total += other.discarded_total;
+        self.max_size = self.max_size.saturating_add(other.max_size);
+
+        let total_micros = self.wait.mean_micros * self.wait.samples + other.wait.mean_micros * other.wait.samples;
+        self.wait.samples += other.wait.samples;
+        self.wait.mean_micros = if self.wait.samples == 0 { 0 } else { total_micros / self.wait.samples };
+        self.wait.max_micros = self.wait.max_micros.max(other.wait.max_micros);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

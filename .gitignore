@@ -17,3 +17,6 @@ ui/dist/
 !.env.example
 
 .DS_Store
+
+# Built by agent/build.sh; a JAR does not belong in source control.
+/agent/build/
