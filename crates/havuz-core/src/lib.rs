@@ -16,7 +16,10 @@ pub mod state;
 pub mod store;
 pub mod tls;
 
-pub use config::{AdminAuth, AdminConfig, Bootstrap, BootstrapError, LogConfig, ServerConfig, ServerTls, StatePaths};
+pub use config::{
+    AdminAuth, AdminConfig, Bootstrap, BootstrapError, LogConfig, MasterKeyError, MasterKeySource, SecretsConfig,
+    ServerConfig, ServerTls, StatePaths,
+};
 pub use state::{
     Listener, PoolConfig, PoolLimits, RoutingConfig, State, StateError, Target, TargetRole, TraceLevel, UserConfig,
     Warning,

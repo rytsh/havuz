@@ -64,6 +64,14 @@ export interface Pool {
   database: string;
   backend_user: string;
   backend_auth: BackendAuth;
+  /**
+   * Whether this pool will ask for a password on an unencrypted socket.
+   *
+   * Only meaningful under per-user auth, which is the only mode that asks for
+   * one at all. What crosses that socket is a working database credential, not
+   * a pooler password.
+   */
+  allow_password_without_tls: boolean;
   trace: TraceLevel;
   /** The port clients reach this pool on. Pools may share one. */
   listen_port: number;
@@ -115,7 +123,8 @@ export type Warning =
   | { kind: "split_without_replicas"; pool: string }
   | { kind: "no_sticky_window"; pool: string }
   | { kind: "read_only_not_enforced"; pool: string; users: string[] }
-  | { kind: "users_without_backend_role"; pool: string; users: string[] };
+  | { kind: "users_without_backend_role"; pool: string; users: string[] }
+  | { kind: "password_without_tls"; pool: string };
 
 export interface Summary {
   uptime_seconds: number;
@@ -124,6 +133,12 @@ export interface Summary {
   client_connections: number;
   backend_connections: number;
   fan_in: number | null;
+  /**
+   * Whether the client-facing listeners can offer TLS at all. Process-level, so
+   * it cannot be changed from here — it decides whether a per-user pool needs
+   * allow_password_without_tls to accept anyone.
+   */
+  client_tls: boolean;
   warnings: Warning[];
   pool_snapshots: PoolSnapshot[];
 }

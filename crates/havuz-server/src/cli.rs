@@ -21,7 +21,9 @@ OPTIONS:
     -c, --config <path>   Configuration file (default: havuz.toml)
 
 ENVIRONMENT:
-    HAVUZ_MASTER_KEY      Required to run. Seals stored credentials.
+    HAVUZ_MASTER_KEY      Seals stored credentials. Optional: falls back to
+                          secrets.master_key, secrets.master_key_file, and
+                          finally a key generated into the state directory.
     HAVUZ_UI_DIR          Serve dashboard assets from this directory.
     RUST_LOG              Overrides the configured log filter.
 ";

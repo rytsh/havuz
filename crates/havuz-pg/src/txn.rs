@@ -1159,6 +1159,7 @@ mod tests {
                 ..RoutingConfig::default()
             },
             backend_auth: Default::default(),
+            allow_password_without_tls: false,
             trace: Default::default(),
             disabled: false,
             description: None,

@@ -47,6 +47,15 @@
             `${w.users.join(", ")} ${w.users.length === 1 ? "is" : "are"} not marked as having a database role of ` +
             `their own. Tick "Connect to the database as this user" on the Users page, or give the pool a backend user.`,
         };
+      case "password_without_tls":
+        return {
+          title: `${w.pool}: database passwords cross the network in the clear`,
+          detail:
+            `This pool authenticates every client as itself, so the password it asks for is that client's ` +
+            `PostgreSQL password. allow_password_without_tls is on, so it is asked for even when the client ` +
+            `did not negotiate TLS. Anyone who can read that traffic can connect to the database directly, ` +
+            `without going through havuz at all. Configure server.tls.cert and server.tls.key and turn this off.`,
+        };
       case "read_only_not_enforced":
         return {
           title: `${w.pool}: read-only is not enforced in session mode`,

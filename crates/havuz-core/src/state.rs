@@ -239,6 +239,13 @@ impl State {
             if pool.routing.read_write_split && pool.routing.sticky_after_write.is_zero() {
                 out.push(Warning::NoStickyWindow { pool: name.clone() });
             }
+            // Not a misconfiguration — it was asked for explicitly — but it is
+            // the one setting in havuz that can hand a working database
+            // credential to whoever is on the wire, so it stays visible for as
+            // long as it is on.
+            if pool.backend_auth.is_per_user() && pool.allow_password_without_tls {
+                out.push(Warning::PasswordWithoutTls { pool: name.clone() });
+            }
             // Per-user auth without a service account removes the fallback the
             // migration path relies on. The users left on it are refused when
             // they connect, which is far too late to find out.
@@ -327,6 +334,12 @@ pub enum Warning {
     UsersWithoutBackendRole {
         pool: String,
         users: Vec<String>,
+    },
+    /// A per-user pool has been allowed to ask for passwords over an
+    /// unencrypted socket. What travels there is a database credential, so
+    /// anyone on the path can reach the database without going through havuz.
+    PasswordWithoutTls {
+        pool: String,
     },
 }
 
@@ -503,6 +516,22 @@ pub struct PoolConfig {
     /// Whose credentials backend connections are opened with.
     #[serde(default)]
     pub backend_auth: BackendAuth,
+    /// Ask clients for their password even on an unencrypted socket.
+    ///
+    /// Only meaningful under [`BackendAuth::PerUser`], which is the one mode
+    /// that has to hold the plaintext. Off by default, and the default is the
+    /// one to keep: the password such a pool asks for is not a pooler password,
+    /// it is a working *database* credential. Handing it to anyone on the path
+    /// does not merely let them impersonate a client against havuz, it lets
+    /// them connect to the database directly and leave havuz out of it.
+    ///
+    /// It exists because "TLS everywhere" is not always the operator's to
+    /// decide — a unix-socket-like private link, a service mesh that already
+    /// encrypts, a legacy client that cannot speak TLS at all. Turning it on
+    /// raises [`Warning::PasswordWithoutTls`] and logs on every connection that
+    /// actually takes the unencrypted path.
+    #[serde(default)]
+    pub allow_password_without_tls: bool,
     /// How much of this pool's traffic reaches the query trace store.
     #[serde(default)]
     pub trace: TraceLevel,
@@ -802,6 +831,7 @@ mod tests {
             settings: Default::default(),
             routing: Default::default(),
             backend_auth: Default::default(),
+            allow_password_without_tls: false,
             trace: Default::default(),
             disabled: false,
             description: None,
@@ -1222,6 +1252,28 @@ mod tests {
         p.backend_auth = BackendAuth::PerUser;
         let state = state_with_pool("app_main", p);
         assert!(!state.warnings().iter().any(|w| matches!(w, Warning::UsersWithoutBackendRole { .. })));
+    }
+
+    #[test]
+    fn allowing_a_password_on_an_unencrypted_socket_is_flagged_for_as_long_as_it_is_on() {
+        let mut p = pool();
+        p.backend_auth = BackendAuth::PerUser;
+        p.allow_password_without_tls = true;
+        let state = state_with_pool("app_main", p);
+        assert!(
+            state.warnings().iter().any(|w| matches!(w, Warning::PasswordWithoutTls { pool } if pool == "app_main")),
+            "what travels on that socket opens the database directly; it does not get to be quiet"
+        );
+    }
+
+    #[test]
+    fn the_flag_is_inert_on_a_pool_that_never_asks_for_a_password() {
+        // A shared pool runs SCRAM and never learns a password, so there is
+        // nothing for this setting to expose and nothing to warn about.
+        let mut p = pool();
+        p.allow_password_without_tls = true;
+        let state = state_with_pool("app_main", p);
+        assert!(!state.warnings().iter().any(|w| matches!(w, Warning::PasswordWithoutTls { .. })));
     }
 
     #[test]

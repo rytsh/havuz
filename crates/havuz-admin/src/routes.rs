@@ -94,6 +94,8 @@ struct PoolView {
     /// Extra names clients may use in their database field to reach this pool.
     aliases: Vec<String>,
     backend_auth: BackendAuth,
+    /// Whether this pool will ask for a password on an unencrypted socket.
+    allow_password_without_tls: bool,
     trace: TraceLevel,
     /// Whether a password is stored. Never the password itself.
     has_backend_password: bool,
@@ -124,6 +126,7 @@ fn pool_view(name: &str, config: &PoolConfig, state: &havuz_core::State, runtime
         listen_port: config.listen_port,
         aliases: config.aliases.clone(),
         backend_auth: config.backend_auth,
+        allow_password_without_tls: config.allow_password_without_tls,
         trace: config.trace,
         has_backend_password: state.secrets.contains(&havuz_secrets::pool_backend_password(name)),
         targets: config.targets.clone(),
@@ -193,6 +196,13 @@ struct CreatePool {
     /// shared service account, which is what every other pooler does.
     #[serde(default)]
     backend_auth: BackendAuth,
+    /// Let a per-user pool ask for a password on an unencrypted socket.
+    ///
+    /// Accepting this is what lets such a pool exist without client-facing TLS
+    /// configured. It is off by default and stays visible as a warning while it
+    /// is on, because the password in question opens the database directly.
+    #[serde(default)]
+    allow_password_without_tls: bool,
     /// How much of this pool's traffic is recorded. Defaults to statements
     /// only: the timings and outcomes are what a pooler is asked to explain,
     /// and the row values are the part that turns a trace into a copy of the
@@ -241,13 +251,14 @@ async fn create_pool(
     Json(body): Json<CreatePool>,
 ) -> Result<impl IntoResponse, ApiError> {
     check_listen_port(&state, &body.name, body.listen_port, &body.family)?;
-    if body.backend_auth.is_per_user() && !state.client_tls {
+    if body.backend_auth.is_per_user() && !state.client_tls && !body.allow_password_without_tls {
         // The handshake refuses this per connection anyway; catching it here
         // means the operator finds out while creating the pool rather than
         // when the first client fails to connect to it.
         return Err(ApiError::BadRequest(
             "per-user authentication asks clients for their password, so it needs client-facing TLS; \
-             set server.tls.cert and server.tls.key and restart"
+             set server.tls.cert and server.tls.key and restart, or accept the risk with \
+             allow_password_without_tls"
                 .into(),
         ));
     }
@@ -317,6 +328,7 @@ async fn create_pool(
         settings,
         routing: body.routing.unwrap_or_default(),
         backend_auth: body.backend_auth,
+        allow_password_without_tls: body.allow_password_without_tls,
         trace: body.trace,
         disabled: false,
         description: body.description,
@@ -371,6 +383,12 @@ struct UpdatePool {
     /// having to recreate the pool would make that impossible.
     #[serde(default)]
     trace: Option<TraceLevel>,
+    /// Both directions are useful and both are guarded. Turning it on is how an
+    /// operator stops refusing clients on a link they have decided is safe;
+    /// turning it off is how they undo that, and is refused when it would lock
+    /// every client out of a pool that has no other way in.
+    #[serde(default)]
+    allow_password_without_tls: Option<bool>,
 }
 
 async fn update_pool(
@@ -378,12 +396,26 @@ async fn update_pool(
     Path(name): Path<String>,
     Json(body): Json<UpdatePool>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let Some(family) = state.store.load().pools.get(&name).map(|pool| pool.family.clone()) else {
+    let current = state.store.load();
+    let Some(existing) = current.pools.get(&name) else {
         return Err(ApiError::NotFound(format!("pool '{name}'")));
     };
+    let family = existing.family.clone();
     if let Some(listen_port) = body.listen_port {
         check_listen_port(&state, &name, listen_port, &family)?;
     }
+    // Withdrawing the exemption from a pool that only exists because of it
+    // would leave every client refused at the handshake with no way back
+    // except editing the state file. `backend_auth` cannot be patched, so the
+    // pool's own setting is the one that matters here.
+    if body.allow_password_without_tls == Some(false) && existing.backend_auth.is_per_user() && !state.client_tls {
+        return Err(ApiError::BadRequest(format!(
+            "pool '{name}' authenticates clients against the database as themselves and this process has no \
+             client-facing TLS, so every client would be refused; set server.tls.cert and server.tls.key and \
+             restart first"
+        )));
+    }
+
     let update_name = name.clone();
     let found = state
         .store
@@ -406,6 +438,9 @@ async fn update_pool(
                 }
                 if let Some(trace) = body.trace {
                     pool.trace = trace;
+                }
+                if let Some(allow) = body.allow_password_without_tls {
+                    pool.allow_password_without_tls = allow;
                 }
                 true
             }
@@ -790,6 +825,10 @@ async fn get_summary(State(state): State<AdminState>) -> impl IntoResponse {
         "backend_connections": backend,
         // The number the whole product exists to move.
         "fan_in": if backend == 0 { None } else { Some(clients as f32 / backend as f32) },
+        // Not a statistic, but the dashboard cannot otherwise explain why a
+        // per-user pool is refusing everyone, or why the option to let it stop
+        // is worth thinking about.
+        "client_tls": state.client_tls,
         "warnings": warnings,
         "pool_snapshots": snapshots,
     }))
@@ -1821,7 +1860,68 @@ mod tests {
         let (status, body) = post(&app, "/api/v1/pools", payload).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
         assert!(body["error"]["message"].as_str().unwrap_or_default().contains("TLS"), "body: {body}");
+        assert!(
+            body["error"]["message"].as_str().unwrap_or_default().contains("allow_password_without_tls"),
+            "the refusal has to name the way out, or it reads as an unconditional ban: {body}"
+        );
         assert!(state.store.load().pools.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_operator_may_accept_the_risk_instead_of_configuring_tls() {
+        let (app, state) = app_without_tls();
+        let mut payload = pool_payload();
+        payload["backend_auth"] = json!("per_user");
+        payload["allow_password_without_tls"] = json!(true);
+
+        let (status, body) = post(&app, "/api/v1/pools", payload).await;
+        assert_eq!(status, StatusCode::CREATED, "body: {body}");
+        assert!(state.store.load().pools["app_main"].allow_password_without_tls);
+
+        // And it stays visible for as long as it is on: this is the one setting
+        // that can hand out a working database credential.
+        let (_, summary) = get(&app, "/api/v1/summary").await;
+        assert!(
+            summary["warnings"].as_array().unwrap().iter().any(|w| w["kind"] == "password_without_tls"),
+            "body: {summary}"
+        );
+        assert_eq!(summary["client_tls"], false, "the dashboard has to be able to say why this was needed");
+    }
+
+    #[tokio::test]
+    async fn the_exemption_cannot_be_withdrawn_from_a_pool_that_depends_on_it() {
+        // Otherwise a one-word PATCH locks every client out of the pool, and
+        // the only way back is editing the state file by hand.
+        let (app, state) = app_without_tls();
+        let mut payload = pool_payload();
+        payload["backend_auth"] = json!("per_user");
+        payload["allow_password_without_tls"] = json!(true);
+        let (status, body) = post(&app, "/api/v1/pools", payload).await;
+        assert_eq!(status, StatusCode::CREATED, "body: {body}");
+
+        let (status, body) =
+            patch(&app, "/api/v1/pools/app_main", json!({ "allow_password_without_tls": false })).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+        assert!(state.store.load().pools["app_main"].allow_password_without_tls, "the setting must be untouched");
+    }
+
+    #[tokio::test]
+    async fn the_exemption_can_be_added_and_removed_where_tls_exists() {
+        let (app, state) = app();
+        let mut payload = pool_payload();
+        payload["backend_auth"] = json!("per_user");
+        let (status, body) = post(&app, "/api/v1/pools", payload).await;
+        assert_eq!(status, StatusCode::CREATED, "body: {body}");
+
+        let (status, body) = patch(&app, "/api/v1/pools/app_main", json!({ "allow_password_without_tls": true })).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(body["allow_password_without_tls"], true);
+        assert!(state.store.load().pools["app_main"].allow_password_without_tls);
+
+        let (status, body) =
+            patch(&app, "/api/v1/pools/app_main", json!({ "allow_password_without_tls": false })).await;
+        assert_eq!(status, StatusCode::OK, "with a certificate configured there is a way back: {body}");
+        assert!(!state.store.load().pools["app_main"].allow_password_without_tls);
     }
 
     #[tokio::test]

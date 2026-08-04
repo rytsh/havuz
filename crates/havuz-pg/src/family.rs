@@ -849,7 +849,7 @@ impl Authenticator for StateAuthenticator {
         // keeps the SCRAM path and the service account, which is what makes the
         // migration incremental.
         let needs_plaintext = pool_config.backend_auth.is_per_user() && user_config.own_backend_role;
-        Ok(ClientAuth { verifier, needs_plaintext })
+        Ok(ClientAuth { verifier, needs_plaintext, allow_without_tls: pool_config.allow_password_without_tls })
     }
 }
 
@@ -877,6 +877,7 @@ mod tests {
             settings: Default::default(),
             routing: Default::default(),
             backend_auth: Default::default(),
+            allow_password_without_tls: false,
             trace: Default::default(),
             disabled: false,
             description: None,

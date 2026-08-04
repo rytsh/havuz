@@ -17,7 +17,7 @@
 # and a reporting one — can share a port and still be reached under the names
 # their clients already use.
 #
-# Start with:  HAVUZ_MASTER_KEY=$(havuz keygen) havuz run --config havuz.toml
+# Start with:  havuz run --config havuz.toml
 
 [server]
 # Interface every pool port is bound on. Address only; the ports come from the
@@ -37,8 +37,11 @@ max_client_connections = 1000
 # them havuz declines SSLRequest and clients fall back to plaintext, exactly as
 # they would against a Postgres built without TLS.
 #
-# Required for pools with `backend_auth = per_user`, which ask each client for
-# its password and refuse to do so over an unencrypted socket.
+# Needed by pools with `backend_auth = per_user`, which ask each client for its
+# password and refuse to do so over an unencrypted socket. Such a pool can be
+# told to ask anyway — `allow_password_without_tls`, set per pool from the
+# dashboard — but the password in question opens the database directly, so the
+# pool stays flagged for as long as that is on.
 # cert = "/etc/havuz/tls/server.crt"
 # key  = "/etc/havuz/tls/server.key"
 require_client_cert = false
@@ -64,6 +67,34 @@ ui = true
 # per pool from the dashboard or the admin API, not here: it is a property of
 # the data behind a pool, not of the process.
 dir = "./data"
+
+[secrets]
+# The AES-256 key that seals everything in state.json worth stealing: backend
+# passwords and client SCRAM verifiers. Generate one with `havuz keygen`.
+#
+# Looked for in this order, stopping at the first that exists:
+#
+#   1. $HAVUZ_MASTER_KEY          first, so a secret manager that injects an
+#                                 environment variable need not know about this
+#                                 file at all
+#   2. secrets.master_key         the same base64 string, inline below
+#   3. secrets.master_key_file    a path this file points at
+#   4. <state.dir>/master.key     left behind by an earlier run
+#   5. generated                  written to that same path, mode 0600
+#
+# A key that is present but unreadable is a hard error at every step; it never
+# falls through to the next one. That would generate a second key and silently
+# orphan everything the first one sealed.
+# master_key = "..."
+# master_key_file = "/etc/havuz/master.key"
+
+# Step 5. On by default so havuz starts without ceremony, and worth
+# understanding before relying on it: the key then lives in the same directory
+# as the ciphertext it opens, which protects a stolen state file and not a
+# stolen state directory. Set it to false wherever the key is supposed to come
+# from somewhere else — a missing key then stops the process instead of quietly
+# inventing one.
+auto_generate = true
 
 [log]
 # `tracing` directives, e.g. "info,havuz_pg=debug". RUST_LOG overrides this.

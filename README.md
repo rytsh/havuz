@@ -61,7 +61,6 @@ the number that measures havuz itself.
 ```sh
 (cd ui && pnpm install && pnpm build)
 cargo build --release
-export HAVUZ_MASTER_KEY=$(./target/release/havuz keygen)
 cp havuz.example.toml havuz.toml
 HAVUZ_UI_DIR=ui/dist ./target/release/havuz run
 ```
@@ -71,6 +70,32 @@ Open <http://127.0.0.1:7432>, add a database, create a user, then connect:
 ```sh
 psql "postgresql://svc_orders:yourpassword@127.0.0.1:6432/app_main"
 ```
+
+### The master key
+
+Backend passwords and client verifiers are sealed under an AES-256 key that
+lives outside the state file. havuz looks for it in this order, and stops at the
+first one that exists:
+
+| | |
+|---|---|
+| `$HAVUZ_MASTER_KEY` | base64, from `havuz keygen`. First, so a secret manager need not know what the config file looks like |
+| `secrets.master_key` | the same string, inline in `havuz.toml` |
+| `secrets.master_key_file` | a path the config points at |
+| `<state.dir>/master.key` | left behind by an earlier run |
+| generated | written to that same path, unless `secrets.auto_generate = false` |
+
+The last row is why the quick start above has no `export`. It is a convenience
+and not a security measure: the key then sits in the same directory as the
+ciphertext it opens, so it protects a stolen state *file* and not a stolen state
+*directory*. Anywhere the key is meant to come from elsewhere, set
+`secrets.auto_generate = false` and a missing key goes back to being a startup
+failure.
+
+A key that is present but unreadable — bad base64, wrong length, unreadable file
+— is always a hard error and never falls through to the next source. Falling
+through would generate a second key and silently orphan everything sealed under
+the first.
 
 ### Ports belong to pools
 
@@ -215,18 +240,34 @@ entirely on whether you need the database to know who is asking.
 
 SCRAM cannot be proxied — the proof is computed over nonces chosen by both
 endpoints — so havuz has to hold the plaintext to authenticate outward. It gets
-it by asking the client for it directly, and three things follow, all enforced
-rather than configured:
+it by asking the client for it directly, and three things follow:
 
-* **It is only ever asked for over TLS.** A cleartext request on an unencrypted
-  socket is refused outright. This is why the client-facing listener needs a
-  certificate before such a pool can be created at all.
+* **It is only asked for over TLS.** A cleartext request on an unencrypted
+  socket is refused outright, which is why the client-facing listener needs a
+  certificate before such a pool can be created. This is the default, and the
+  one part an operator can override — see below.
 * **It is checked against havuz's own verifier first**, so a wrong password is
-  refused here and never reaches the database. Without that, the pool would be a
-  credential-stuffing proxy pointed at PostgreSQL.
+  refused here and never reaches the database. Not overridable by anything.
+  Without it, the pool would be a credential-stuffing proxy pointed at
+  PostgreSQL.
 * **It is never stored.** It lives as long as the user has connections, and goes
   when the last one closes. Rotating it drains the connections opened with the
   old one.
+
+#### Running one without TLS
+
+`allow_password_without_tls` on the pool lifts the first rule. It exists because
+the safety of the link is not always havuz's to judge — a loopback socket, a
+service mesh that already encrypts, a client that cannot speak TLS at all.
+
+Be clear about what it costs. The password such a pool asks for is not a pooler
+password, it is that client's **PostgreSQL** password. Leaking it does not let an
+eavesdropper open a session through havuz; it lets them connect to the database
+directly and leave havuz out of it entirely — past the pool grants, past
+`read_only`, past `disabled`. The setting is therefore off by default, raises a
+warning on the dashboard for as long as it is on, logs on every connection that
+actually takes the unencrypted path, and cannot be switched back off while it is
+the only reason clients can still reach the pool.
 
 Two consequences worth planning for. `min_idle` must be `0`: havuz cannot warm a
 connection for a user whose password it does not hold. And the service account
@@ -451,9 +492,10 @@ docker compose -f tests/e2e/docker-compose.yml up -d
 `pg_stat_activity.usename` names the connecting client rather than the service
 account, which is the only claim the feature actually makes. It also checks the
 parts that are easy to lose while making that true: a wrong password never
-reaches the database, an unencrypted client is refused, pooling still happens
-within each user, and the flat pool list stays one row and one metric series
-however many identities are live.
+reaches the database, an unencrypted client is refused — and accepted once the
+pool is told to allow it, and refused again the moment that is withdrawn —
+pooling still happens within each user, and the flat pool list stays one row and
+one metric series however many identities are live.
 
 The replica suite builds an actual standby rather than a second independent
 database. That distinction matters: the entire risk in read/write split is

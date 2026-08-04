@@ -30,6 +30,17 @@
   let maxClients = $state(100);
   let listenPort = $state<number | undefined>(undefined);
   let backendAuth = $state<BackendAuth>("shared");
+  let allowPasswordWithoutTls = $state(false);
+
+  /**
+   * Whether this process can offer TLS to clients at all.
+   *
+   * Process-level and not editable from here, but it decides whether a per-user
+   * pool works out of the box or refuses every client, so the form has to know.
+   * `null` until the summary arrives; treated as "assume it exists" so the
+   * scarier copy never flashes up on a healthy deployment.
+   */
+  let clientTls = $state<boolean | null>(null);
 
   // Asked as two questions because they are two decisions. Whether to record at
   // all is an operational one; how much to keep is a data-protection one, and
@@ -67,6 +78,12 @@
       .families()
       .then((f) => (families = f))
       .catch((e) => (error = e instanceof Error ? e.message : String(e)));
+    // Failure here is not worth an error banner: it only costs the form its
+    // ability to explain why per-user auth might need the checkbox below.
+    api
+      .summary()
+      .then((s) => (clientTls = s.client_tls))
+      .catch(() => (clientTls = null));
   });
 
   function categoryOf(family: Family): string {
@@ -81,6 +98,7 @@
     profileId = profile.id;
     mode = family.default_pool_mode;
     backendAuth = "shared";
+    allowPasswordWithoutTls = false;
     tracing = "on";
     traceDepth = "statements";
     // Seed defaults straight from the schema so the form starts valid.
@@ -153,6 +171,7 @@
       listen_port: listenPort,
       aliases: parseAliases(aliasText),
       backend_auth: backendAuth,
+      allow_password_without_tls: backendAuth === "per_user" && allowPasswordWithoutTls,
       trace: traceLevel,
       limits: { max_size: maxSize, max_client_connections: maxClients },
       settings,
@@ -348,10 +367,33 @@
 
     {#if backendAuth === "per_user"}
       <div class="help notice">
-        Requires client-facing TLS: Havuz has to ask each client for its password, and will only do so over an encrypted
-        connection. Users keep using the service account until you switch them over individually on the Users page.
+        Havuz has to ask each client for its password, and by default will only do so over an encrypted connection.
+        Users keep using the service account until you switch them over individually on the Users page.
         The service account itself is optional here — leave it blank and only users connecting as themselves get in,
         at the cost of health probes and <em>Test connection</em>, which have no client credential to borrow.
+      </div>
+
+      {#if clientTls === false}
+        <div class="warning">
+          <strong>This process has no client-facing TLS.</strong>
+          <div>
+            Set <code>server.tls.cert</code> and <code>server.tls.key</code> and restart, or tick the box below to
+            accept the consequences.
+          </div>
+        </div>
+      {/if}
+
+      <div class="field">
+        <label class="font-normal">
+          <input type="checkbox" bind:checked={allowPasswordWithoutTls} />
+          Ask for passwords even without TLS
+        </label>
+        <div class="help">
+          The password this pool asks for is the client's <em>database</em> password. Without TLS, anyone who can read
+          the network traffic gets a working database credential and can connect directly, leaving Havuz out of it
+          entirely. Only reasonable when something else already encrypts the link. The pool stays flagged on the
+          dashboard for as long as this is on.
+        </div>
       </div>
     {/if}
 

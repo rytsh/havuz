@@ -267,8 +267,9 @@ impl Message {
     ///
     /// Only ever sent on a pool that authenticates per user, where havuz needs
     /// the plaintext to open a backend connection as that client. The handshake
-    /// refuses to send it over an unencrypted socket, because a password on the
-    /// wire is worse than no pooler at all.
+    /// refuses to send it over an unencrypted socket unless that pool has
+    /// `allow_password_without_tls` set, because a password on the wire is
+    /// worse than no pooler at all.
     pub fn authentication_cleartext() -> Self {
         let mut body = BytesMut::with_capacity(4);
         body.put_i32(3);

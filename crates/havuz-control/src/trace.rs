@@ -736,13 +736,23 @@ mod tests {
     }
 
     fn wait_for_history(store: &TraceStore) {
+        wait_for_history_count(store, 1);
+    }
+
+    /// Wait until at least `expected` rows are visible.
+    ///
+    /// The count matters: the writer flushes asynchronously and in no
+    /// particular batch size, so waiting for "any row at all" and then
+    /// asserting on three of them passes on an idle machine and fails on a busy
+    /// one.
+    fn wait_for_history_count(store: &TraceStore, expected: usize) {
         for _ in 0..50 {
-            if !store.list(&TraceFilter::default()).unwrap().is_empty() {
+            if store.list(&TraceFilter::default()).unwrap().len() >= expected {
                 return;
             }
             std::thread::sleep(Duration::from_millis(5));
         }
-        panic!("trace writer did not flush");
+        panic!("trace writer did not flush {expected} rows");
     }
 
     #[test]
@@ -922,7 +932,7 @@ mod tests {
         for sql in ["select 1", "select 2", "select 3"] {
             store.begin(&context(), sql).succeed();
         }
-        wait_for_history(&store);
+        wait_for_history_count(&store, 3);
 
         let filter = TraceFilter { limit: Some(1), offset: Some(1), ..Default::default() };
         assert_eq!(store.count(&filter).unwrap(), 3);

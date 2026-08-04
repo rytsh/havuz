@@ -16,6 +16,9 @@
   let editListenPort = $state<number | undefined>(undefined);
   let editAliases = $state("");
   let editTrace = $state<TraceLevel>("statements");
+  let editAllowPasswordWithoutTls = $state(false);
+  /** Only per-user pools ever ask for a password, so only they can leak one. */
+  let editIsPerUser = $state(false);
 
   const traceLabel: Record<TraceLevel, string> = {
     off: "not traced",
@@ -90,6 +93,8 @@
     editListenPort = pool.listen_port;
     editAliases = pool.aliases.join(", ");
     editTrace = pool.trace;
+    editAllowPasswordWithoutTls = pool.allow_password_without_tls;
+    editIsPerUser = pool.backend_auth === "per_user";
   }
 
   async function saveConfiguration(event: Event) {
@@ -104,6 +109,10 @@
         listen_port: editListenPort,
         aliases: parseAliases(editAliases),
         trace: editTrace,
+        // Sent only where it means something. On a shared pool the server would
+        // store it and nothing would ever read it, which is a worse kind of
+        // confusing than not offering it.
+        ...(editIsPerUser ? { allow_password_without_tls: editAllowPasswordWithoutTls } : {}),
       }),
     );
     if (!error) editing = null;
@@ -151,6 +160,13 @@
               <span class="badge" title="Backend connections are opened with each client's own credentials"
                 >per-user auth</span
               >
+              {#if pool.allow_password_without_tls}
+                <span
+                  class="badge danger"
+                  title="This pool asks for database passwords even without TLS, so anyone on the network path can read them and use them against the database directly"
+                  >no TLS required</span
+                >
+              {/if}
             {:else}
               <div class="muted text-xs">{pool.database} as {pool.backend_user}</div>
             {/if}
@@ -272,6 +288,22 @@
           </select>
         </div>
       </div>
+      {#if editIsPerUser}
+        <div class="field mb-0">
+          <label class="font-normal">
+            <input type="checkbox" bind:checked={editAllowPasswordWithoutTls} />
+            Ask for passwords even without TLS
+          </label>
+        </div>
+      {/if}
+      {#if editIsPerUser && editAllowPasswordWithoutTls}
+        <div class="warning mb-0">
+          This pool asks each client for its <em>database</em> password. With this on it does so even without TLS, so
+          anyone who can read the traffic gets a working database credential and can connect directly, past this pool's
+          grants and past <code>read_only</code>. Turning it back off is refused while Havuz has no certificate of its
+          own — every client would be locked out.
+        </div>
+      {/if}
       {#if editListenPort !== undefined && !sharedPorts.has(editListenPort) && editAliases.trim()}
         <div class="warning mb-0">
           Nothing else is on port {editListenPort}, so the database name in a connection string is ignored and these

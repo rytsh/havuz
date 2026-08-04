@@ -15,14 +15,19 @@
 //! with — SCRAM cannot be proxied, so there is no way to reuse the client's
 //! proof. Such a pool asks for `AuthenticationCleartextPassword` instead.
 //!
-//! Two properties are preserved even then, and both are enforced here rather
-//! than left to configuration:
+//! Two properties are preserved even then:
 //!
-//! * **The password never travels in the clear.** A cleartext request on an
-//!   unencrypted socket is refused outright, whatever `require_tls` says.
-//! * **The stored verifier is still checked.** Skipping it would turn havuz
-//!   into a credential-stuffing proxy pointed at the database, and would leave
-//!   `disabled`, `read_only` and the pool grants with nothing to hang off.
+//! * **The password does not travel in the clear.** A cleartext request on an
+//!   unencrypted socket is refused outright, whatever `require_tls` says. This
+//!   is the default and the only part of the handshake an operator can turn
+//!   off — `allow_password_without_tls` on the pool — because the link havuz
+//!   runs over is not always havuz's to judge. What is at stake is worth being
+//!   plain about: this password opens the database, so leaking it does not give
+//!   an eavesdropper a session through havuz, it gives them the database.
+//! * **The stored verifier is still checked.** Not configurable at all.
+//!   Skipping it would turn havuz into a credential-stuffing proxy pointed at
+//!   the database, and would leave `disabled`, `read_only` and the pool grants
+//!   with nothing to hang off.
 //!
 //! What havuz still does not do is *store* the password. It is held for the
 //! life of the session, handed to the connector, and gone when the last client
@@ -86,6 +91,10 @@ pub struct ClientAuth {
     /// The pool opens backend connections as this client, so the handshake
     /// must come away holding the plaintext password.
     pub needs_plaintext: bool,
+    /// The pool has been told it may ask for that password on an unencrypted
+    /// socket. Only consulted when `needs_plaintext` is set; the SCRAM path
+    /// never learns a password and so has nothing to expose.
+    pub allow_without_tls: bool,
 }
 
 /// Resolves a client identity against havuz's own user list.
@@ -278,16 +287,28 @@ impl<A: Authenticator> ClientHandshake<A> {
         };
 
         let credential = if auth.needs_plaintext {
-            // Not negotiable and not configurable. Asking for a password on a
-            // plaintext socket hands it to anyone on the path, and the whole
-            // point of this pool is that the password also opens the database.
+            // Asking for a password on a plaintext socket hands it to anyone on
+            // the path, and the whole point of this pool is that the password
+            // also opens the database. Refused by default; an operator who
+            // knows something about the link that havuz cannot see may say so
+            // per pool, and then gets told about it every single time.
             if !stream.is_encrypted() {
-                let text = format!(
-                    "pool \"{pool}\" authenticates against the database as you, so it needs your password \
-                     and will only ask for it over TLS; connect with sslmode=require or higher"
+                if !auth.allow_without_tls {
+                    let text = format!(
+                        "pool \"{pool}\" authenticates against the database as you, so it needs your password \
+                         and will only ask for it over TLS; connect with sslmode=require or higher"
+                    );
+                    let _ = Message::fatal(sqlstate::INVALID_AUTHORIZATION, &text).write(&mut stream).await;
+                    return Err(ProtoError::Tls(format!("pool '{pool}' requires TLS for per-user authentication")));
+                }
+                tracing::warn!(
+                    %user,
+                    %pool,
+                    %peer,
+                    "asking for a database password on an unencrypted socket because \
+                     allow_password_without_tls is set on this pool; anyone on the path can read it \
+                     and use it against the database directly"
                 );
-                let _ = Message::fatal(sqlstate::INVALID_AUTHORIZATION, &text).write(&mut stream).await;
-                return Err(ProtoError::Tls(format!("pool '{pool}' requires TLS for per-user authentication")));
             }
             Some(self.cleartext(&mut stream, &auth.verifier, &user, &pool).await?)
         } else {
@@ -479,6 +500,7 @@ mod tests {
         users: HashMap<String, (ScramVerifier, Vec<String>)>,
         pools: Vec<String>,
         per_user: bool,
+        allow_without_tls: bool,
     }
 
     impl TestAuth {
@@ -488,7 +510,12 @@ mod tests {
                 "svc_orders".to_string(),
                 (ScramVerifier::from_password("hunter2"), vec!["app_main".to_string()]),
             );
-            Arc::new(Self { users, pools: vec!["app_main".into(), "other".into()], per_user: false })
+            Arc::new(Self {
+                users,
+                pools: vec!["app_main".into(), "other".into()],
+                per_user: false,
+                allow_without_tls: false,
+            })
         }
 
         /// A pool that authenticates clients against the database as
@@ -496,6 +523,14 @@ mod tests {
         fn per_user() -> Arc<Self> {
             let mut auth = (*Self::new()).clone();
             auth.per_user = true;
+            Arc::new(auth)
+        }
+
+        /// The same, with the operator having accepted that the password may
+        /// cross an unencrypted socket.
+        fn per_user_without_tls() -> Arc<Self> {
+            let mut auth = (*Self::per_user()).clone();
+            auth.allow_without_tls = true;
             Arc::new(auth)
         }
     }
@@ -511,7 +546,11 @@ mod tests {
             if !grants.iter().any(|g| g == pool) {
                 return Err(AuthDenial::NotGranted { user: user.into(), pool: pool.into() });
             }
-            Ok(ClientAuth { verifier: verifier.clone(), needs_plaintext: self.per_user })
+            Ok(ClientAuth {
+                verifier: verifier.clone(),
+                needs_plaintext: self.per_user,
+                allow_without_tls: self.allow_without_tls,
+            })
         }
     }
 
@@ -727,10 +766,17 @@ mod tests {
     async fn spawn_per_user_server(
         with_tls: bool,
     ) -> (SocketAddr, tokio::task::JoinHandle<ProtoResult<(MaybeTls, HandshakeOutcome)>>) {
+        spawn_per_user_server_as(TestAuth::per_user(), with_tls).await
+    }
+
+    async fn spawn_per_user_server_as(
+        auth: Arc<TestAuth>,
+        with_tls: bool,
+    ) -> (SocketAddr, tokio::task::JoinHandle<ProtoResult<(MaybeTls, HandshakeOutcome)>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
-        let handshake = ClientHandshake::new(TestAuth::per_user());
+        let handshake = ClientHandshake::new(auth);
         // The directory has to outlive the acceptor's construction only; rustls
         // has parsed the material by then.
         let (handshake, _material) = match with_tls {
@@ -814,8 +860,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_per_user_pool_refuses_to_ask_for_a_password_in_the_clear() {
-        // Not configurable, and checked before the request is sent: a password
-        // on an unencrypted socket is worse than no pooler at all.
+        // The default, and checked before the request is sent: a password on an
+        // unencrypted socket is worse than no pooler at all.
         let (addr, server) = spawn_per_user_server(false).await;
         let client = tokio::spawn(async move { client_connect(addr, "svc_orders", "app_main", "hunter2").await });
 
@@ -823,6 +869,38 @@ mod tests {
         assert!(matches!(err, ProtoError::Tls(_)), "got {err:?}");
         let client_error = client.await.unwrap().unwrap_err();
         assert!(client_error.contains("TLS"), "the client must be told why: {client_error}");
+    }
+
+    #[tokio::test]
+    async fn a_pool_may_be_told_to_ask_in_the_clear_anyway() {
+        // The escape hatch for links havuz cannot see the safety of. It changes
+        // nothing else: the verifier is still checked, and the handshake still
+        // comes away holding the password, because that is what opens the
+        // backend connection.
+        let (addr, server) = spawn_per_user_server_as(TestAuth::per_user_without_tls(), false).await;
+        let client = tokio::spawn(async move { client_connect(addr, "svc_orders", "app_main", "hunter2").await });
+
+        let (stream, outcome) = server.await.unwrap().expect("the pool opted into this");
+        client.await.unwrap().expect("client must reach AuthenticationOk");
+
+        assert!(!stream.is_encrypted(), "the whole point is that this socket is plaintext");
+        let HandshakeOutcome::Established { credential, .. } = outcome else {
+            panic!("expected an established session");
+        };
+        assert_eq!(credential.expect("still needed to open the backend").expose(), "hunter2");
+    }
+
+    #[tokio::test]
+    async fn opting_out_of_tls_does_not_opt_out_of_the_verifier() {
+        // The two are separate promises. Skipping the verifier would make the
+        // pool a credential-stuffing proxy pointed at the database, which no
+        // amount of operator consent makes reasonable.
+        let (addr, server) = spawn_per_user_server_as(TestAuth::per_user_without_tls(), false).await;
+        let client = tokio::spawn(async move { client_connect(addr, "svc_orders", "app_main", "wrong").await });
+
+        assert!(server.await.unwrap().is_err());
+        let err = client.await.unwrap().unwrap_err();
+        assert!(err.contains("28000"), "got: {err}");
     }
 
     #[tokio::test]

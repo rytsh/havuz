@@ -8,7 +8,7 @@ mod shutdown;
 
 use std::sync::Arc;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use havuz_control::{ClientGate, Registries};
 use havuz_core::{Bootstrap, StateStore};
 use havuz_secrets::MasterKey;
@@ -34,8 +34,13 @@ fn main() -> Result<()> {
             eprintln!(
                 "\nGenerated a master key. Use it with:\n\
                  \n    export {}='{}'\n\
-                 \nStore it safely: without it every stored credential is unrecoverable.",
+                 \nor in the config file:\n\
+                 \n    [secrets]\n    master_key = \"{}\"\n\
+                 \nStore it safely: without it every stored credential is unrecoverable.\n\
+                 Supplying none at all is also allowed — havuz then keeps one in the state\n\
+                 directory, which is convenient and offers no protection if that directory leaks.",
                 MasterKey::ENV_VAR,
+                key.to_base64(),
                 key.to_base64()
             );
             Ok(())
@@ -83,14 +88,16 @@ fn run(config_path: std::path::PathBuf) -> Result<()> {
 async fn serve(bootstrap: Bootstrap) -> Result<()> {
     havuz_core::tls::install_default_provider();
 
-    let master_key = match MasterKey::from_env() {
-        Ok(key) => key,
-        Err(e) => {
-            // Failing here is deliberate. Generating a key silently would make
-            // every restart lose the credentials sealed under the previous one.
-            bail!("{e}\n\nGenerate one with:  havuz keygen\nThen export it before starting havuz.");
-        }
-    };
+    // Generating a key is safe only because it is also persisted: the reason
+    // this used to refuse to start was that a key created per run would orphan
+    // everything the previous run sealed. See `SecretsConfig` for the order.
+    let (master_key, source) = bootstrap.secrets.resolve(&bootstrap.state).map_err(|e| {
+        anyhow::anyhow!(
+            "{e}\n\nGenerate one with:  havuz keygen\n\
+             Then export it, put it in secrets.master_key, or point secrets.master_key_file at it."
+        )
+    })?;
+    tracing::info!(source = source.as_str(), key_id = %master_key.id(), "master key loaded");
     let master_key = Arc::new(master_key);
 
     let state_file = bootstrap.state.state_file();

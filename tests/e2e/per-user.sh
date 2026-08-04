@@ -24,8 +24,8 @@ api() {
 }
 
 # Everything runs in a container so the host needs no PostgreSQL client.
-# `sslmode=require` because a per-user pool refuses to ask for a password on an
-# unencrypted socket, and the certificate is self-signed.
+# `sslmode=require` because a per-user pool refuses by default to ask for a
+# password on an unencrypted socket, and the certificate is self-signed.
 pg() {
   local user="$1" password="$2" port="$3"
   shift 3
@@ -153,11 +153,32 @@ print(row["pool_snapshot"]["created_total"] if row else "missing")
 [[ "$alice_created" -le 2 ]] \
   || fail "alice opened $alice_created backend connections for 3 sessions; pooling is not happening per user"
 
+# A plaintext client, used twice: once to prove it is refused by default and
+# once to prove the escape hatch actually opens.
+pg_plaintext() {
+  docker run --rm --add-host host.docker.internal:host-gateway -e PGPASSWORD=alicepass postgres:16 \
+    psql -qtAX "host=host.docker.internal port=$POOL_PORT user=alice dbname=ignored sslmode=disable" "$@"
+}
+
 echo "==> plaintext clients are refused, whatever they ask for"
-if docker run --rm --add-host host.docker.internal:host-gateway -e PGPASSWORD=alicepass postgres:16 \
-  psql -qtAX "host=host.docker.internal port=$POOL_PORT user=alice dbname=ignored sslmode=disable" \
-  -c "select 1;" > /dev/null 2>&1; then
+if pg_plaintext -c "select 1;" > /dev/null 2>&1; then
   fail "a per-user pool handed out a password prompt over an unencrypted socket"
+fi
+
+echo "==> unless the pool is told to allow it, and says so while it is on"
+api /api/v1/pools/app_main -X PATCH -H 'content-type: application/json' \
+  -d '{"allow_password_without_tls": true}' > /dev/null
+
+seen="$(pg_plaintext -c "select current_user;")"
+[[ "$seen" == "alice" ]] || fail "the pool was told to allow this and still refused, got '$seen'"
+
+api /api/v1/summary | grep -q '"kind":"password_without_tls"' \
+  || fail "handing database credentials to the network must stay visible on the dashboard"
+
+api /api/v1/pools/app_main -X PATCH -H 'content-type: application/json' \
+  -d '{"allow_password_without_tls": false}' > /dev/null
+if pg_plaintext -c "select 1;" > /dev/null 2>&1; then
+  fail "turning the exemption back off did not restore the refusal"
 fi
 
 echo "==> a user still on the service account keeps working"
