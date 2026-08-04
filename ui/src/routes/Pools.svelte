@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { api, formatFanIn } from "../lib/api";
+  import { api, formatFanIn, parseAliases } from "../lib/api";
   import type { Pool, TraceLevel, Warning } from "../lib/types";
   import Warnings from "../components/Warnings.svelte";
   import PoolModeGuide from "../components/PoolModeGuide.svelte";
@@ -14,6 +14,7 @@
   let editMaxSize = $state(10);
   let editMaxClients = $state(100);
   let editListenPort = $state<number | undefined>(undefined);
+  let editAliases = $state("");
   let editTrace = $state<TraceLevel>("statements");
 
   const traceLabel: Record<TraceLevel, string> = {
@@ -87,6 +88,7 @@
     editMaxSize = pool.limits.max_size;
     editMaxClients = pool.limits.max_client_connections;
     editListenPort = pool.listen_port;
+    editAliases = pool.aliases.join(", ");
     editTrace = pool.trace;
   }
 
@@ -100,6 +102,7 @@
         max_size: editMaxSize,
         max_client_connections: editMaxClients,
         listen_port: editListenPort,
+        aliases: parseAliases(editAliases),
         trace: editTrace,
       }),
     );
@@ -156,6 +159,11 @@
             <span class="badge ok">:{pool.listen_port}</span>
             {#if sharedPorts.has(pool.listen_port)}
               <div class="muted text-xs">shared, selected by name</div>
+            {/if}
+            {#if pool.aliases.length}
+              <div class="muted text-xs" title="Database names that also reach this pool">
+                also {pool.aliases.join(", ")}
+              </div>
             {/if}
           </td>
           <td>
@@ -252,6 +260,10 @@
           <input id="edit-listen-port" type="number" min="1" max="65535" bind:value={editListenPort} required />
         </div>
         <div class="field mb-0">
+          <label for="edit-aliases">Also reachable as</label>
+          <input id="edit-aliases" bind:value={editAliases} placeholder="orders, orders_prod" />
+        </div>
+        <div class="field mb-0">
           <label for="edit-trace">Query tracing</label>
           <select id="edit-trace" bind:value={editTrace}>
             <option value="off">Nothing recorded</option>
@@ -260,6 +272,13 @@
           </select>
         </div>
       </div>
+      {#if editListenPort !== undefined && !sharedPorts.has(editListenPort) && editAliases.trim()}
+        <div class="warning mb-0">
+          Nothing else is on port {editListenPort}, so the database name in a connection string is ignored and these
+          aliases do nothing yet. They start mattering the moment a second pool joins this port — which is exactly when
+          you want them already in place.
+        </div>
+      {/if}
       {#if editTrace === "full"}
         <div class="warning mb-0">
           Result rows are kept verbatim for as long as the trace retention allows. Turn this back down once you have

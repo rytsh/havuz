@@ -60,6 +60,15 @@ pub enum StateError {
          but a listener can only speak one protocol"
     )]
     MixedFamiliesOnPort { first: String, first_family: String, second: String, second_family: String, port: u16 },
+    #[error("pool '{pool}': alias '{alias}' is not a valid name; use letters, digits, '_' and '-'")]
+    BadAliasName { pool: String, alias: String },
+    #[error("pool '{pool}' lists its own name '{alias}' as an alias; a pool is always reachable by its name")]
+    AliasIsOwnPool { pool: String, alias: String },
+    #[error(
+        "pools '{first}' and '{second}' share listen port {port} and both answer to '{name}'; \
+         a client sends one database name and must reach one pool"
+    )]
+    RoutableNameCollides { name: String, port: u16, first: String, second: String },
     #[error(
         "pool '{0}' authenticates per user, so min_idle must be 0: havuz cannot warm a connection \
          for a user whose password it does not hold"
@@ -125,6 +134,12 @@ impl State {
     /// read a single byte.
     fn validate_listeners(&self) -> Result<(), StateError> {
         let mut ports: BTreeMap<u16, (&String, &String)> = BTreeMap::new();
+        // Every string a client may put in its database field, per port. Pool
+        // names go in first and aliases second, so a pool is never made
+        // unreachable by somebody else's alias — the alias is what gets
+        // refused, and the operator is told which pool it collided with.
+        let mut routable: BTreeMap<(u16, &str), &String> = BTreeMap::new();
+
         for (name, pool) in &self.pools {
             if pool.listen_port == 0 {
                 return Err(StateError::ZeroListenPort(name.clone()));
@@ -139,7 +154,29 @@ impl State {
                     port: pool.listen_port,
                 });
             }
+            // Pool names cannot collide with each other: they are map keys.
+            routable.insert((pool.listen_port, name.as_str()), name);
         }
+
+        for (name, pool) in &self.pools {
+            for alias in &pool.aliases {
+                if !is_valid_name(alias) {
+                    return Err(StateError::BadAliasName { pool: name.clone(), alias: alias.clone() });
+                }
+                if alias == name {
+                    return Err(StateError::AliasIsOwnPool { pool: name.clone(), alias: alias.clone() });
+                }
+                if let Some(other) = routable.insert((pool.listen_port, alias.as_str()), name) {
+                    return Err(StateError::RoutableNameCollides {
+                        name: alias.clone(),
+                        port: pool.listen_port,
+                        first: other.clone(),
+                        second: name.clone(),
+                    });
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -154,10 +191,21 @@ impl State {
     pub fn listeners(&self) -> BTreeMap<u16, Listener> {
         let mut out: BTreeMap<u16, Listener> = BTreeMap::new();
         for (name, pool) in self.pools.iter().filter(|(_, pool)| !pool.disabled) {
-            out.entry(pool.listen_port)
-                .or_insert_with(|| Listener { port: pool.listen_port, family: pool.family.clone(), pools: Vec::new() })
-                .pools
-                .push(name.clone());
+            let listener = out.entry(pool.listen_port).or_insert_with(|| Listener {
+                port: pool.listen_port,
+                family: pool.family.clone(),
+                pools: Vec::new(),
+                aliases: Vec::new(),
+            });
+            listener.pools.push(name.clone());
+            listener.aliases.extend(pool.aliases.iter().map(|alias| (alias.clone(), name.clone())));
+        }
+        // `pools` is already sorted because it came from a `BTreeMap`; the
+        // aliases were gathered per pool and have to be sorted here, so that
+        // two runs over the same configuration produce the same listener and
+        // the reconciler does not see a change that is not one.
+        for listener in out.values_mut() {
+            listener.aliases.sort();
         }
         out
     }
@@ -291,6 +339,12 @@ pub struct Listener {
     pub family: String,
     /// Sorted, because `pools` is a `BTreeMap`.
     pub pools: Vec<String>,
+    /// Extra names clients may use here, as `(alias, pool)`, sorted by alias.
+    ///
+    /// Flattened out of the pools rather than left on them, because this is the
+    /// listener's routing table and nothing above it should have to walk the
+    /// pool list to rebuild one.
+    pub aliases: Vec<(String, String)>,
 }
 
 impl Listener {
@@ -417,9 +471,29 @@ pub struct PoolConfig {
     /// Client-facing port. Required: a pool nobody can reach is not a pool.
     ///
     /// Pools may share a port. With one pool on a port the client's database
-    /// field is ignored; with several, it names which one. See
-    /// [`State::listeners`].
+    /// field is ignored; with several, it names which one — by this pool's name
+    /// or by one of its [`aliases`](Self::aliases). See [`State::listeners`].
     pub listen_port: u16,
+    /// Extra names clients may put in their database field to reach this pool.
+    ///
+    /// The startup packet carries exactly one routing field, so a port shared
+    /// by several pools makes the client name one of them. Without aliases that
+    /// name has to be the pool's own, which drags two unrelated decisions
+    /// together: a pool ends up having to be called after its database, and two
+    /// pools over *one* database — a read-write one and a reporting one, say —
+    /// cannot both be reachable under the database's real name.
+    ///
+    /// An alias separates them. `orders_rw` and `orders_ro` can share a port
+    /// and a database while clients keep writing `dbname=orders` and
+    /// `dbname=orders_bi`.
+    ///
+    /// Aliases and pool names share one namespace per port, because a client
+    /// cannot tell them apart: it sends one string and expects one pool. A pool
+    /// alone on its port has no use for them — its clients' database field is
+    /// ignored entirely — but they are still worth declaring before a second
+    /// pool arrives on that port.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
     pub limits: PoolLimits,
     /// Family-specific settings validated against the registry's config fields.
     #[serde(default)]
@@ -723,6 +797,7 @@ mod tests {
             backend_user: "app".into(),
             database: "appdb".into(),
             listen_port: 6432,
+            aliases: Vec::new(),
             limits: PoolLimits::default(),
             settings: Default::default(),
             routing: Default::default(),
@@ -914,6 +989,110 @@ mod tests {
         let mut state = state_with_pool("orders", pool());
         state.pools.get_mut("orders").unwrap().disabled = true;
         assert!(state.listeners().is_empty(), "the socket must close, not accept and then refuse");
+    }
+
+    #[test]
+    fn an_alias_lets_two_pools_share_one_database_on_one_port() {
+        // The reason aliases exist. Without them `orders` is a name only one of
+        // these can have, so the other is unreachable under the name its
+        // clients already write.
+        let mut rw = pool();
+        rw.aliases = vec!["orders".into()];
+        let mut state = state_with_pool("orders_rw", rw);
+
+        let mut ro = pool();
+        ro.aliases = vec!["orders_bi".into()];
+        state.pools.insert("orders_ro".into(), ro);
+        state.validate().expect("distinct aliases on one port are fine");
+
+        let listener = &state.listeners()[&6432];
+        assert_eq!(listener.pools, ["orders_ro", "orders_rw"]);
+        assert_eq!(
+            listener.aliases,
+            [("orders".to_string(), "orders_rw".to_string()), ("orders_bi".to_string(), "orders_ro".to_string())],
+            "sorted by alias, so the same configuration always produces the same listener"
+        );
+    }
+
+    #[test]
+    fn two_pools_on_a_port_cannot_answer_to_the_same_name() {
+        let mut first = pool();
+        first.aliases = vec!["orders".into()];
+        let mut state = state_with_pool("orders_rw", first);
+
+        let mut second = pool();
+        second.aliases = vec!["orders".into()];
+        state.pools.insert("orders_ro".into(), second);
+
+        assert!(
+            matches!(state.validate().unwrap_err(), StateError::RoutableNameCollides { ref name, port: 6432, .. } if name == "orders"),
+            "a client sends one name and must reach one pool"
+        );
+    }
+
+    #[test]
+    fn an_alias_cannot_shadow_another_pool_on_the_same_port() {
+        // Accepting this would make `reports` unreachable while the dashboard
+        // went on showing it, which is the worst of both outcomes.
+        let mut state = state_with_pool("reports", pool());
+        let mut squatter = pool();
+        squatter.aliases = vec!["reports".into()];
+        state.pools.insert("orders".into(), squatter);
+
+        assert!(
+            matches!(state.validate().unwrap_err(), StateError::RoutableNameCollides { ref name, .. } if name == "reports")
+        );
+    }
+
+    #[test]
+    fn the_same_alias_on_two_different_ports_is_fine() {
+        // Routing is per listener, so there is nothing to be ambiguous about.
+        let mut first = pool();
+        first.aliases = vec!["orders".into()];
+        let mut state = state_with_pool("orders_rw", first);
+
+        let mut second = pool();
+        second.listen_port = 6433;
+        second.aliases = vec!["orders".into()];
+        state.pools.insert("orders_staging".into(), second);
+
+        state.validate().expect("two ports, two routing tables");
+        assert_eq!(state.listeners().len(), 2);
+    }
+
+    #[test]
+    fn a_pool_cannot_alias_its_own_name() {
+        // Harmless to honour, but it is almost always a half-finished edit, and
+        // silently accepting it hides the typo it usually is.
+        let mut redundant = pool();
+        redundant.aliases = vec!["orders".into()];
+        assert_eq!(
+            state_with_pool("orders", redundant).validate().unwrap_err(),
+            StateError::AliasIsOwnPool { pool: "orders".into(), alias: "orders".into() }
+        );
+    }
+
+    #[test]
+    fn an_alias_obeys_the_same_naming_rules_as_a_pool() {
+        let mut bad = pool();
+        bad.aliases = vec!["orders prod".into()];
+        assert_eq!(
+            state_with_pool("orders_rw", bad).validate().unwrap_err(),
+            StateError::BadAliasName { pool: "orders_rw".into(), alias: "orders prod".into() }
+        );
+    }
+
+    #[test]
+    fn a_pool_without_aliases_keeps_them_out_of_the_state_document() {
+        // The field is additive: a configuration that never mentions aliases
+        // must round-trip byte for byte through the state file.
+        let state = state_with_pool("orders", pool());
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(!json.contains("aliases"), "an unused field must not appear in state.json");
+
+        let reloaded: State = serde_json::from_str(&json).unwrap();
+        assert!(reloaded.pools["orders"].aliases.is_empty());
+        reloaded.validate().unwrap();
     }
 
     #[test]

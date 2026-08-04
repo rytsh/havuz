@@ -34,11 +34,13 @@ pub fn router(state: AdminState) -> Router {
         .route("/users/{name}", patch(update_user).delete(delete_user))
         .route("/users/{name}/kick", post(kick_user))
         .route("/sessions", get(list_sessions))
+        .route("/sessions/{id}/kick", post(kick_session))
         .route("/config", get(get_config))
         .route("/summary", get(get_summary))
         .route("/pins", get(get_pins).delete(reset_pins))
         .route("/traces", get(get_traces).delete(clear_traces))
-        .route("/traces/{id}", get(get_trace));
+        .route("/traces/{id}", get(get_trace))
+        .route("/traces/{id}/cancel", post(cancel_trace));
 
     Router::new()
         .nest("/api/v1", api)
@@ -89,6 +91,8 @@ struct PoolView {
     database: String,
     backend_user: String,
     listen_port: u16,
+    /// Extra names clients may use in their database field to reach this pool.
+    aliases: Vec<String>,
     backend_auth: BackendAuth,
     trace: TraceLevel,
     /// Whether a password is stored. Never the password itself.
@@ -118,6 +122,7 @@ fn pool_view(name: &str, config: &PoolConfig, state: &havuz_core::State, runtime
         database: config.database.clone(),
         backend_user: config.backend_user.clone(),
         listen_port: config.listen_port,
+        aliases: config.aliases.clone(),
         backend_auth: config.backend_auth,
         trace: config.trace,
         has_backend_password: state.secrets.contains(&havuz_secrets::pool_backend_password(name)),
@@ -177,6 +182,13 @@ struct CreatePool {
     targets: Option<Vec<Target>>,
     /// Required: a pool nobody can reach is not a pool.
     listen_port: u16,
+    /// Extra names clients may put in their database field to reach this pool.
+    ///
+    /// Only does anything once a second pool shares the port; until then the
+    /// database field is ignored. Rejected if it collides with another pool or
+    /// alias on the same port — see `State::validate`.
+    #[serde(default)]
+    aliases: Vec<String>,
     /// Whose credentials backend connections are opened with. Defaults to one
     /// shared service account, which is what every other pooler does.
     #[serde(default)]
@@ -300,6 +312,7 @@ async fn create_pool(
         backend_user: connection.user,
         database: connection.database,
         listen_port: body.listen_port,
+        aliases: body.aliases,
         limits: body.limits.unwrap_or_default(),
         settings,
         routing: body.routing.unwrap_or_default(),
@@ -345,6 +358,14 @@ struct UpdatePool {
     max_client_connections: Option<u32>,
     #[serde(default)]
     listen_port: Option<u16>,
+    /// Replaces the whole list, so an alias is removed by sending the list
+    /// without it. Absent leaves the aliases alone.
+    ///
+    /// This is the field an operator reaches for when a second pool arrives on
+    /// a port and the clients already connected to the first one have to keep
+    /// working: give the first pool the name they are already sending.
+    #[serde(default)]
+    aliases: Option<Vec<String>>,
     /// Changeable after creation on purpose: turning capture up for the length
     /// of an incident and back down afterwards is the normal way to use it, and
     /// having to recreate the pool would make that impossible.
@@ -379,6 +400,9 @@ async fn update_pool(
                 }
                 if let Some(listen_port) = body.listen_port {
                     pool.listen_port = listen_port;
+                }
+                if let Some(aliases) = body.aliases {
+                    pool.aliases = aliases;
                 }
                 if let Some(trace) = body.trace {
                     pool.trace = trace;
@@ -641,6 +665,18 @@ async fn list_sessions(State(state): State<AdminState>) -> impl IntoResponse {
     Json(json!({ "sessions": state.registries.sessions.snapshot() }))
 }
 
+/// End one session, named by the id the session list reports.
+///
+/// The blunt instrument. It disconnects the client outright and, like every
+/// kick, waits for a statement in flight to finish first. To stop a query
+/// without disconnecting anybody, cancel the query instead.
+async fn kick_session(State(state): State<AdminState>, Path(id): Path<u64>) -> Result<impl IntoResponse, ApiError> {
+    if !state.registries.sessions.kick_session(id) {
+        return Err(ApiError::NotFound(format!("session '{id}'")));
+    }
+    Ok(Json(json!({ "session": id, "kicked": true })))
+}
+
 #[derive(Debug, Deserialize)]
 struct CreateUser {
     name: String,
@@ -849,6 +885,38 @@ async fn get_trace(State(state): State<AdminState>, Path(id): Path<u64>) -> Resu
         .ok_or_else(|| ApiError::NotFound(format!("query trace '{id}'")))
 }
 
+/// Interrupt a query that is running right now, leaving its session connected.
+///
+/// This is the operator's version of `Ctrl-C`, and it is deliberately not a
+/// kick: the client keeps its connection, its transaction is rolled back by the
+/// database rather than by us, and the backend goes back to the pool clean.
+///
+/// Best effort in the strict sense. PostgreSQL never acknowledges a
+/// cancellation — it closes the socket either way — so a successful response
+/// means the request was delivered, not that the query stopped. A query that
+/// finished while the operator was reading the screen is a 404: there is
+/// nothing left to cancel, and pretending otherwise would invite a second
+/// press that lands on somebody else's work.
+///
+/// One race survives, and it is the one worth keeping: a query that finishes
+/// between this lookup and the delivery a microsecond later. The cancellation
+/// then reaches whatever that *same session* is running next, or nothing at
+/// all. It cannot reach another client, because the hook resolves the backend
+/// through the session's own slot rather than through an address recorded when
+/// the query started.
+async fn cancel_trace(State(state): State<AdminState>, Path(id): Path<u64>) -> Result<impl IntoResponse, ApiError> {
+    let hook =
+        state.registries.traces.cancel_hook(id).ok_or_else(|| ApiError::NotFound(format!("running query '{id}'")))?;
+
+    match hook.cancel().await {
+        Ok(()) => Ok(Json(json!({ "trace": id, "delivered": true }))),
+        // Not a server fault: the backend may have gone away, or the client may
+        // have released it a microsecond ago. Report it as a failed request
+        // rather than a broken pooler.
+        Err(detail) => Err(ApiError::BadRequest(format!("cancelling query '{id}': {detail}"))),
+    }
+}
+
 async fn clear_traces(State(state): State<AdminState>) -> Result<impl IntoResponse, ApiError> {
     let deleted = state.registries.traces.clear().map_err(|error| ApiError::Internal(error.to_string()))?;
     Ok(Json(json!({ "deleted": deleted })))
@@ -1046,6 +1114,73 @@ mod tests {
         let (status, body) = post(&app, "/api/v1/pools", second).await;
         assert_eq!(status, StatusCode::CREATED, "body: {body}");
         assert_eq!(state.store.load().listeners()[&5544].pools, ["app_main", "reports"]);
+    }
+
+    #[tokio::test]
+    async fn a_pool_may_answer_to_names_it_is_not_called() {
+        // Two pools over one database, sharing a port, both reachable under the
+        // names their clients already write. Without aliases only one of them
+        // could be called `orders`.
+        let (app, state) = app();
+        let mut rw = pool_payload();
+        rw["name"] = json!("orders_rw");
+        rw["listen_port"] = json!(5545);
+        rw["aliases"] = json!(["orders"]);
+        let (status, body) = post(&app, "/api/v1/pools", rw).await;
+        assert_eq!(status, StatusCode::CREATED, "body: {body}");
+        assert_eq!(body["aliases"], json!(["orders"]));
+
+        let mut ro = pool_payload();
+        ro["name"] = json!("orders_ro");
+        ro["listen_port"] = json!(5545);
+        ro["aliases"] = json!(["orders_bi"]);
+        let (status, body) = post(&app, "/api/v1/pools", ro).await;
+        assert_eq!(status, StatusCode::CREATED, "body: {body}");
+
+        let listener = &state.store.load().listeners()[&5545];
+        assert_eq!(listener.pools, ["orders_ro", "orders_rw"]);
+        assert_eq!(
+            listener.aliases,
+            [("orders".to_string(), "orders_rw".to_string()), ("orders_bi".to_string(), "orders_ro".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_alias_another_pool_already_answers_to_is_refused() {
+        let (app, _) = app();
+        let mut first = pool_payload();
+        first["listen_port"] = json!(5546);
+        first["aliases"] = json!(["orders"]);
+        post(&app, "/api/v1/pools", first).await;
+
+        let mut second = pool_payload();
+        second["name"] = json!("reports");
+        second["listen_port"] = json!(5546);
+        second["aliases"] = json!(["orders"]);
+        let (status, body) = post(&app, "/api/v1/pools", second).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "a client sends one name and must reach one pool");
+        assert!(body["error"]["message"].as_str().unwrap().contains("orders"), "got {body}");
+    }
+
+    #[tokio::test]
+    async fn aliases_can_be_added_and_removed_after_creation() {
+        // The migration story: a second pool arrives on a port, and the clients
+        // already connected to the first one have to keep working.
+        let (app, state) = app();
+        let (status, body) = post(&app, "/api/v1/pools", pool_payload()).await;
+        assert_eq!(status, StatusCode::CREATED, "body: {body}");
+        assert_eq!(body["aliases"], json!([]));
+
+        let (status, body) = patch(&app, "/api/v1/pools/app_main", json!({ "aliases": ["appdb", "legacy"] })).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(state.store.load().pools["app_main"].aliases, ["appdb", "legacy"]);
+
+        // Absent leaves them alone; an empty list clears them.
+        patch(&app, "/api/v1/pools/app_main", json!({ "max_size": 4 })).await;
+        assert_eq!(state.store.load().pools["app_main"].aliases, ["appdb", "legacy"]);
+
+        patch(&app, "/api/v1/pools/app_main", json!({ "aliases": [] })).await;
+        assert!(state.store.load().pools["app_main"].aliases.is_empty());
     }
 
     #[tokio::test]
@@ -1308,6 +1443,88 @@ mod tests {
         assert_eq!(body["sessions"][0]["pool"], "app_main");
         assert_eq!(body["sessions"][0]["application"], "orders-api");
         assert_eq!(body["sessions"][0]["client_addr"], "10.0.0.1:5000");
+    }
+
+    #[tokio::test]
+    async fn one_session_can_be_ended_by_id() {
+        let (app, state) = app();
+        let sessions = state.registries.sessions;
+        let mine = sessions.register("svc", "app_main", None, "10.0.0.1:5000", 0).unwrap();
+        let theirs = sessions.register("other", "app_main", None, "10.0.0.2:5000", 0).unwrap();
+
+        let (status, body) = post(&app, &format!("/api/v1/sessions/{}/kick", mine.id()), json!({})).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["kicked"], true);
+        assert!(mine.signal().is_kicked());
+        assert!(!theirs.signal().is_kicked(), "one id must end exactly one session");
+
+        let (status, _) = post(&app, "/api/v1/sessions/9999/kick", json!({})).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "an id nobody holds must not report success");
+    }
+
+    #[tokio::test]
+    async fn a_running_query_can_be_cancelled_from_the_dashboard() {
+        let (app, state) = app();
+        let traces = state.registries.traces.clone();
+        let hook = havuz_control::testing::FakeCancel::new();
+
+        let mut span = traces.begin(&trace_context(), "select pg_sleep(600)");
+        span.arm_cancel(hook.clone());
+        span.assign("primary/127.0.0.1:5432", Some(42));
+
+        let listed = traces.active();
+        assert!(listed[0].cancellable, "the dashboard has to know the button will do something");
+        let id = listed[0].id;
+
+        let (status, body) = post(&app, &format!("/api/v1/traces/{id}/cancel"), json!({})).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["delivered"], true);
+        assert_eq!(hook.calls(), 1);
+
+        // The session is untouched: cancelling a query is not a disconnect.
+        assert_eq!(state.registries.sessions.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_cancellation_that_could_not_be_delivered_says_so() {
+        let (app, state) = app();
+        let traces = state.registries.traces.clone();
+
+        let mut span = traces.begin(&trace_context(), "select pg_sleep(600)");
+        span.arm_cancel(havuz_control::testing::FakeCancel::failing("backend is unreachable"));
+        span.assign("primary/127.0.0.1:5432", Some(42));
+        let id = traces.active()[0].id;
+
+        let (status, body) = post(&app, &format!("/api/v1/traces/{id}/cancel"), json!({})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "an unreachable backend is not a broken pooler");
+        assert!(body["error"]["message"].as_str().unwrap().contains("backend is unreachable"), "got {body}");
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_query_that_already_finished_is_a_404() {
+        // An operator reads a screen that is up to a second old. A late press
+        // must not be redirected at whoever is using that backend now.
+        let (app, state) = app();
+        let traces = state.registries.traces.clone();
+
+        let mut span = traces.begin(&trace_context(), "select 1");
+        span.arm_cancel(havuz_control::testing::FakeCancel::new());
+        span.assign("primary/127.0.0.1:5432", Some(42));
+        let id = traces.active()[0].id;
+        span.succeed();
+
+        let (status, _) = post(&app, &format!("/api/v1/traces/{id}/cancel"), json!({})).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    fn trace_context() -> havuz_control::TraceContext {
+        havuz_control::TraceContext {
+            pool: "app_main".into(),
+            user: "svc".into(),
+            application: Some("orders-api".into()),
+            client_addr: "10.0.0.1:5000".into(),
+            level: Default::default(),
+        }
     }
 
     #[tokio::test]

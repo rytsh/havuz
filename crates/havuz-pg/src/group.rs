@@ -227,6 +227,7 @@ mod tests {
             backend_user: "app".into(),
             database: "appdb".into(),
             listen_port: 6432,
+            aliases: Vec::new(),
             limits: PoolLimits { max_size: 3, ..PoolLimits::default() },
             settings: Default::default(),
             routing: RoutingConfig { read_write_split: split, ..RoutingConfig::default() },

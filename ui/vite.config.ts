@@ -8,6 +8,7 @@ const ADMIN = process.env.HAVUZ_ADMIN_URL ?? "http://127.0.0.1:7432";
 
 export default defineConfig({
   plugins: [tailwindcss(), svelte()],
+  publicDir: "../assets",
   build: {
     outDir: "dist",
     emptyOutDir: true,

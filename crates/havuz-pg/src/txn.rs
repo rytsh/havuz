@@ -37,6 +37,7 @@ use havuz_proto::{BackendConn, FlowEvent, PinReason, ProtoError, ProtoResult, Se
 use tokio::io::AsyncWriteExt;
 
 use crate::backend::PgConnector;
+use crate::cancel::CancelScope;
 use crate::classify::{classify, route_intent, ClientIntent, RouteIntent};
 use crate::group::PoolGroup;
 use crate::params::{self, ClientParams, SetAction};
@@ -75,6 +76,12 @@ pub struct SessionPolicy {
     pub read_only: bool,
     /// Resolves when an operator ends this session.
     pub kick: KickSignal,
+    /// This session's slot in the cancellation registry, retargeted as it
+    /// borrows and returns backends.
+    ///
+    /// `None` outside a served session — the relay is testable without one, and
+    /// a session with no slot simply cannot be cancelled.
+    pub cancel: Option<CancelScope>,
 }
 
 /// Relay a client session in transaction mode.
@@ -214,6 +221,13 @@ async fn transaction_relay_inner(
         if trace_span.is_none() {
             if let (Some(sql), Some((traces, context))) = (trace_sql(&msg, &statements), tracing) {
                 let mut span = traces.begin(context, sql);
+                // Armed with the session's slot rather than a fixed target, so
+                // an operator pressing cancel hits whatever backend the client
+                // holds at that instant — and nothing at all once the query is
+                // over and the span has gone.
+                if let Some(scope) = policy.cancel.clone() {
+                    span.arm_cancel(std::sync::Arc::new(scope));
+                }
                 if let Some(checkout) = held.as_ref() {
                     span.assign(group.target_label(current_route), checkout.backend_pid());
                 }
@@ -288,6 +302,7 @@ async fn transaction_relay_inner(
                     }
 
                     held = Some(checkout);
+                    retarget_cancel(policy.cancel.as_ref(), held.as_ref());
                 }
                 Err(e) => {
                     group.router().record_result(current_route, false);
@@ -369,6 +384,7 @@ async fn transaction_relay_inner(
         if let Err(e) = checkout.stream_mut().write_all(&outgoing.encode()).await {
             checkout.discard();
             held = None;
+            retarget_cancel(policy.cancel.as_ref(), None);
             group.router().record_result(current_route, false);
 
             // A write that never left our side of a dead replica connection is
@@ -428,6 +444,7 @@ async fn transaction_relay_inner(
                 // installs a replacement or returns.
                 held = None;
                 let _ = &held;
+                retarget_cancel(policy.cancel.as_ref(), None);
 
                 // A replica that died is not the client's problem. Nothing has
                 // been written back yet, so the exchange can be replayed on the
@@ -456,6 +473,11 @@ async fn transaction_relay_inner(
                     if let Some(span) = trace_span.as_mut() {
                         span.assign(group.target_label(current_route), checkout.backend_pid());
                     }
+                    // The replay runs on this backend even though `held` will
+                    // not be set until it succeeds, and it is a replay of the
+                    // statement the client is still waiting on — so it has to
+                    // stay cancellable throughout.
+                    retarget_cancel(policy.cancel.as_ref(), Some(&checkout));
 
                     // The replay lands on a different backend, so it needs the
                     // client's parameters just as much as the original did.
@@ -534,6 +556,7 @@ async fn transaction_relay_inner(
                                 state.released();
                                 held = None;
                             }
+                            retarget_cancel(policy.cancel.as_ref(), held.as_ref());
                             continue;
                         }
                         Err(e) => {
@@ -560,7 +583,10 @@ async fn transaction_relay_inner(
             state.released();
             held = None;
         }
+        retarget_cancel(policy.cancel.as_ref(), held.as_ref());
     }
+
+    retarget_cancel(policy.cancel.as_ref(), None);
 
     // Return the backend, cleaning it only if it was pinned. An unpinned
     // connection is clean by construction.
@@ -723,6 +749,20 @@ fn update_holder(
         holder.idle_in_transaction(target, checkout.backend_pid());
     } else {
         holder.clear();
+    }
+}
+
+/// Point this session's cancellation key at the backend it is holding.
+///
+/// Called after every change to `held`, and that is the whole contract: a key
+/// that lagged behind would let a `Ctrl-C` land on a backend this client had
+/// already given back, cancelling a query belonging to whoever borrowed it
+/// next. Passing `None` is not a failure — it is the normal state of a
+/// transaction-mode client between statements, and it means a cancellation
+/// arriving now correctly does nothing.
+fn retarget_cancel(scope: Option<&CancelScope>, held: Option<&Checkout<PgConnector>>) {
+    if let Some(scope) = scope {
+        scope.retarget(held.and_then(|checkout| checkout.cancel_target()));
     }
 }
 
@@ -937,6 +977,7 @@ mod tests {
     use crate::backend::BackendConfig;
     use crate::group::PoolGroup;
     use bytes::Bytes;
+    use havuz_control::CancelHook;
     use havuz_core::{PoolLimits, SslMode};
     use havuz_proto::PoolMode;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1106,6 +1147,7 @@ mod tests {
             backend_user: "app".into(),
             database: "appdb".into(),
             listen_port: 6432,
+            aliases: Vec::new(),
             limits: PoolLimits { max_size, queue_timeout: Duration::from_secs(5), ..PoolLimits::default() },
             settings: Default::default(),
             routing: RoutingConfig {
@@ -1489,8 +1531,11 @@ mod tests {
         let server = FakeServer::start().await;
         let pool = server.pool(2);
 
-        let (mut client, relay) =
-            open_policy_session(pool.clone(), SessionPolicy { read_only: true, kick: KickSignal::never() }).await;
+        let (mut client, relay) = open_policy_session(
+            pool.clone(),
+            SessionPolicy { read_only: true, kick: KickSignal::never(), cancel: None },
+        )
+        .await;
 
         exchange(&mut client, "SELECT 1").await;
         drop(client);
@@ -1510,8 +1555,11 @@ mod tests {
         let server = FakeServer::start().await;
         let pool = server.pool(2);
 
-        let (mut client, relay) =
-            open_policy_session(pool.clone(), SessionPolicy { read_only: true, kick: KickSignal::never() }).await;
+        let (mut client, relay) = open_policy_session(
+            pool.clone(),
+            SessionPolicy { read_only: true, kick: KickSignal::never(), cancel: None },
+        )
+        .await;
 
         for escape in [
             "SET default_transaction_read_only = off",
@@ -1545,7 +1593,8 @@ mod tests {
         let session = registry.register("svc_orders", "app_main", None, "127.0.0.1:5000", 0).unwrap();
 
         let (mut client, relay) =
-            open_policy_session(pool.clone(), SessionPolicy { read_only: false, kick: session.signal() }).await;
+            open_policy_session(pool.clone(), SessionPolicy { read_only: false, kick: session.signal(), cancel: None })
+                .await;
 
         // Establish that the session is working before ending it.
         assert_eq!(exchange(&mut client, "SELECT 1").await, vec![b'C', b'Z']);
@@ -1577,7 +1626,8 @@ mod tests {
         let session = registry.register("svc_orders", "app_main", None, "127.0.0.1:5000", 0).unwrap();
 
         let (mut client, relay) =
-            open_policy_session(pool.clone(), SessionPolicy { read_only: false, kick: session.signal() }).await;
+            open_policy_session(pool.clone(), SessionPolicy { read_only: false, kick: session.signal(), cancel: None })
+                .await;
         exchange(&mut client, "SELECT 1").await;
 
         registry.kick_user("svc_orders");
@@ -1607,7 +1657,8 @@ mod tests {
         registry.kick_user("svc_orders");
 
         let (mut client, relay) =
-            open_policy_session(pool.clone(), SessionPolicy { read_only: false, kick: session.signal() }).await;
+            open_policy_session(pool.clone(), SessionPolicy { read_only: false, kick: session.signal(), cancel: None })
+                .await;
 
         let goodbye = tokio::time::timeout(Duration::from_secs(2), Message::read(&mut client))
             .await
@@ -1626,7 +1677,8 @@ mod tests {
         let _theirs = registry.register("svc_reports", "app_main", None, "b", 0).unwrap();
 
         let (mut client, relay) =
-            open_policy_session(pool.clone(), SessionPolicy { read_only: false, kick: mine.signal() }).await;
+            open_policy_session(pool.clone(), SessionPolicy { read_only: false, kick: mine.signal(), cancel: None })
+                .await;
 
         // Kicking a different user must leave this session alone.
         assert_eq!(registry.kick_user("svc_reports"), 1);
@@ -1636,6 +1688,66 @@ mod tests {
         drop(client);
         let outcome = relay.await.unwrap().unwrap();
         assert_eq!(outcome.exchanges, 2);
+    }
+
+    // --- cancellation ---
+
+    #[tokio::test]
+    async fn the_cancel_key_points_at_the_backend_the_client_is_actually_holding() {
+        // The transaction-mode hazard in one test. A key fixed at startup would
+        // still name a backend after the client gave it back, so `Ctrl-C` a
+        // second later would cancel whatever the next client was running on it.
+        let server = FakeServer::start().await;
+        let pool = server.pool(2);
+        let registry = Arc::new(crate::cancel::CancelRegistry::new());
+        let scope = registry.scope();
+
+        let (mut client, relay) = open_policy_session(
+            pool.clone(),
+            SessionPolicy { read_only: false, kick: KickSignal::never(), cancel: Some(scope.clone()) },
+        )
+        .await;
+
+        assert_eq!(exchange(&mut client, "SELECT 1").await, vec![b'C', b'Z']);
+        assert_eq!(scope.target(), None, "a client between statements holds no backend to cancel");
+
+        assert_eq!(exchange(&mut client, "BEGIN").await, vec![b'C', b'Z']);
+        let target = scope.target().expect("an open transaction keeps the backend");
+        assert_eq!(target.host, server.addr.ip().to_string(), "the backend's own address, not the pool's name");
+        assert_eq!(target.port, server.addr.port(), "and its real port, not zero");
+        assert_eq!(target.backend_pid, 4242, "the backend's key pair, as the server reported it");
+        assert_eq!(target.backend_secret, 7);
+
+        assert_eq!(exchange(&mut client, "COMMIT").await, vec![b'C', b'Z']);
+        assert_eq!(scope.target(), None, "committing gives the backend back and the key must follow");
+
+        drop(client);
+        relay.await.unwrap().unwrap();
+        assert_eq!(scope.target(), None, "and a finished session cancels nothing at all");
+    }
+
+    #[tokio::test]
+    async fn a_cancellation_for_an_idle_client_is_dropped_rather_than_delivered() {
+        // Doing nothing is the whole point: the alternative is dialling a
+        // backend that has moved on.
+        let server = FakeServer::start().await;
+        let pool = server.pool(1);
+        let registry = Arc::new(crate::cancel::CancelRegistry::new());
+        let scope = registry.scope();
+
+        let (mut client, relay) = open_policy_session(
+            pool.clone(),
+            SessionPolicy { read_only: false, kick: KickSignal::never(), cancel: Some(scope.clone()) },
+        )
+        .await;
+        exchange(&mut client, "SELECT 1").await;
+
+        let opened_before = server.opened();
+        assert!(scope.cancel().await.is_err(), "there is nothing to cancel");
+        assert_eq!(server.opened(), opened_before, "and nothing was dialled to find that out");
+
+        drop(client);
+        relay.await.unwrap().unwrap();
     }
 
     #[tokio::test]

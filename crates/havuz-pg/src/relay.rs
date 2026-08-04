@@ -17,8 +17,10 @@
 use std::collections::{HashMap, VecDeque};
 use std::io;
 
+use std::sync::Arc;
+
 use bytes::{Buf, Bytes, BytesMut};
-use havuz_control::{KickSignal, TraceContext, TraceSpan, TraceStore};
+use havuz_control::{CancelHook, KickSignal, TraceContext, TraceSpan, TraceStore};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::protocol::Message;
@@ -52,19 +54,21 @@ pub async fn session_relay(client: &mut MaybeTls, backend: &mut MaybeTls) -> io:
     session_relay_inner(client, backend, None, KickSignal::never()).await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn session_relay_traced(
     client: &mut MaybeTls,
     backend: &mut MaybeTls,
-    traces: &std::sync::Arc<TraceStore>,
+    traces: &Arc<TraceStore>,
     context: &TraceContext,
     target: String,
     backend_pid: Option<u32>,
     kick: KickSignal,
+    cancel: Option<Arc<dyn CancelHook>>,
 ) -> io::Result<RelayStats> {
     session_relay_inner(
         client,
         backend,
-        Some(SessionTrace::new(traces.clone(), context.clone(), target, backend_pid)),
+        Some(SessionTrace::new(traces.clone(), context.clone(), target, backend_pid, cancel)),
         kick,
     )
     .await
@@ -155,10 +159,14 @@ async fn session_relay_inner(
 }
 
 struct SessionTrace {
-    store: std::sync::Arc<TraceStore>,
+    store: Arc<TraceStore>,
     context: TraceContext,
     target: String,
     backend_pid: Option<u32>,
+    /// Fixed for the whole session: in session mode the client owns one backend
+    /// from startup to disconnect, so every statement it runs is cancellable
+    /// against the same one.
+    cancel: Option<Arc<dyn CancelHook>>,
     client_frames: FrameObserver,
     backend_frames: FrameObserver,
     pending: VecDeque<TraceSpan>,
@@ -167,12 +175,19 @@ struct SessionTrace {
 }
 
 impl SessionTrace {
-    fn new(store: std::sync::Arc<TraceStore>, context: TraceContext, target: String, backend_pid: Option<u32>) -> Self {
+    fn new(
+        store: Arc<TraceStore>,
+        context: TraceContext,
+        target: String,
+        backend_pid: Option<u32>,
+        cancel: Option<Arc<dyn CancelHook>>,
+    ) -> Self {
         Self {
             store,
             context,
             target,
             backend_pid,
+            cancel,
             client_frames: FrameObserver::default(),
             backend_frames: FrameObserver::default(),
             pending: VecDeque::new(),
@@ -236,6 +251,9 @@ impl SessionTrace {
     fn start(&mut self, sql: String) {
         let mut span = self.store.begin(&self.context, sql);
         span.assign(self.target.clone(), self.backend_pid);
+        if let Some(cancel) = self.cancel.clone() {
+            span.arm_cancel(cancel);
+        }
         self.pending.push_back(span);
     }
 }

@@ -22,7 +22,46 @@ use havuz_proto::{PoolRoute, Probe, ProtoError, ProtoResult, ProtocolFamily, Ser
 use havuz_registry::FamilyDescriptor;
 use tokio::net::TcpStream;
 
-use crate::{ControlPlane, ReplicaReport, ReplicaRouting, RoutingReport, TargetPool, TargetReport};
+use crate::{CancelHook, ControlPlane, ReplicaReport, ReplicaRouting, RoutingReport, TargetPool, TargetReport};
+
+/// A cancellation that reaches nothing and counts how often it was asked to.
+///
+/// Same reason as [`FakeFamily`]: proving that the admin API cancels the right
+/// query must not require a real PostgreSQL — or even a wire codec — on the
+/// other end of it.
+#[derive(Debug, Default)]
+pub struct FakeCancel {
+    calls: std::sync::atomic::AtomicUsize,
+    /// What to report back. `None` means the cancellation was delivered.
+    failure: Option<String>,
+}
+
+impl FakeCancel {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// A cancellation that cannot be delivered — an unreachable backend, or a
+    /// client that gave its backend back a moment ago.
+    pub fn failing(detail: impl Into<String>) -> Arc<Self> {
+        Arc::new(Self { calls: Default::default(), failure: Some(detail.into()) })
+    }
+
+    pub fn calls(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+#[async_trait]
+impl CancelHook for FakeCancel {
+    async fn cancel(&self) -> Result<(), String> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        match &self.failure {
+            Some(detail) => Err(detail.clone()),
+            None => Ok(()),
+        }
+    }
+}
 
 /// A family that keeps a pool list and nothing else.
 pub struct FakeFamily {
@@ -168,6 +207,7 @@ mod tests {
             backend_user: "app".into(),
             database: "appdb".into(),
             listen_port: 6432,
+            aliases: Vec::new(),
             limits: PoolLimits::default(),
             settings: Default::default(),
             routing: Default::default(),

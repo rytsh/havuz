@@ -42,8 +42,8 @@ pub use report::{
 };
 pub use sessions::{KickSignal, LiveSession, SessionHandle, SessionRegistry, TooManySessions};
 pub use trace::{
-    ActiveTrace, QueryResult, ResultSet, TraceContext, TraceDetail, TraceError, TraceFilter, TraceSpan, TraceStore,
-    TraceSummary, MAX_RESULT_BYTES, MAX_RESULT_ROWS, RETENTION_DAYS,
+    ActiveTrace, CancelHook, QueryResult, ResultSet, TraceContext, TraceDetail, TraceError, TraceFilter, TraceSpan,
+    TraceStore, TraceSummary, MAX_RESULT_BYTES, MAX_RESULT_ROWS, RETENTION_DAYS,
 };
 
 /// The observability every family shares.

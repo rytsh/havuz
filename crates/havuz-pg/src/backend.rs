@@ -18,6 +18,7 @@ use rustls_pki_types::ServerName;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+use crate::cancel::CancelTarget;
 use crate::prepared::BackendStatements;
 use crate::protocol::{Message, StartupPacket, TransactionStatus};
 use crate::scram::ScramClient;
@@ -45,6 +46,13 @@ pub struct BackendConfig {
 pub struct PgBackend {
     stream: MaybeTls,
     opened_at: Instant,
+    /// Where this connection was opened. Carried on the connection rather than
+    /// looked up from configuration at cancellation time: a `CancelRequest`
+    /// must reach the server that is actually running the query, and the pool's
+    /// configuration may have been edited since — or the checkout may have come
+    /// from a replica while the pool now points somewhere else.
+    host: String,
+    port: u16,
     backend_pid: Option<u32>,
     secret_key: Option<i32>,
     /// `ParameterStatus` values the backend reported during startup. Replayed
@@ -104,6 +112,21 @@ impl PgBackend {
 
     pub fn secret_key(&self) -> Option<i32> {
         self.secret_key
+    }
+
+    /// Where a `CancelRequest` for this connection has to be sent.
+    ///
+    /// `None` when the server never sent a `BackendKeyData` — some proxies and
+    /// PostgreSQL-compatible engines do not. Cancellation is impossible then,
+    /// and saying so beats sending a key pair of zeroes to a server that would
+    /// either ignore it or, worse, match it against something.
+    pub fn cancel_target(&self) -> Option<CancelTarget> {
+        Some(CancelTarget {
+            host: self.host.clone(),
+            port: self.port,
+            backend_pid: self.backend_pid? as i32,
+            backend_secret: self.secret_key?,
+        })
     }
 
     pub fn is_encrypted(&self) -> bool {
@@ -487,6 +510,8 @@ impl BackendConnector for PgConnector {
         Ok(PgBackend {
             stream,
             opened_at: Instant::now(),
+            host: self.config.host.clone(),
+            port: self.config.port,
             backend_pid: startup.backend_pid,
             secret_key: startup.secret_key,
             parameters: startup.parameters,

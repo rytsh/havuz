@@ -1,17 +1,20 @@
 @import "tailwindcss";
 
 :root {
-  --canvas: #090d14;
-  --panel: #111722;
-  --panel-raised: #18202d;
-  --line: #273244;
-  --ink: #edf2f7;
-  --muted: #8995a7;
-  --accent: #5eead4;
-  --accent-strong: #2dd4bf;
-  --positive: #6ee7b7;
-  --warning: #fbbf24;
-  --negative: #fb7185;
+  --canvas: #252422;
+  --panel: #302e2a;
+  --panel-raised: #403d39;
+  --line: #57524b;
+  --ink: #f1faee;
+  --muted: #aaa59d;
+  --accent: #06d6a0;
+  --accent-strong: #05b98b;
+  --accent-contrast: #073b4c;
+  --info: #118ab2;
+  --positive: #06d6a0;
+  --warning: #ffd166;
+  --negative: #ef476f;
+  color-scheme: dark;
 }
 
 @theme inline {
@@ -23,6 +26,7 @@
   --color-muted: var(--muted);
   --color-accent: var(--accent);
   --color-accent-strong: var(--accent-strong);
+  --color-info: var(--info);
   --color-positive: var(--positive);
   --color-warning: var(--warning);
   --color-negative: var(--negative);
@@ -30,20 +34,21 @@
   --font-mono: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
 }
 
-@media (prefers-color-scheme: light) {
-  :root {
-    --canvas: #f2f5f5;
-    --panel: #ffffff;
-    --panel-raised: #e8eeee;
-    --line: #ced8d9;
-    --ink: #172124;
-    --muted: #657376;
-    --accent: #0f766e;
-    --accent-strong: #0d9488;
-    --positive: #047857;
-    --warning: #a16207;
-    --negative: #be123c;
-  }
+:root[data-theme="light"] {
+  --canvas: #f1faee;
+  --panel: #ffffff;
+  --panel-raised: #e4eee8;
+  --line: #c7d5cd;
+  --ink: #252422;
+  --muted: #6c6862;
+  --accent: #087b61;
+  --accent-strong: #066e57;
+  --accent-contrast: #f1faee;
+  --info: #0d7092;
+  --positive: #087b61;
+  --warning: #8a5a00;
+  --negative: #c62f52;
+  color-scheme: light;
 }
 
 @layer base {
@@ -100,11 +105,31 @@
   }
 
   .brand {
-    @apply flex items-center gap-3 px-2 pb-3 text-base font-semibold lg:pb-8;
+    @apply flex items-center justify-between gap-3 px-2 pb-3 text-base font-semibold lg:pb-8;
+  }
+
+  .brand-identity {
+    @apply flex items-center gap-3;
   }
 
   .brand-mark {
-    @apply grid size-9 shrink-0 place-items-center rounded-md bg-accent font-mono text-sm font-bold text-canvas;
+    @apply grid size-9 shrink-0 place-items-center rounded-md bg-info;
+  }
+
+  .brand-mark span {
+    @apply size-5;
+    background: #ffffff;
+    mask: url("/favicon.svg") center / contain no-repeat;
+  }
+
+  .theme-toggle {
+    @apply inline-flex cursor-pointer items-center gap-1.5 rounded-md border border-line bg-panel-raised px-2 py-1.5 text-[11px] font-medium text-muted transition-colors hover:border-accent/60 hover:text-ink;
+  }
+
+  .theme-toggle svg {
+    @apply size-3.5 fill-none stroke-current stroke-[1.8];
+    stroke-linecap: round;
+    stroke-linejoin: round;
   }
 
   .nav {
@@ -239,6 +264,12 @@
     @apply border-negative/40 bg-negative/10 text-negative;
   }
 
+  /* Neither a warning nor a failure: the outcome of an action the operator just
+     took, including "it finished before you pressed the button". */
+  .notice {
+    @apply mb-3 rounded-lg border border-accent/40 bg-accent/5 px-4 py-3 text-[13px] text-ink;
+  }
+
   button.action,
   a.action {
     @apply inline-flex cursor-pointer items-center justify-center whitespace-nowrap rounded-md border border-line bg-panel-raised px-3 py-1.5 text-xs font-medium text-ink transition hover:border-accent/70 hover:text-accent disabled:cursor-not-allowed disabled:opacity-40;
@@ -246,12 +277,18 @@
 
   button.action.primary,
   a.action.primary {
-    @apply border-accent-strong bg-accent-strong text-canvas hover:border-accent hover:bg-accent hover:text-canvas;
+    @apply border-accent-strong bg-accent-strong hover:border-accent hover:bg-accent;
+    color: var(--accent-contrast);
   }
 
   button.action.danger:hover,
   a.action.danger:hover {
     @apply border-negative text-negative;
+  }
+
+  button.action.small,
+  a.action.small {
+    @apply px-2 py-1 text-[11px];
   }
 
   .field {
@@ -368,11 +405,11 @@
   }
 
   .database-type-card {
-    @apply relative flex min-h-28 cursor-not-allowed flex-col items-center justify-center gap-2 rounded-lg border border-line bg-canvas/20 p-4 text-center text-ink opacity-45 transition;
+    @apply relative flex min-h-32 cursor-not-allowed flex-col items-center justify-center gap-3 overflow-hidden rounded-lg border border-line bg-canvas/20 p-4 text-center text-ink opacity-45 transition;
   }
 
   .database-type-card.available {
-    @apply cursor-pointer opacity-100 hover:border-accent hover:bg-panel-raised;
+    @apply cursor-pointer opacity-100 hover:-translate-y-0.5 hover:border-accent/70 hover:bg-panel-raised hover:shadow-[0_10px_28px_-18px_var(--ink)];
   }
 
   .database-catalog.list .database-type-card {
@@ -380,12 +417,20 @@
   }
 
   .database-mark {
-    @apply flex size-10 shrink-0 items-center justify-center rounded-md border border-line bg-panel-raised;
+    @apply flex size-12 shrink-0 items-center justify-center;
+  }
+
+  .database-mark.large {
+    @apply size-14;
   }
 
   .database-mark svg {
-    @apply size-5;
+    @apply size-7;
     fill: var(--brand, var(--accent));
+  }
+
+  .database-mark.large svg {
+    @apply size-8;
   }
 
   .database-card-copy {

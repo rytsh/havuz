@@ -12,6 +12,11 @@
 #   one pool on :6432      postgresql://svc_orders:***@havuz:6432/anything
 #   two pools on :6432     postgresql://svc_orders:***@havuz:6432/app_main
 #
+# The name a client writes there does not have to be the pool's. A pool may
+# declare aliases, which is how two pools over one database — a read-write one
+# and a reporting one — can share a port and still be reached under the names
+# their clients already use.
+#
 # Start with:  HAVUZ_MASTER_KEY=$(havuz keygen) havuz run --config havuz.toml
 
 [server]

@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use async_trait::async_trait;
 use havuz_core::TraceLevel;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -46,6 +47,20 @@ pub struct TraceContext {
     pub level: TraceLevel,
 }
 
+/// How one protocol interrupts a query it is running.
+///
+/// Lives here rather than in a family because the thing an operator points at
+/// is a running query, and running queries are what this module tracks. What
+/// arrives on the wire — a PostgreSQL `CancelRequest` on a second connection,
+/// something else entirely for another family — is the family's business.
+///
+/// Best effort by nature. PostgreSQL never confirms a cancellation, so `Ok`
+/// means "asked", not "stopped".
+#[async_trait]
+pub trait CancelHook: Send + Sync + std::fmt::Debug {
+    async fn cancel(&self) -> Result<(), String>;
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ActiveTrace {
     pub id: u64,
@@ -59,6 +74,11 @@ pub struct ActiveTrace {
     pub phase: String,
     pub target: Option<String>,
     pub backend_pid: Option<u32>,
+    /// Whether an operator can interrupt this query. False while it is still
+    /// queueing for a backend — there is nothing to interrupt yet — and false
+    /// for a family that cannot cancel at all, so the dashboard can offer the
+    /// button only where pressing it would do something.
+    pub cancellable: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -122,6 +142,9 @@ pub struct ResultSet {
 struct ActiveEntry {
     public: ActiveTrace,
     started: Instant,
+    /// Dropped with the entry when the query completes, so a cancellation can
+    /// never outlive the query it was aimed at.
+    cancel: Option<Arc<dyn CancelHook>>,
 }
 
 struct CompletedTrace {
@@ -239,8 +262,9 @@ impl TraceStore {
             phase: "waiting".into(),
             target: None,
             backend_pid: None,
+            cancellable: false,
         };
-        self.active.write().expect("trace registry poisoned").insert(id, ActiveEntry { public, started });
+        self.active.write().expect("trace registry poisoned").insert(id, ActiveEntry { public, started, cancel: None });
         TraceSpan {
             store: self.clone(),
             id,
@@ -406,7 +430,26 @@ impl TraceStore {
             entry.public.phase = "running".into();
             entry.public.target = Some(target);
             entry.public.backend_pid = backend_pid;
+            entry.public.cancellable = entry.cancel.is_some();
         }
+    }
+
+    fn arm_cancel(&self, id: u64, hook: Arc<dyn CancelHook>) {
+        if let Some(entry) = self.active.write().expect("trace registry poisoned").get_mut(&id) {
+            entry.public.cancellable = entry.public.phase == "running";
+            entry.cancel = Some(hook);
+        }
+    }
+
+    /// How to interrupt a query that is running right now.
+    ///
+    /// Returns the hook rather than doing the cancelling, because delivering it
+    /// means opening a socket and this lock must not be held across an await.
+    /// `None` covers every way the answer is "nothing to do": an id that never
+    /// existed, a query that finished while the operator was reading the screen,
+    /// or a family with no way to cancel.
+    pub fn cancel_hook(&self, id: u64) -> Option<Arc<dyn CancelHook>> {
+        self.active.read().expect("trace registry poisoned").get(&id)?.cancel.clone()
     }
 
     fn complete(&self, span: &mut TraceSpan, status: &str, error: Option<(String, String)>) {
@@ -463,6 +506,18 @@ impl TraceSpan {
     pub fn assign(&mut self, target: impl Into<String>, backend_pid: Option<u32>) {
         self.wait_us = self.started.elapsed().as_micros() as u64;
         self.store.assign(self.id, target.into(), backend_pid);
+    }
+
+    /// Declare this query interruptible, and how.
+    ///
+    /// The hook is dropped with the active entry when the query completes, so
+    /// an operator can never cancel a query that has already finished — and, in
+    /// transaction mode, can never reach a backend the client has given back.
+    pub fn arm_cancel(&mut self, hook: Arc<dyn CancelHook>) {
+        if self.finished {
+            return;
+        }
+        self.store.arm_cancel(self.id, hook);
     }
 
     /// Start a new result set. The family supplies already-decoded column
@@ -710,6 +765,62 @@ mod tests {
         let detail = store.get(summary.id).unwrap().unwrap();
         assert_eq!(detail.result.sets[0].columns, ["answer"]);
         assert_eq!(detail.result.sets[0].rows[0], [Some("42".into())]);
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingHook {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl CancelHook for RecordingHook {
+        async fn cancel(&self) -> Result<(), String> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn an_armed_query_can_be_cancelled_while_it_runs() {
+        let store = TraceStore::memory();
+        let hook = Arc::new(RecordingHook::default());
+
+        let mut span = store.begin(&context(), "select pg_sleep(600)");
+        span.arm_cancel(hook.clone());
+        assert!(!store.active()[0].cancellable, "nothing to cancel while it queues for a backend");
+
+        span.assign("primary/127.0.0.1:5432", Some(42));
+        assert!(store.active()[0].cancellable, "a query on a backend is interruptible");
+
+        store.cancel_hook(store.active()[0].id).expect("armed").cancel().await.expect("delivered");
+        assert_eq!(hook.calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn a_finished_query_stops_being_cancellable() {
+        // Otherwise an operator reading a one-second-old screen could press
+        // cancel on a query that already returned — and in transaction mode the
+        // backend it ran on may belong to somebody else by then.
+        let store = TraceStore::memory();
+        let mut span = store.begin(&context(), "select 1");
+        span.arm_cancel(Arc::new(RecordingHook::default()));
+        span.assign("primary/127.0.0.1:5432", Some(42));
+        let id = store.active()[0].id;
+
+        span.succeed();
+        assert!(store.cancel_hook(id).is_none(), "a completed query must not remain cancellable");
+    }
+
+    #[test]
+    fn a_query_nobody_can_cancel_says_so() {
+        // A family with no cancellation of its own, or a pool whose backend
+        // never sent a key pair. The dashboard needs to know not to offer the
+        // button rather than offering one that always fails.
+        let store = TraceStore::memory();
+        let mut span = store.begin(&context(), "select 1");
+        span.assign("primary/127.0.0.1:5432", Some(42));
+        assert!(!store.active()[0].cancellable);
+        assert!(store.cancel_hook(store.active()[0].id).is_none());
     }
 
     #[test]

@@ -239,16 +239,26 @@ impl<A: Authenticator> ClientHandshake<A> {
             Some(only) => only.to_string(),
             None => {
                 let asked = packet.database().map_err(|e| ProtoError::protocol(e.to_string()))?;
-                if !route.contains(asked) {
-                    // Not "database does not exist": the pool may well exist,
-                    // just on another port, and saying so sends an operator
-                    // looking in the right place.
-                    let text =
-                        format!("no pool named \"{asked}\" on this port; available here: {}", route.names().join(", "));
-                    let _ = Message::fatal(sqlstate::UNDEFINED_DATABASE, &text).write(&mut stream).await;
-                    return Err(ProtoError::NoRoute(asked.to_string()));
+                match route.resolve(asked) {
+                    // The name the client sent and the pool it reached are not
+                    // necessarily the same string: an alias exists so that a
+                    // connection string can keep naming the database while the
+                    // pool is called something an operator chose.
+                    Some(pool) => pool.to_string(),
+                    None => {
+                        // Not "database does not exist": the pool may well
+                        // exist, just on another port, and saying so sends an
+                        // operator looking in the right place. Aliases are
+                        // listed too, or a refusal reads as if the alias had
+                        // never been applied.
+                        let text = format!(
+                            "no pool named \"{asked}\" on this port; available here: {}",
+                            route.reachable().join(", ")
+                        );
+                        let _ = Message::fatal(sqlstate::UNDEFINED_DATABASE, &text).write(&mut stream).await;
+                        return Err(ProtoError::NoRoute(asked.to_string()));
+                    }
                 }
-                asked.to_string()
             }
         };
         let application_name = packet.application_name().map(str::to_string);
@@ -614,6 +624,54 @@ mod tests {
         let err = client.await.unwrap().unwrap_err();
         assert!(err.contains("3D000"), "got: {err}");
         assert!(err.contains("nope"));
+    }
+
+    /// The same shared port, but `app_main` also answers to `orders`.
+    async fn spawn_aliased_server() -> (SocketAddr, tokio::task::JoinHandle<ProtoResult<(MaybeTls, HandshakeOutcome)>>)
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handshake = ClientHandshake::new(TestAuth::new());
+        let route = PoolRoute::with_aliases(
+            vec!["app_main".to_string(), "other".to_string()],
+            vec![("orders".to_string(), "app_main".to_string())],
+        );
+
+        let handle = tokio::spawn(async move {
+            let (socket, peer) = listener.accept().await.unwrap();
+            handshake.run_for_pool(socket, peer, &route).await
+        });
+        (addr, handle)
+    }
+
+    #[tokio::test]
+    async fn a_client_naming_an_alias_lands_on_the_pool_behind_it() {
+        // What the client writes and what the pool is called are allowed to
+        // differ; everything downstream sees the pool.
+        let (addr, server) = spawn_aliased_server().await;
+        let client = tokio::spawn(async move { client_connect(addr, "svc_orders", "orders", "hunter2").await });
+
+        let (_, outcome) = server.await.unwrap().expect("the alias must resolve");
+        client.await.unwrap().expect("client should reach AuthenticationOk");
+
+        let HandshakeOutcome::Established { identity, .. } = outcome else {
+            panic!("expected an established session");
+        };
+        assert_eq!(identity.pool, "app_main", "authorisation and pooling both key on the pool, not the alias");
+    }
+
+    #[tokio::test]
+    async fn a_refusal_lists_the_aliases_too() {
+        // Otherwise the message reads as if the alias had never been applied,
+        // and an operator goes looking for a bug that is not there.
+        let (addr, server) = spawn_aliased_server().await;
+        let client = tokio::spawn(async move { client_connect(addr, "svc_orders", "payroll", "hunter2").await });
+
+        assert!(server.await.unwrap().is_err());
+        let err = client.await.unwrap().unwrap_err();
+        assert!(err.contains("3D000"), "got: {err}");
+        assert!(err.contains("orders"), "the alias belongs in the list of what is reachable: {err}");
+        assert!(err.contains("app_main"), "and so does the pool it points at: {err}");
     }
 
     #[tokio::test]

@@ -20,7 +20,8 @@ PostgreSQL, with pin analysis on top.
 | PostgreSQL wire protocol v3 | working |
 | SCRAM-SHA-256, client and backend side | working, verified against RFC 7677 vectors |
 | TLS, all five `sslmode` levels | working |
-| Query cancellation with remapped keys | working |
+| Query cancellation with remapped keys | working, retargeted per checkout |
+| Operator-initiated query cancellation from the dashboard | working |
 | Session-mode pooling | working |
 | Transaction-mode pooling | working |
 | Pin analysis | working |
@@ -58,10 +59,11 @@ the number that measures havuz itself.
 ## Quick start
 
 ```sh
+(cd ui && pnpm install && pnpm build)
 cargo build --release
 export HAVUZ_MASTER_KEY=$(./target/release/havuz keygen)
 cp havuz.example.toml havuz.toml
-./target/release/havuz run
+HAVUZ_UI_DIR=ui/dist ./target/release/havuz run
 ```
 
 Open <http://127.0.0.1:7432>, add a database, create a user, then connect:
@@ -83,6 +85,22 @@ Pools may share a port, and that is what the database name is for:
 |---|---|
 | one | ignored — the connection string may omit it entirely |
 | several | picks between them; an unknown name is refused with the list of what is there |
+
+A pool name is an operator's label, not a copy of the database name. A pool may
+declare **aliases** — extra names clients are allowed to put in the database
+field — which is what keeps the two apart:
+
+```
+pool orders_rw   database=orders   aliases=[orders]      # dbname=orders
+pool orders_ro   database=orders   aliases=[orders_bi]   # dbname=orders_bi
+```
+
+Both sit on one port, over one database, with different pooling modes. Without
+aliases only one of them could be called `orders`, and the other would be
+unreachable under the name its clients already write. Aliases and pool names
+share one namespace per port, because a client sends one string and must reach
+one pool; a collision is refused before it is stored rather than resolved by
+guessing.
 
 Every pool on a port must belong to the same family, because the listener has
 to decide which handshake to run before it has read a byte. The admin port is

@@ -49,6 +49,10 @@ struct Bound {
     route: Arc<RwLock<Arc<PoolRoute>>>,
     /// What this socket is currently bound for, for logging and diffing.
     pools: Vec<String>,
+    /// Diffed alongside `pools`: an alias is routing, so adding one has to
+    /// reach the live socket exactly as adding a pool does. Comparing only the
+    /// pool list would make a new alias need a restart.
+    aliases: Vec<(String, String)>,
     accept: JoinHandle<()>,
 }
 
@@ -102,10 +106,17 @@ impl Pooler {
         for (port, plan) in desired {
             // A live socket only needs its pool list refreshed.
             if let Some(bound) = self.bound.get_mut(&port) {
-                if bound.pools != plan.pools {
-                    *bound.route.write().expect("route poisoned") = Arc::new(PoolRoute::new(plan.pools.clone()));
-                    tracing::info!(port, pools = ?plan.pools, "client listener now serves a different pool set");
+                if bound.pools != plan.pools || bound.aliases != plan.aliases {
+                    *bound.route.write().expect("route poisoned") =
+                        Arc::new(PoolRoute::with_aliases(plan.pools.clone(), plan.aliases.clone()));
+                    tracing::info!(
+                        port,
+                        pools = ?plan.pools,
+                        aliases = ?plan.aliases,
+                        "client listener now serves a different pool set"
+                    );
                     bound.pools = plan.pools;
+                    bound.aliases = plan.aliases;
                 }
                 continue;
             }
@@ -125,8 +136,17 @@ impl Pooler {
             let addr = SocketAddr::new(self.bind, port);
             match bind(addr) {
                 Ok(listener) => {
-                    let route = Arc::new(RwLock::new(Arc::new(PoolRoute::new(plan.pools.clone()))));
-                    tracing::info!(%addr, pools = ?plan.pools, family = %plan.family, "client listener ready");
+                    let route = Arc::new(RwLock::new(Arc::new(PoolRoute::with_aliases(
+                        plan.pools.clone(),
+                        plan.aliases.clone(),
+                    ))));
+                    tracing::info!(
+                        %addr,
+                        pools = ?plan.pools,
+                        aliases = ?plan.aliases,
+                        family = %plan.family,
+                        "client listener ready"
+                    );
                     let accept = tokio::spawn(accept_loop(
                         listener,
                         addr,
@@ -135,7 +155,10 @@ impl Pooler {
                         self.gate.clone(),
                         self.shutdown.clone(),
                     ));
-                    self.bound.insert(port, Bound { family: plan.family, route, pools: plan.pools, accept });
+                    self.bound.insert(
+                        port,
+                        Bound { family: plan.family, route, pools: plan.pools, aliases: plan.aliases, accept },
+                    );
                 }
                 // Not fatal: the operator can fix the port in the dashboard and
                 // the next reconcile picks it up. Killing the process would
@@ -256,6 +279,7 @@ mod tests {
             backend_user: "app".into(),
             database: "appdb".into(),
             listen_port: port,
+            aliases: Vec::new(),
             limits: PoolLimits::default(),
             settings: Default::default(),
             routing: Default::default(),
@@ -350,6 +374,27 @@ mod tests {
             .unwrap();
         pooler.reconcile();
         assert_eq!(pooler.bound[&port].pools, ["orders", "reports"]);
+    }
+
+    #[tokio::test]
+    async fn adding_an_alias_reaches_the_live_socket_without_a_restart() {
+        // An alias is routing, so it has to travel the same path a new pool
+        // does. Diffing only the pool list would leave the socket answering to
+        // the old set until the process was restarted — and the operator would
+        // have no way to tell from the dashboard, which shows the stored state.
+        let port = free_port().await;
+        let store = Arc::new(StateStore::ephemeral(state_with(&[("orders_rw", port)])));
+        let mut pooler = pooler(store.clone(), None, Shutdown::new());
+        pooler.reconcile();
+        assert!(pooler.bound[&port].aliases.is_empty());
+
+        store.update(|state| state.pools.get_mut("orders_rw").unwrap().aliases = vec!["orders".into()]).await.unwrap();
+        pooler.reconcile();
+
+        assert_eq!(pooler.bound[&port].aliases, [("orders".to_string(), "orders_rw".to_string())]);
+        let route = pooler.bound[&port].route.read().unwrap().clone();
+        assert_eq!(route.resolve("orders"), Some("orders_rw"), "the socket routes on the new alias immediately");
+        assert!(TcpStream::connect(("127.0.0.1", port)).await.is_ok(), "and the port never closed");
     }
 
     #[tokio::test]

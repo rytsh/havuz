@@ -17,6 +17,7 @@ ui/dist/
 .env
 .env.*
 !.env.example
+havuz.toml
 
 .DS_Store
 

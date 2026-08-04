@@ -1,7 +1,8 @@
 <script lang="ts">
   import { push } from "svelte-spa-router";
   import { iconFor } from "../lib/icons";
-  import { api } from "../lib/api";
+  import DatabaseMark from "../components/DatabaseMark.svelte";
+  import { api, parseAliases } from "../lib/api";
   import type {
     BackendAuth,
     DriverProfile,
@@ -23,6 +24,7 @@
   let settings = $state<Record<string, unknown>>({});
 
   let name = $state("");
+  let aliasText = $state("");
   let mode = $state<PoolMode>("session");
   let maxSize = $state(10);
   let maxClients = $state(100);
@@ -149,6 +151,7 @@
       profile: profileId || undefined,
       mode,
       listen_port: listenPort,
+      aliases: parseAliases(aliasText),
       backend_auth: backendAuth,
       trace: traceLevel,
       limits: { max_size: maxSize, max_client_connections: maxClients },
@@ -209,9 +212,7 @@
             disabled={!item.family.usable || item.profile.maturity === "planned"}
             onclick={() => pick(item.family, item.profile)}
           >
-            <span class="database-mark" style={`--brand:#${icon.hex}`}>
-              <svg viewBox="0 0 24 24" role="img" aria-label={icon.title}><path d={icon.path}></path></svg>
-            </span>
+            <DatabaseMark {icon} />
             <span class="database-card-copy">
               <strong>{item.profile.label}</strong>
               <small>{item.family.usable ? `${item.profile.maturity} driver` : "Coming soon"}</small>
@@ -232,9 +233,7 @@
       <div class="selected-database-title">
         {#if selectedProfile}
           {@const icon = iconFor(selectedProfile.id, selected.id)}
-          <span class="database-mark" style={`--brand:#${icon.hex}`}>
-            <svg viewBox="0 0 24 24" role="img" aria-label={icon.title}><path d={icon.path}></path></svg>
-          </span>
+          <DatabaseMark {icon} large />
         {/if}
         <h1>{selectedProfile?.label ?? selected.label}</h1>
       </div>
@@ -251,15 +250,27 @@
 
     <div class="field">
       <label for="pool-name">Pool name</label>
-      <div class="help">Clients connect to this as if it were the database name.</div>
-      <input id="pool-name" bind:value={name} required placeholder="app_main" />
+      <div class="help">
+        Your name for this pool. It does not have to match the database name — that is what the field below is for.
+      </div>
+      <input id="pool-name" bind:value={name} required placeholder="orders_rw" />
+    </div>
+
+    <div class="field">
+      <label for="pool-aliases">Also reachable as <span class="muted font-normal">(optional)</span></label>
+      <div class="help">
+        Extra names clients may put in the database field, separated by commas. Use this to keep existing connection
+        strings working — a pool named <code>orders_rw</code> that also answers to <code>orders</code> — and to put two
+        pools over the same database on one port. Only takes effect once a second pool shares the port.
+      </div>
+      <input id="pool-aliases" bind:value={aliasText} placeholder="orders, orders_prod" />
     </div>
 
     <div class="field">
       <label for="listen-port">Client port</label>
       <div class="help">
         The port clients connect to for this pool. Pools may share a port, in which case clients pick between them by
-        pool name; a port with a single pool ignores the database name entirely.
+        pool name or alias; a port with a single pool ignores the database name entirely.
       </div>
       <input id="listen-port" type="number" min="1" max="65535" bind:value={listenPort} required placeholder="6432" />
     </div>

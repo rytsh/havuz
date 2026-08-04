@@ -11,6 +11,9 @@
   let loadingDetail = $state(false);
   let clearing = $state(false);
   let copied = $state<string | null>(null);
+  /** Trace ids whose cancellation is in flight, so the button cannot be pressed twice. */
+  let cancelling = $state<number[]>([]);
+  let cancelNote = $state<string | null>(null);
 
   let search = $state("");
   let pool = $state("");
@@ -149,6 +152,30 @@
   function exportResultJson() {
     if (!detail) return;
     download(`havuz-trace-${detail.id}.json`, JSON.stringify(detail, null, 2), "application/json");
+  }
+
+  /**
+   * Interrupt one running query.
+   *
+   * Deliberately not a confirmation dialog: a runaway query is an incident, the
+   * blast radius is one statement, and the client survives to see the error.
+   * Cancelling something that already finished is a 404 rather than a hit on
+   * whoever is using that backend now, so a late press is harmless.
+   */
+  async function cancelQuery(trace: ActiveTrace) {
+    if (cancelling.includes(trace.id)) return;
+    cancelling = [...cancelling, trace.id];
+    cancelNote = null;
+    try {
+      await api.cancelTrace(trace.id);
+      cancelNote = `Cancellation sent for query ${trace.id}. Postgres does not confirm one, so watch the list.`;
+      await refresh();
+    } catch (cause) {
+      // Almost always "it finished first", which is not an error worth a red banner.
+      cancelNote = cause instanceof Error ? cause.message : String(cause);
+    } finally {
+      cancelling = cancelling.filter((id) => id !== trace.id);
+    }
   }
 
   async function clearHistory() {
@@ -328,6 +355,8 @@
   <span class="live-count">{visibleActive.length}</span>
 </div>
 
+{#if cancelNote}<div class="notice">{cancelNote}</div>{/if}
+
 {#if visibleActive.length === 0}
   <div class="trace-empty">No query is running right now.</div>
 {:else}
@@ -336,7 +365,19 @@
       <article class="active-trace">
         <div class="active-trace-top">
           <span class="badge" class:warn={trace.phase === "waiting"} class:ok={trace.phase === "running"}>{trace.phase}</span>
-          <span class="trace-clock">{elapsed(trace)}</span>
+          <div class="row">
+            <span class="trace-clock">{elapsed(trace)}</span>
+            <button
+              class="action danger small"
+              disabled={!trace.cancellable || cancelling.includes(trace.id)}
+              title={trace.cancellable
+                ? "Ask the database to stop this query. The client stays connected and sees a cancellation error."
+                : "Not running on a backend yet — there is nothing to cancel."}
+              onclick={() => cancelQuery(trace)}
+            >
+              {cancelling.includes(trace.id) ? "Cancelling…" : "Cancel query"}
+            </button>
+          </div>
         </div>
         <pre>{trace.sql}</pre>
         <div class="trace-meta">

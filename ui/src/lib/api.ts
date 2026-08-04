@@ -71,6 +71,14 @@ export const api = {
   pins: () => request<PinReport>("/api/v1/pins"),
   traces: (params: URLSearchParams) => request<TraceResponse>(`/api/v1/traces?${params}`),
   trace: (id: number) => request<TraceDetail>(`/api/v1/traces/${id}`),
+  /**
+   * Ask the database to stop a query that is running right now.
+   *
+   * The session stays connected — this is the operator's `Ctrl-C`, not a
+   * disconnect. Postgres never confirms a cancellation, so a resolved promise
+   * means the request was delivered, not that the query has stopped.
+   */
+  cancelTrace: (id: number) => request<{ trace: number; delivered: boolean }>(`/api/v1/traces/${id}/cancel`, { method: "POST" }),
   clearTraces: () => request<{ deleted: number }>("/api/v1/traces", { method: "DELETE" }),
   poolTargets: (name: string) => request<GroupSnapshot>(`/api/v1/pools/${encodeURIComponent(name)}/targets`),
   poolIdentities: (name: string) =>
@@ -100,7 +108,21 @@ export const api = {
   kickUser: (name: string) =>
     request<{ user: string; kicked: number }>(`/api/v1/users/${encodeURIComponent(name)}/kick`, { method: "POST" }),
   sessions: () => request<{ sessions: LiveSession[] }>("/api/v1/sessions").then((r) => r.sessions),
+  kickSession: (id: number) =>
+    request<{ session: number; kicked: boolean }>(`/api/v1/sessions/${id}/kick`, { method: "POST" }),
 };
+
+/**
+ * Split an operator's alias list into names.
+ *
+ * Commas and whitespace both separate, because a list typed by hand arrives
+ * either way, and duplicates are dropped here rather than being sent to the
+ * server only to come back as a validation error about something the operator
+ * did not mean to say twice.
+ */
+export function parseAliases(value: string): string[] {
+  return [...new Set(value.split(/[,\s]+/).filter(Boolean))];
+}
 
 /** Human-readable fan-in, e.g. `33.3x`. */
 export function formatFanIn(value: number | null | undefined): string {

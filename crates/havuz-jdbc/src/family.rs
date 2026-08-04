@@ -349,6 +349,7 @@ mod tests {
             backend_user: "app".into(),
             database: String::new(),
             listen_port: 6543,
+            aliases: Vec::new(),
             limits: PoolLimits::default(),
             settings,
             routing: Default::default(),

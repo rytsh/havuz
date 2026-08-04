@@ -67,6 +67,13 @@ export interface Pool {
   trace: TraceLevel;
   /** The port clients reach this pool on. Pools may share one. */
   listen_port: number;
+  /**
+   * Extra names clients may put in their database field to reach this pool.
+   *
+   * Only meaningful once a second pool shares the port: with one pool the
+   * database field is ignored entirely.
+   */
+  aliases: string[];
   /** Whether a password is stored. The password itself is never served. */
   has_backend_password: boolean;
   targets: Target[];
@@ -314,6 +321,8 @@ export interface ActiveTrace {
   phase: "waiting" | "running";
   target: string | null;
   backend_pid: number | null;
+  /** Whether this query can be interrupted right now. False while it is still queueing for a backend. */
+  cancellable: boolean;
 }
 
 export interface TraceSummary {

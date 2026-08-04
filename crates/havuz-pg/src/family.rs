@@ -21,15 +21,13 @@ use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
 
 use crate::backend::{BackendConfig, PgConnector};
-use crate::cancel::{CancelKey, CancelRegistry, CancelTarget};
+use crate::cancel::{CancelKey, CancelRegistry, CANCEL_TIMEOUT};
 use crate::group::PoolGroup;
 use crate::protocol::{sqlstate, Message};
 use crate::scram::ScramVerifier;
 use crate::session::{
     complete_startup, AuthDenial, Authenticator, BackendCredential, ClientAuth, ClientHandshake, HandshakeOutcome,
 };
-
-const CANCEL_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// The registry id this family serves. Pools configured for anything else are
 /// not ours, and are skipped rather than mishandled.
@@ -607,12 +605,11 @@ impl ProtocolFamily for PgFamily {
             }
         };
 
-        let cancel_key = self.cancels.register(CancelTarget {
-            host: group.name().to_string(),
-            port: 0,
-            backend_pid: checkout.backend_pid().unwrap_or(0) as i32,
-            backend_secret: checkout.secret_key().unwrap_or(0),
-        });
+        // Issued pointing at nothing. Which backend this client can cancel
+        // changes as it borrows and returns them, and in transaction mode it is
+        // usually none: the startup checkout below is handed straight back.
+        let cancel = self.cancels.scope();
+        let cancel_key = cancel.key();
 
         complete_startup(&mut client, checkout.parameters(), cancel_key.process_id, cancel_key.secret_key).await?;
 
@@ -629,7 +626,7 @@ impl ProtocolFamily for PgFamily {
             params.enforce_read_only();
         }
 
-        let policy = crate::txn::SessionPolicy { read_only, kick: session.signal() };
+        let policy = crate::txn::SessionPolicy { read_only, kick: session.signal(), cancel: Some(cancel.clone()) };
 
         let outcome = if mode.multiplexes() {
             // Transaction mode: the startup checkout has done its job (the
@@ -651,7 +648,6 @@ impl ProtocolFamily for PgFamily {
                 &holder,
             )
             .await;
-            self.cancels.unregister(cancel_key);
 
             match result {
                 Ok(txn) => ServeOutcome {
@@ -693,6 +689,11 @@ impl ProtocolFamily for PgFamily {
             let target =
                 group.target_label(crate::routing::Route::Primary(crate::routing::PrimaryReason::SplitDisabled));
             holder.session_reserved(target.clone(), backend_pid);
+
+            // This client owns one backend for its whole life, so unlike
+            // transaction mode the mapping is written once and never moves.
+            cancel.retarget(checkout.cancel_target());
+
             let relay = crate::relay::session_relay_traced(
                 &mut client,
                 checkout.stream_mut(),
@@ -701,9 +702,9 @@ impl ProtocolFamily for PgFamily {
                 target,
                 backend_pid,
                 session.signal(),
+                Some(Arc::new(cancel.clone())),
             )
             .await;
-            self.cancels.unregister(cancel_key);
 
             let (to_backend, to_client) = match relay {
                 Ok(stats) => {
@@ -871,6 +872,7 @@ mod tests {
             backend_user: "app".into(),
             database: "appdb".into(),
             listen_port: 6432,
+            aliases: Vec::new(),
             limits: PoolLimits::default(),
             settings: Default::default(),
             routing: Default::default(),

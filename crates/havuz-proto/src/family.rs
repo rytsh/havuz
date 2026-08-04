@@ -19,21 +19,34 @@ use crate::flow::PinReason;
 /// * One pool on the port — the client's database field is not routing
 ///   information at all, and is ignored. This is what lets a connection string
 ///   omit the database entirely.
-/// * Several pools — the client names one. A name that is not on this listener
-///   is refused with the list of names that are, rather than with "database
-///   does not exist", which sends an operator looking in the wrong place.
+/// * Several pools — the client names one, by the pool's name or by an alias
+///   the pool declared. A name that is not on this listener is refused with the
+///   list of names that are, rather than with "database does not exist", which
+///   sends an operator looking in the wrong place.
+///
+/// Aliases are why the two names are not the same thing. A pool called
+/// `orders_rw` may answer to `orders`, so the pool's name stays an operator's
+/// label and the client's database field stays whatever the client already
+/// writes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PoolRoute {
     pools: Arc<[String]>,
+    /// `(alias, pool)`. Empty in the common case, which is why the lookup is a
+    /// scan: a listener carries a handful of pools, not a directory.
+    aliases: Arc<[(String, String)]>,
 }
 
 impl PoolRoute {
     /// Panics if `pools` is empty: a listener with no pools should have been
     /// closed rather than bound.
     pub fn new(pools: impl Into<Arc<[String]>>) -> Self {
+        Self::with_aliases(pools, Vec::new())
+    }
+
+    pub fn with_aliases(pools: impl Into<Arc<[String]>>, aliases: impl Into<Arc<[(String, String)]>>) -> Self {
         let pools = pools.into();
         assert!(!pools.is_empty(), "a listener must serve at least one pool");
-        Self { pools }
+        Self { pools, aliases: aliases.into() }
     }
 
     /// The pool a client reaches without naming one, if there is no ambiguity.
@@ -44,13 +57,31 @@ impl PoolRoute {
         }
     }
 
-    pub fn contains(&self, pool: &str) -> bool {
-        self.pools.iter().any(|candidate| candidate == pool)
+    /// The pool a client reaches by putting `asked` in its database field.
+    ///
+    /// Pool names are matched before aliases, so an alias can never shadow a
+    /// real pool — configuration that tried to is refused before it is stored.
+    pub fn resolve(&self, asked: &str) -> Option<&str> {
+        if let Some(pool) = self.pools.iter().find(|candidate| candidate.as_str() == asked) {
+            return Some(pool);
+        }
+        self.aliases.iter().find(|(alias, _)| alias == asked).map(|(_, pool)| pool.as_str())
     }
 
-    /// For the error message a client sees when it names the wrong pool.
+    /// The pools on this listener, whatever names they also answer to.
     pub fn names(&self) -> &[String] {
         &self.pools
+    }
+
+    /// Everything a client may legally put in its database field here.
+    ///
+    /// For the error message: an operator who configured an alias needs to see
+    /// it listed, or the refusal reads like the alias was never applied.
+    pub fn reachable(&self) -> Vec<&str> {
+        let mut out: Vec<&str> =
+            self.pools.iter().map(String::as_str).chain(self.aliases.iter().map(|(alias, _)| alias.as_str())).collect();
+        out.sort_unstable();
+        out
     }
 }
 
@@ -144,16 +175,46 @@ mod tests {
     fn a_listener_with_one_pool_needs_no_database_name() {
         let route = PoolRoute::new(vec!["app_main".to_string()]);
         assert_eq!(route.sole(), Some("app_main"));
-        assert!(route.contains("app_main"));
+        assert_eq!(route.resolve("app_main"), Some("app_main"));
     }
 
     #[test]
     fn a_shared_listener_refuses_to_guess() {
         let route = PoolRoute::new(vec!["orders".to_string(), "reports".to_string()]);
         assert_eq!(route.sole(), None, "picking one would silently connect the client to the wrong database");
-        assert!(route.contains("reports"));
-        assert!(!route.contains("payroll"));
+        assert_eq!(route.resolve("reports"), Some("reports"));
+        assert_eq!(route.resolve("payroll"), None);
         assert_eq!(route.names(), ["orders", "reports"]);
+    }
+
+    #[test]
+    fn an_alias_reaches_a_pool_that_is_not_named_after_it() {
+        // The whole point: two pools over one database, both reachable under
+        // names their clients already write.
+        let route = PoolRoute::with_aliases(
+            vec!["orders_ro".to_string(), "orders_rw".to_string()],
+            vec![("orders".to_string(), "orders_rw".to_string()), ("orders_bi".to_string(), "orders_ro".to_string())],
+        );
+
+        assert_eq!(route.resolve("orders"), Some("orders_rw"));
+        assert_eq!(route.resolve("orders_bi"), Some("orders_ro"));
+        assert_eq!(route.resolve("orders_rw"), Some("orders_rw"), "a pool still answers to its own name");
+        assert_eq!(route.resolve("payroll"), None);
+
+        assert_eq!(route.names(), ["orders_ro", "orders_rw"], "aliases are not pools");
+        assert_eq!(route.reachable(), ["orders", "orders_bi", "orders_ro", "orders_rw"]);
+    }
+
+    #[test]
+    fn a_pool_name_wins_over_an_alias_that_shadows_it() {
+        // `State::validate` refuses this configuration, so it should be
+        // unreachable. If one ever gets through, the pool an operator can see
+        // in the dashboard is the one clients get.
+        let route = PoolRoute::with_aliases(
+            vec!["orders".to_string(), "reports".to_string()],
+            vec![("orders".to_string(), "reports".to_string())],
+        );
+        assert_eq!(route.resolve("orders"), Some("orders"));
     }
 
     #[test]
