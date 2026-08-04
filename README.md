@@ -32,6 +32,7 @@ PostgreSQL, with pin analysis on top.
 | Per-pool client ports, rebound without a restart | working |
 | Client-facing TLS | working |
 | Per-user backend authentication | working |
+| Passthrough authentication: no havuz user, no stored backend credential | working |
 | Multi-family plumbing: registry-driven, `dyn` all the way to the socket | working, one family shipped |
 | JDBC bridge (Oracle, DB2, Informix, …) | working, experimental |
 | MySQL, Redis | not yet, visible in the UI as planned |
@@ -279,6 +280,63 @@ That last part is the migration path. Flipping a pool to `per_user` changes
 nothing until each user is switched over individually on the **Users** page, so
 you can move one application at a time and watch what it costs.
 
+#### Passthrough: no havuz user, no stored backend credential
+
+`per_user` still needs a havuz user for everyone who connects — the verifier is
+what refuses a wrong password locally, and the grant list, `disabled` and
+`read_only` all hang off that same record. `backend_auth = passthrough` keeps
+every one of those rules and adds the case they cannot cover: **a client havuz
+has never heard of**.
+
+There is nothing local to check such a client against, so havuz asks the only
+thing that can answer. It opens one backend connection with the credentials the
+client just supplied, and sends `AuthenticationOk` only if that worked. The
+result is a pool with no service account, no per-user configuration and no
+backend password stored anywhere — every identity is the client's own, proved
+by the database.
+
+```toml
+# not a config file; this is set per pool from the dashboard or the API
+backend_auth = "passthrough"
+```
+
+Four things are true of this and none of them are negotiable.
+
+**Configured users come first.** A name that *is* in havuz's user list takes the
+same path it always did: its stored verifier, its pool grants, its `disabled`
+and `read_only` flags, checked before anything reaches the database. Passthrough
+is reached only after that lookup misses. Turning it on therefore takes nothing
+away, and a pool can carry both kinds of client at once.
+
+**Only the first attempt reaches PostgreSQL.** Once the database has vouched for
+an identity, havuz derives a verifier from the password — with its own salt, so
+what it holds is not usable against the database — and keeps it **in memory
+only**. From the second connection on, that identity is refused locally exactly
+like a configured user. The record is not in the state file, not sealed under
+the master key, and not restored on restart; it is dropped by the same idle
+sweeper that reclaims the identity's connections and its password, so a rotated
+credential stops working rather than living on in a cache.
+
+**A failure is refused at the handshake, not at the first query.** The probe
+runs before `AuthenticationOk`, so a bad password is an ordinary `28000` at the
+point every client and driver expects one. A database that is *unreachable* is
+reported separately, as `57P03` — saying "authentication failed" when the
+database is merely down sends people to rotate credentials that work.
+
+**The first attempt is a real database login attempt.** This is the cost, and it
+does not go away. Anyone who can reach the port can cause one, under havuz's
+source address rather than their own, which means `pg_hba` host rules and your
+database's own view of where a login came from are both out of the picture for
+that attempt. There is no rate limit and no ceiling on distinct identities yet.
+The mode raises a warning on the dashboard for as long as it is on, and that
+warning is not a misconfiguration notice — it is the deal.
+
+Everything else follows from `per_user` unchanged: `min_idle` must be `0`,
+`max_size` is a per-user budget, client-facing TLS is required unless
+`allow_password_without_tls` is set, and `read_write_split` needs a service
+account to probe with. The JDBC bridge refuses the setting for the same reason
+it refuses `per_user`.
+
 The service account is nevertheless *optional* on such a pool: leave the backend
 user and password blank and the pool has no shared identity at all. Every client
 then connects as itself or not at all, which is the point of the mode taken to
@@ -481,6 +539,7 @@ docker compose -f tests/e2e/docker-compose.yml up -d
 ./tests/e2e/run.sh                  # pooling, prepared statements, pin detection
 
 ./tests/e2e/per-user.sh             # per-user backend roles, over real TLS
+./tests/e2e/passthrough.sh          # roles havuz was never told about
 ./tests/e2e/jdbc.sh                 # the JDBC bridge, compared against native
 
 ./tests/e2e/replica-setup.sh up     # a real streaming standby via pg_basebackup
@@ -496,6 +555,15 @@ reaches the database, an unencrypted client is refused — and accepted once the
 pool is told to allow it, and refused again the moment that is withdrawn —
 pooling still happens within each user, and the flat pool list stays one row and
 one metric series however many identities are live.
+
+`passthrough.sh` creates a PostgreSQL role and then never tells havuz about it,
+which is the only claim *that* mode makes. It checks the things that make it
+survivable rather than merely convenient: a wrong password is refused at the
+handshake, a second wrong password is refused locally without a further database
+login, a configured havuz user keeps its own password and its `disabled` flag
+and does not fall through to this path, nothing about a vouched-for identity
+reaches `state.json`, and everything still works after a restart that discards
+all of it.
 
 The replica suite builds an actual standby rather than a second independent
 database. That distinction matters: the entire risk in read/write split is

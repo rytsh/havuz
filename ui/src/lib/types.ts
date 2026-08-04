@@ -44,8 +44,15 @@ export interface PoolLimits {
   max_lifetime: string;
 }
 
-/** Whose credentials backend connections are opened with. */
-export type BackendAuth = "shared" | "per_user";
+/**
+ * Whose credentials backend connections are opened with.
+ *
+ * `passthrough` is `per_user` plus one more case: a client havuz has no user
+ * record for is admitted if the database accepts its credentials. That is what
+ * lets a pool exist with no stored backend credential at all, and it is why
+ * such a pool carries a standing warning.
+ */
+export type BackendAuth = "shared" | "per_user" | "passthrough";
 
 /**
  * How much of a pool's traffic reaches the query trace store.
@@ -124,7 +131,8 @@ export type Warning =
   | { kind: "no_sticky_window"; pool: string }
   | { kind: "read_only_not_enforced"; pool: string; users: string[] }
   | { kind: "users_without_backend_role"; pool: string; users: string[] }
-  | { kind: "password_without_tls"; pool: string };
+  | { kind: "password_without_tls"; pool: string }
+  | { kind: "passthrough_pool"; pool: string };
 
 export interface Summary {
   uptime_seconds: number;

@@ -23,6 +23,7 @@ pub mod family;
 pub mod group;
 pub mod health;
 pub mod params;
+pub mod passthrough;
 pub mod prepared;
 pub mod protocol;
 pub mod relay;
@@ -36,9 +37,10 @@ pub mod txn;
 pub use backend::{BackendConfig, PgBackend, PgConnector};
 pub use cancel::{CancelKey, CancelRegistry, CancelTarget};
 pub use classify::{classify, route_intent, ClientIntent, RouteIntent};
-pub use family::{ClientTls, PgFamily, StateAuthenticator, FAMILY_ID};
+pub use family::{ClientTls, CredentialProber, PgFamily, StateAuthenticator, FAMILY_ID};
 pub use group::PoolGroup;
 pub use params::{ClientParams, SetAction};
+pub use passthrough::EphemeralIdentities;
 pub use prepared::{BackendStatements, ClientStatements, PreparedError, Rewrite};
 pub use protocol::{
     ErrorField, FieldDescription, Message, ProtocolError, StartupPacket, TransactionStatus, PROTOCOL_VERSION_3,
@@ -46,7 +48,9 @@ pub use protocol::{
 pub use relay::{session_relay, session_relay_traced, RelayStats};
 pub use routing::{ReplicaState, Route, Router, SessionRouting};
 pub use scram::{ScramClient, ScramError, ScramServer, ScramVerifier};
-pub use session::{complete_startup, Authenticator, BackendCredential, ClientAuth, ClientHandshake, HandshakeOutcome};
+pub use session::{
+    complete_startup, AuthDenial, Authenticator, BackendCredential, ClientAuth, ClientHandshake, HandshakeOutcome,
+};
 pub use stream::MaybeTls;
 pub use trace::PgTraceSpan;
 pub use txn::{transaction_relay, TxnOutcome};

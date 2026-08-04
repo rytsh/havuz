@@ -142,7 +142,7 @@
   function isRequired(family: Family, key: string): boolean {
     if (!(family.schema.required ?? []).includes(key)) return false;
     const role = family.schema.properties[key]?.["x-havuz-role"];
-    return !(backendAuth === "per_user" && role !== undefined && relaxedRoles.includes(role));
+    return !(backendAuth !== "shared" && role !== undefined && relaxedRoles.includes(role));
   }
 
   /**
@@ -171,7 +171,7 @@
       listen_port: listenPort,
       aliases: parseAliases(aliasText),
       backend_auth: backendAuth,
-      allow_password_without_tls: backendAuth === "per_user" && allowPasswordWithoutTls,
+      allow_password_without_tls: backendAuth !== "shared" && allowPasswordWithoutTls,
       trace: traceLevel,
       limits: { max_size: maxSize, max_client_connections: maxClients },
       settings,
@@ -360,12 +360,28 @@
         </div>
         <select id="backend-auth" bind:value={backendAuth}>
           <option value="shared">One shared service account</option>
-          <option value="per_user">Each user, with its own credentials</option>
+          <option value="per_user">Each Havuz user, with its own credentials</option>
+          <option value="passthrough">Anyone the database accepts, with no Havuz user</option>
         </select>
       </div>
     {/if}
 
-    {#if backendAuth === "per_user"}
+    {#if backendAuth === "passthrough"}
+      <div class="warning">
+        <strong>This pool will try credentials it has never seen against your database.</strong>
+        <div>
+          That is what removes the need to store a backend credential anywhere. A client Havuz has no user record for is
+          admitted by opening one database connection with the password it supplied — so a first attempt from anyone who
+          can reach this port reaches PostgreSQL's authentication, under Havuz's source address rather than the
+          client's. Once an identity is accepted, its verifier is held <em>in memory only</em> and later attempts are
+          refused by Havuz; the record goes when that identity's last connection does, and on restart.
+          Users you have configured keep their password, pool grants, read-only and disabled flags — those are checked
+          first and this changes nothing for them.
+        </div>
+      </div>
+    {/if}
+
+    {#if backendAuth !== "shared"}
       <div class="help notice">
         Havuz has to ask each client for its password, and by default will only do so over an encrypted connection.
         Users keep using the service account until you switch them over individually on the Users page.
@@ -404,10 +420,10 @@
 
     <div class="field">
       <label for="max-size">
-        Max backend connections {#if backendAuth === "per_user"}<span class="muted font-normal">(per user)</span>{/if}
+        Max backend connections {#if backendAuth !== "shared"}<span class="muted font-normal">(per user)</span>{/if}
       </label>
       <div class="help">
-        {#if backendAuth === "per_user"}
+        {#if backendAuth !== "shared"}
           Applied to each user separately, so the total depends on how many are connected at once. PostgreSQL's own
           <code>CONNECTION LIMIT</code> per role is the backstop; this is what gives a client a queue instead of an
           error.

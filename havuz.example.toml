@@ -37,11 +37,11 @@ max_client_connections = 1000
 # them havuz declines SSLRequest and clients fall back to plaintext, exactly as
 # they would against a Postgres built without TLS.
 #
-# Needed by pools with `backend_auth = per_user`, which ask each client for its
-# password and refuse to do so over an unencrypted socket. Such a pool can be
-# told to ask anyway — `allow_password_without_tls`, set per pool from the
-# dashboard — but the password in question opens the database directly, so the
-# pool stays flagged for as long as that is on.
+# Needed by pools with `backend_auth = per_user` or `passthrough`, which ask
+# each client for its password and refuse to do so over an unencrypted socket.
+# Such a pool can be told to ask anyway — `allow_password_without_tls`, set per
+# pool from the dashboard — but the password in question opens the database
+# directly, so the pool stays flagged for as long as that is on.
 # cert = "/etc/havuz/tls/server.crt"
 # key  = "/etc/havuz/tls/server.key"
 require_client_cert = false

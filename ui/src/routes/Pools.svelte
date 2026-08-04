@@ -94,7 +94,7 @@
     editAliases = pool.aliases.join(", ");
     editTrace = pool.trace;
     editAllowPasswordWithoutTls = pool.allow_password_without_tls;
-    editIsPerUser = pool.backend_auth === "per_user";
+    editIsPerUser = pool.backend_auth !== "shared";
   }
 
   async function saveConfiguration(event: Event) {
@@ -155,11 +155,18 @@
         <tr>
           <td>
             <strong>{pool.name}</strong>
-            {#if pool.backend_auth === "per_user"}
+            {#if pool.backend_auth !== "shared"}
               <div class="muted text-xs">{pool.database} as each connecting user</div>
               <span class="badge" title="Backend connections are opened with each client's own credentials"
                 >per-user auth</span
               >
+              {#if pool.backend_auth === "passthrough"}
+                <span
+                  class="badge warn"
+                  title="Clients havuz has no user record for are admitted if the database accepts their credentials, so a first attempt from anyone who can reach this port reaches PostgreSQL's authentication"
+                  >passthrough</span
+                >
+              {/if}
               {#if pool.allow_password_without_tls}
                 <span
                   class="badge danger"
@@ -202,7 +209,7 @@
           <td>
             {#if pool.configured_fan_in === null}
               <span class="muted" title="Session mode cannot multiplex">—</span>
-            {:else if pool.backend_auth === "per_user"}
+            {:else if pool.backend_auth !== "shared"}
               <strong>{formatFanIn(pool.configured_fan_in)}</strong>
               <div class="muted text-xs" title="Each user multiplexes over its own connections">per user</div>
             {:else}

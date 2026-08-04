@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex, RwLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -11,8 +11,8 @@ use havuz_core::state::{PoolConfig, State};
 use havuz_core::{SslMode, StateStore, TraceLevel};
 use havuz_pool::PoolSnapshot;
 use havuz_proto::{
-    BackendConn, PoolMode, PoolRoute, Probe, ProtoError, ProtoResult, ProtocolFamily, ResetOutcome, ServeOutcome,
-    SessionState,
+    BackendConn, BackendConnector, PoolMode, PoolRoute, Probe, ProtoError, ProtoResult, ProtocolFamily, ResetOutcome,
+    ServeOutcome, SessionState,
 };
 use havuz_registry::FamilyDescriptor;
 use havuz_secrets::MasterKey;
@@ -23,6 +23,7 @@ use tokio_rustls::TlsAcceptor;
 use crate::backend::{BackendConfig, PgConnector};
 use crate::cancel::{CancelKey, CancelRegistry, CANCEL_TIMEOUT};
 use crate::group::PoolGroup;
+use crate::passthrough::EphemeralIdentities;
 use crate::protocol::{sqlstate, Message};
 use crate::scram::ScramVerifier;
 use crate::session::{
@@ -50,6 +51,10 @@ pub struct PgFamily {
     cancels: Arc<CancelRegistry>,
     registries: Registries,
     handshake: ClientHandshake<StateAuthenticator>,
+    /// Identities a passthrough pool learned from the wire, shared with the
+    /// authenticator that fills it. Held here too because the idle sweeper is
+    /// what empties it.
+    identities: Arc<EphemeralIdentities>,
     /// Started the first time a per-user pool is actually used, so a
     /// conventional deployment never pays for it.
     sweeper: Mutex<Option<JoinHandle<()>>>,
@@ -164,12 +169,17 @@ impl PgFamily {
         registries: Registries,
         tls: ClientTls,
     ) -> Arc<Self> {
-        let authenticator = Arc::new(StateAuthenticator { state: state.clone(), master_key: master_key.clone() });
+        let authenticator = Arc::new(StateAuthenticator::new(state.clone(), master_key.clone()));
+        let identities = authenticator.identities().clone();
+        // Kept out of the handshake so the prober can be attached afterwards:
+        // proving a passthrough credential means opening a backend connection,
+        // which needs the family that does not exist yet.
+        let prober = authenticator.clone();
         let mut handshake = ClientHandshake::new(authenticator);
         if let Some(acceptor) = tls.acceptor {
             handshake = handshake.with_tls(acceptor, tls.require);
         }
-        Arc::new_cyclic(|me| Self {
+        let family = Arc::new_cyclic(|me| Self {
             me: me.clone(),
             state,
             master_key,
@@ -177,8 +187,18 @@ impl PgFamily {
             cancels: Arc::new(CancelRegistry::new()),
             registries,
             handshake,
+            identities,
             sweeper: Mutex::new(None),
-        })
+        });
+        // Weak, because the family owns the handshake that owns the
+        // authenticator that would otherwise own the family.
+        prober.attach_prober(Arc::new(FamilyProber { family: Arc::downgrade(&family) }));
+        family
+    }
+
+    /// Identities a passthrough pool has vouched for, for the dashboard.
+    pub fn passthrough_identities(&self) -> usize {
+        self.identities.len()
     }
 
     pub fn cancels(&self) -> &Arc<CancelRegistry> {
@@ -236,6 +256,9 @@ impl PgFamily {
             if !live {
                 tracing::info!(pool = %name, "pool removed from configuration, draining");
                 entry.drain();
+                // Whatever this pool vouched for was vouched for against a
+                // configuration that no longer exists.
+                self.identities.forget_pool(name);
             }
             live
         });
@@ -411,6 +434,17 @@ impl PgFamily {
                 }
                 keep
             });
+            let held: std::collections::HashSet<String> = groups.keys().cloned().collect();
+            drop(groups);
+
+            // A passthrough identity is vouched for only as long as it is using
+            // that vouching, or the verifier would go on admitting a password
+            // the database may since have revoked. Swept over what is *held*
+            // rather than dropped alongside each group, because an identity the
+            // database accepted may never have got a connection at all — the
+            // client can go away between the two — and nothing would ever come
+            // back for those.
+            self.identities.retain(&pool, |user| live.contains(user) || held.contains(user));
         }
     }
 }
@@ -805,14 +839,45 @@ impl ProtocolFamily for PgFamily {
 pub struct StateAuthenticator {
     state: Arc<StateStore>,
     master_key: Arc<MasterKey>,
+    /// Identities admitted by the database rather than by the user list.
+    ///
+    /// Only ever written on a `passthrough` pool, and only after the database
+    /// has accepted the credentials. Never persisted — see
+    /// [`EphemeralIdentities`].
+    identities: Arc<EphemeralIdentities>,
+    /// How to ask the database whether a password works.
+    ///
+    /// A slot rather than a constructor argument because the thing that can
+    /// open a backend connection is the family, and the family owns this. Left
+    /// empty — by the JDBC bridge, and by every test that does not care — it
+    /// means unknown identities are refused, which is the safe default and the
+    /// same answer `passthrough` gets from a family that cannot support it.
+    prober: OnceLock<Arc<dyn CredentialProber>>,
+}
+
+/// Opens one backend connection to find out whether a credential is real.
+#[async_trait]
+pub trait CredentialProber: Send + Sync + 'static {
+    async fn prove(&self, pool: &str, user: &str, password: &str) -> Result<(), AuthDenial>;
 }
 
 impl StateAuthenticator {
     pub fn new(state: Arc<StateStore>, master_key: Arc<MasterKey>) -> Self {
-        Self { state, master_key }
+        Self { state, master_key, identities: Arc::new(EphemeralIdentities::new()), prober: OnceLock::new() }
+    }
+
+    pub fn identities(&self) -> &Arc<EphemeralIdentities> {
+        &self.identities
+    }
+
+    /// Give this authenticator a way to reach the database. Called once, by the
+    /// family that owns it, as soon as that family exists.
+    pub fn attach_prober(&self, prober: Arc<dyn CredentialProber>) {
+        let _ = self.prober.set(prober);
     }
 }
 
+#[async_trait]
 impl Authenticator for StateAuthenticator {
     fn resolve(&self, user: &str, pool: &str) -> Result<ClientAuth, AuthDenial> {
         let state = self.state.load();
@@ -825,6 +890,14 @@ impl Authenticator for StateAuthenticator {
         }
 
         let Some(user_config) = state.users.get(user) else {
+            // A configured user is still a configured user on a passthrough
+            // pool; only names the user list has never heard of get here. That
+            // ordering is the whole reason this mode adds nothing to what a
+            // configured user is subject to — `disabled`, the grant list and
+            // `read_only` are all still ahead of anyone who has a record.
+            if pool_config.backend_auth.is_passthrough() {
+                return Ok(self.passthrough_auth(pool_config, pool, user));
+            }
             return Err(AuthDenial::UnknownUser);
         };
         if user_config.disabled {
@@ -849,7 +922,98 @@ impl Authenticator for StateAuthenticator {
         // keeps the SCRAM path and the service account, which is what makes the
         // migration incremental.
         let needs_plaintext = pool_config.backend_auth.is_per_user() && user_config.own_backend_role;
-        Ok(ClientAuth { verifier, needs_plaintext, allow_without_tls: pool_config.allow_password_without_tls })
+        Ok(if needs_plaintext {
+            ClientAuth::Plaintext { verifier, allow_without_tls: pool_config.allow_password_without_tls }
+        } else {
+            ClientAuth::Scram { verifier }
+        })
+    }
+
+    async fn admit(&self, user: &str, pool: &str, credential: &BackendCredential) -> Result<(), AuthDenial> {
+        // Re-read rather than trusting the caller: `resolve` and this run at
+        // different times, and a pool taken out of passthrough in between must
+        // not still admit an unknown name.
+        let state = self.state.load();
+        let passthrough = state.pools.get(pool).is_some_and(|p| p.backend_auth.is_passthrough() && !p.disabled);
+        if !passthrough {
+            return Err(AuthDenial::UnknownUser);
+        }
+
+        let Some(prober) = self.prober.get() else {
+            tracing::error!(%pool, "passthrough pool has no way to reach the database; refusing");
+            return Err(AuthDenial::UnknownUser);
+        };
+
+        prober.prove(pool, user, credential.expose()).await?;
+
+        // Only now, and only in memory. From here the identity takes the
+        // ordinary locally-checked path until the sweeper drops it.
+        self.identities.learn(pool, user, credential.expose());
+        tracing::info!(%pool, %user, "the database vouched for an identity havuz has no record of");
+        Ok(())
+    }
+}
+
+impl StateAuthenticator {
+    /// The policy for a name that reached a passthrough pool without a record.
+    ///
+    /// Everything after the first connection is ordinary: once the database has
+    /// vouched, the verifier is here and a wrong password is refused locally
+    /// exactly as it is for a configured user.
+    fn passthrough_auth(&self, pool_config: &PoolConfig, pool: &str, user: &str) -> ClientAuth {
+        let allow_without_tls = pool_config.allow_password_without_tls;
+        match self.identities.verifier(pool, user) {
+            Some(verifier) => ClientAuth::Plaintext { verifier, allow_without_tls },
+            None => ClientAuth::Unproven { allow_without_tls },
+        }
+    }
+}
+
+/// Proves a credential by opening one backend connection with it.
+///
+/// Deliberately not a pool checkout: a `PoolGroup` keyed on an unproven
+/// password would exist before anyone had established the password was real,
+/// and would have to be torn down again on failure. One connection, opened and
+/// closed, answers the only question being asked.
+struct FamilyProber {
+    family: Weak<PgFamily>,
+}
+
+#[async_trait]
+impl CredentialProber for FamilyProber {
+    async fn prove(&self, pool: &str, user: &str, password: &str) -> Result<(), AuthDenial> {
+        let Some(family) = self.family.upgrade() else {
+            return Err(AuthDenial::Unverifiable { reason: "shutting down".into() });
+        };
+
+        let state = family.state.load();
+        let Some(config) = state.pools.get(pool) else {
+            return Err(AuthDenial::UnknownPool { pool: pool.into() });
+        };
+        let Some(target) = config.primary() else {
+            return Err(AuthDenial::Unverifiable { reason: format!("pool '{pool}' has no primary target") });
+        };
+
+        let connector = family
+            .connector_for(pool, config, &state, target, BackendIdentity::User { name: user, password })
+            .map_err(|e| AuthDenial::Unverifiable { reason: e.to_string() })?;
+
+        match connector.connect().await {
+            Ok(mut backend) => {
+                backend.close().await;
+                Ok(())
+            }
+            // 28xxx from the backend. This is the answer we asked for, and the
+            // only one that means "no".
+            Err(ProtoError::Auth(reason)) => {
+                tracing::info!(%pool, %user, %reason, "the database refused an unproven identity");
+                Err(AuthDenial::UnknownUser)
+            }
+            // Everything else is havuz's problem, not the client's. Reporting
+            // it as a credential failure would send someone rotating a password
+            // that works.
+            Err(e) => Err(AuthDenial::Unverifiable { reason: e.to_string() }),
+        }
     }
 }
 
@@ -1164,7 +1328,7 @@ mod tests {
     async fn authentication_resolves_a_granted_user() {
         let key = Arc::new(MasterKey::generate());
         let state = state_with_user("hunter2", &key);
-        let auth = StateAuthenticator { state: Arc::new(StateStore::ephemeral(state)), master_key: key };
+        let auth = StateAuthenticator::new(Arc::new(StateStore::ephemeral(state)), key);
 
         assert!(auth.resolve("svc_orders", "app_main").is_ok());
     }
@@ -1184,7 +1348,7 @@ mod tests {
             .put(&key, havuz_secrets::user_verifier("blocked"), &ScramVerifier::from_password("x").encode())
             .unwrap();
 
-        let auth = StateAuthenticator { state: Arc::new(StateStore::ephemeral(state)), master_key: key };
+        let auth = StateAuthenticator::new(Arc::new(StateStore::ephemeral(state)), key);
 
         assert_eq!(auth.resolve("ghost", "app_main").unwrap_err(), AuthDenial::UnknownUser);
         assert_eq!(
@@ -1206,8 +1370,195 @@ mod tests {
         state.users.insert("svc_orders".into(), UserConfig::new(vec!["app_main".into()]));
         // No secret stored for this user.
 
-        let auth = StateAuthenticator { state: Arc::new(StateStore::ephemeral(state)), master_key: key };
+        let auth = StateAuthenticator::new(Arc::new(StateStore::ephemeral(state)), key);
         assert_eq!(auth.resolve("svc_orders", "app_main").unwrap_err(), AuthDenial::UnknownUser);
+    }
+
+    // --- passthrough ---
+
+    /// A pool that admits names the user list has never heard of.
+    fn passthrough_state(password: &str, key: &MasterKey) -> State {
+        let mut state = state_with_user(password, key);
+        let pool = state.pools.get_mut("app_main").unwrap();
+        pool.backend_auth = BackendAuth::Passthrough;
+        pool.allow_password_without_tls = true;
+        state
+    }
+
+    /// Stands in for the database, so the resolver can be tested without one.
+    struct FixedProber {
+        accepts: Option<String>,
+    }
+
+    #[async_trait]
+    impl CredentialProber for FixedProber {
+        async fn prove(&self, _pool: &str, _user: &str, password: &str) -> Result<(), AuthDenial> {
+            match &self.accepts {
+                Some(expected) if expected == password => Ok(()),
+                Some(_) => Err(AuthDenial::UnknownUser),
+                None => Err(AuthDenial::Unverifiable { reason: "connection refused".into() }),
+            }
+        }
+    }
+
+    fn passthrough_authenticator(accepts: Option<&str>, key: MasterKey) -> StateAuthenticator {
+        let key = Arc::new(key);
+        let auth = StateAuthenticator::new(Arc::new(StateStore::ephemeral(passthrough_state("hunter2", &key))), key);
+        auth.attach_prober(Arc::new(FixedProber { accepts: accepts.map(str::to_string) }));
+        auth
+    }
+
+    #[tokio::test]
+    async fn an_unconfigured_name_reaches_a_passthrough_pool_with_nothing_to_prove_it() {
+        // The state the whole mode exists to produce. On any other pool this
+        // same lookup is an outright refusal.
+        let auth = passthrough_authenticator(Some("hunter2"), MasterKey::generate());
+        assert!(matches!(auth.resolve("nobody_here", "app_main").unwrap(), ClientAuth::Unproven { .. }));
+
+        let key = Arc::new(MasterKey::generate());
+        let shared = StateAuthenticator::new(Arc::new(StateStore::ephemeral(state_with_user("hunter2", &key))), key);
+        assert_eq!(shared.resolve("nobody_here", "app_main").unwrap_err(), AuthDenial::UnknownUser);
+    }
+
+    #[tokio::test]
+    async fn a_configured_user_keeps_its_verifier_on_a_passthrough_pool() {
+        // Nothing is removed. The grant list, `disabled` and the stored
+        // verifier are all still ahead of anyone who has a record, and only
+        // names with no record take the new path.
+        let auth = passthrough_authenticator(Some("hunter2"), MasterKey::generate());
+        assert!(
+            matches!(auth.resolve("svc_orders", "app_main").unwrap(), ClientAuth::Scram { .. }),
+            "a configured user must not be handed to the database to identify"
+        );
+    }
+
+    #[tokio::test]
+    async fn admitting_an_identity_makes_the_next_attempt_a_local_one() {
+        // The first connection costs a database login; the rest do not. Without
+        // this the pool is a brute-force channel with no floor.
+        let auth = passthrough_authenticator(Some("hunter2"), MasterKey::generate());
+        auth.admit("nobody_here", "app_main", &BackendCredential::for_test("hunter2")).await.unwrap();
+
+        assert!(
+            matches!(auth.resolve("nobody_here", "app_main").unwrap(), ClientAuth::Plaintext { .. }),
+            "once vouched for, the identity takes the ordinary locally-checked path"
+        );
+        assert_eq!(auth.identities().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_credential_the_database_rejects_is_never_remembered() {
+        let auth = passthrough_authenticator(Some("hunter2"), MasterKey::generate());
+        assert_eq!(
+            auth.admit("nobody_here", "app_main", &BackendCredential::for_test("wrong")).await.unwrap_err(),
+            AuthDenial::UnknownUser
+        );
+        assert!(auth.identities().is_empty(), "remembering a refusal would admit it next time");
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_database_is_reported_as_such_and_not_as_a_refusal() {
+        // Two different facts, and conflating them sends an operator to rotate
+        // a credential that was fine all along.
+        let auth = passthrough_authenticator(None, MasterKey::generate());
+        assert_eq!(
+            auth.admit("nobody_here", "app_main", &BackendCredential::for_test("hunter2")).await.unwrap_err(),
+            AuthDenial::Unverifiable { reason: "connection refused".into() }
+        );
+        assert!(auth.identities().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_pool_taken_out_of_passthrough_stops_admitting_unknown_names() {
+        // `resolve` and `admit` run at different moments, so the second one
+        // re-reads rather than trusting a decision the first one made.
+        let key = Arc::new(MasterKey::generate());
+        let store = Arc::new(StateStore::ephemeral(passthrough_state("hunter2", &key)));
+        let auth = StateAuthenticator::new(store.clone(), key);
+        auth.attach_prober(Arc::new(FixedProber { accepts: Some("hunter2".into()) }));
+
+        store
+            .update(|s| {
+                s.pools.get_mut("app_main").unwrap().backend_auth = BackendAuth::Shared;
+                true
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            auth.admit("nobody_here", "app_main", &BackendCredential::for_test("hunter2")).await.unwrap_err(),
+            AuthDenial::UnknownUser
+        );
+    }
+
+    #[tokio::test]
+    async fn an_authenticator_with_no_prober_admits_nobody() {
+        // What the JDBC bridge gets, and what a misconfigured wiring would get.
+        // Failing closed is the only acceptable direction here.
+        let key = Arc::new(MasterKey::generate());
+        let auth = StateAuthenticator::new(Arc::new(StateStore::ephemeral(passthrough_state("hunter2", &key))), key);
+        assert_eq!(
+            auth.admit("nobody_here", "app_main", &BackendCredential::for_test("hunter2")).await.unwrap_err(),
+            AuthDenial::UnknownUser
+        );
+    }
+
+    #[tokio::test]
+    async fn an_identity_that_has_gone_gives_its_verifier_back_too() {
+        // The sweeper already reclaims the connections and the password. The
+        // verifier has to go with them, or a revoked credential keeps opening
+        // sessions for as long as the process lives.
+        let key = MasterKey::generate();
+        let state = passthrough_state("hunter2", &key);
+        let family = family_for(Arc::new(StateStore::ephemeral(state)), key);
+        family.sync_pools().unwrap();
+
+        family.identities.learn("app_main", "nobody_here", "hunter2");
+        let entry = family.entry("app_main").unwrap();
+        entry.per_user.write().unwrap().insert(
+            "nobody_here".to_string(),
+            Arc::new(UserGroup { group: entry.shared.clone(), fingerprint: credential("hunter2").fingerprint() }),
+        );
+
+        family.sweep_idle_users();
+        assert!(family.identities.is_empty(), "no session and no open connection means the vouching is spent");
+        assert_eq!(family.passthrough_identities(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_identity_vouched_for_but_never_connected_is_reclaimed_too() {
+        // The client can go away between `admit` succeeding and a connection
+        // set being built for it. Anything keyed on the disconnect would leave
+        // that verifier behind forever.
+        let key = MasterKey::generate();
+        let family = family_for(Arc::new(StateStore::ephemeral(passthrough_state("hunter2", &key))), key);
+        family.sync_pools().unwrap();
+
+        family.identities.learn("app_main", "nobody_here", "hunter2");
+        assert_eq!(family.passthrough_identities(), 1);
+
+        family.sweep_idle_users();
+        assert!(family.identities.is_empty(), "no session and no group means nothing is using this vouching");
+    }
+
+    #[tokio::test]
+    async fn a_pool_that_leaves_the_configuration_takes_its_vouching_with_it() {
+        let key = MasterKey::generate();
+        let store = Arc::new(StateStore::ephemeral(passthrough_state("hunter2", &key)));
+        let family = family_for(store.clone(), key);
+        family.sync_pools().unwrap();
+        family.identities.learn("app_main", "nobody_here", "hunter2");
+
+        store
+            .update(|s| {
+                s.pools.clear();
+                s.users.clear();
+            })
+            .await
+            .unwrap();
+        family.sync_pools().unwrap();
+
+        assert!(family.identities.is_empty(), "the configuration it was vouched against no longer exists");
     }
 
     #[tokio::test]

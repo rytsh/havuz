@@ -56,6 +56,17 @@
             `did not negotiate TLS. Anyone who can read that traffic can connect to the database directly, ` +
             `without going through havuz at all. Configure server.tls.cert and server.tls.key and turn this off.`,
         };
+      case "passthrough_pool":
+        return {
+          title: `${w.pool}: unknown clients are checked by the database, not by havuz`,
+          detail:
+            `This pool admits clients it has no user record for by opening a database connection with the ` +
+            `credentials they supplied. That is the point of the mode — nothing here stores a backend password — ` +
+            `but it also means a first attempt from anyone who can reach this pool's port reaches ` +
+            `PostgreSQL's authentication. Once an identity has been accepted its verifier is held in memory and ` +
+            `later attempts are refused by havuz. Users you have configured are unaffected: their password, pool ` +
+            `grants, read-only and disabled flags all still apply first.`,
+        };
       case "read_only_not_enforced":
         return {
           title: `${w.pool}: read-only is not enforced in session mode`,

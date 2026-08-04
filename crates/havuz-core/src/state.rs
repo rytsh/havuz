@@ -230,7 +230,10 @@ impl State {
                     max_size: pool.limits.max_size,
                 });
             }
-            if !self.users.values().any(|u| u.pools.iter().any(|p| p == name)) {
+            // A passthrough pool with no configured users is not a mistake, it
+            // is the mode working as asked. Warning about it would train
+            // operators to ignore the banner that matters.
+            if !pool.backend_auth.is_passthrough() && !self.users.values().any(|u| u.pools.iter().any(|p| p == name)) {
                 out.push(Warning::PoolWithoutUsers { pool: name.clone() });
             }
             if pool.routing.read_write_split && pool.replicas().count() == 0 {
@@ -245,6 +248,13 @@ impl State {
             // long as it is on.
             if pool.backend_auth.is_per_user() && pool.allow_password_without_tls {
                 out.push(Warning::PasswordWithoutTls { pool: name.clone() });
+            }
+            // Also asked for explicitly, and also permanent. havuz cannot
+            // refuse a password it has never seen before, so every first
+            // attempt on this pool becomes a database login attempt. That is
+            // the deal the mode offers and it should stay on the screen.
+            if pool.backend_auth.is_passthrough() {
+                out.push(Warning::PassthroughPool { pool: name.clone() });
             }
             // Per-user auth without a service account removes the fallback the
             // migration path relies on. The users left on it are refused when
@@ -341,6 +351,13 @@ pub enum Warning {
     PasswordWithoutTls {
         pool: String,
     },
+    /// A pool admits clients havuz has no user record for, by trying their
+    /// credentials against the database. Nothing local can refuse a password
+    /// that has never been seen, so a first attempt from anyone who can reach
+    /// the port reaches PostgreSQL's authentication.
+    PassthroughPool {
+        pool: String,
+    },
 }
 
 /// One client-facing socket and the pools reachable through it.
@@ -396,17 +413,50 @@ pub enum BackendAuth {
     /// leg must be encrypted, and connections cannot be opened for a user who
     /// is not currently connected.
     PerUser,
+    /// The same, with havuz's own user list out of the way.
+    ///
+    /// [`PerUser`](Self::PerUser) still requires a havuz user: the password is
+    /// checked against a stored verifier before it is forwarded, and the grant
+    /// list, `disabled` and `read_only` all hang off that record. Passthrough
+    /// keeps every one of those rules for users that *are* configured, and adds
+    /// one case they do not cover — a client havuz has never heard of. Its
+    /// password can only be checked by the database, so havuz asks the database:
+    /// it opens one connection with those credentials before admitting the
+    /// client, and remembers the answer in memory for as long as that client has
+    /// connections.
+    ///
+    /// The point is that an operator no longer has to store a backend
+    /// credential anywhere. The cost is that the pool will attempt a database
+    /// login on behalf of anyone who can reach the port, which is why
+    /// [`Warning::PassthroughPool`] is raised for as long as it is on.
+    Passthrough,
 }
 
 impl BackendAuth {
+    /// Backend connections are opened as the connecting client rather than as
+    /// the pool's service account.
+    ///
+    /// True for both client-authenticated modes. Everything that follows from
+    /// opening connections as the client — a connection set per identity, no
+    /// warm connections, no honest single `max_size` ceiling, a cleartext ask
+    /// that needs TLS — follows for passthrough exactly as it does for
+    /// [`BackendAuth::PerUser`], so those rules are written against this and
+    /// not against the variant.
     pub fn is_per_user(self) -> bool {
-        matches!(self, BackendAuth::PerUser)
+        matches!(self, BackendAuth::PerUser | BackendAuth::Passthrough)
+    }
+
+    /// Clients with no havuz user record may still be admitted, by asking the
+    /// database whether their password works.
+    pub fn is_passthrough(self) -> bool {
+        matches!(self, BackendAuth::Passthrough)
     }
 
     pub fn as_str(self) -> &'static str {
         match self {
             BackendAuth::Shared => "shared",
             BackendAuth::PerUser => "per_user",
+            BackendAuth::Passthrough => "passthrough",
         }
     }
 }
@@ -951,6 +1001,92 @@ mod tests {
         assert_eq!(p.backend_ceiling(), Some(p.limits.max_size));
         p.backend_auth = BackendAuth::PerUser;
         assert_eq!(p.backend_ceiling(), None);
+    }
+
+    #[test]
+    fn passthrough_carries_every_rule_per_user_auth_carries() {
+        // It is per-user authentication with the user list stepped over for
+        // names it has never seen, not a separate kind of pool. Anything that
+        // follows from opening backends as the client has to follow here too,
+        // or the second mode quietly reintroduces what the first ruled out.
+        let mut p = pool();
+        p.backend_auth = BackendAuth::Passthrough;
+        assert!(p.backend_auth.is_per_user(), "the rules are written against this, not against the variant");
+        assert_eq!(p.backend_ceiling(), None);
+
+        let mut warm = p.clone();
+        warm.limits.min_idle = 2;
+        assert_eq!(
+            state_with_pool("app_main", warm).validate().unwrap_err(),
+            StateError::PerUserWarmup("app_main".into())
+        );
+
+        let mut split = p.clone();
+        split.routing.read_write_split = true;
+        split.backend_user = String::new();
+        assert_eq!(
+            state_with_pool("app_main", split).validate().unwrap_err(),
+            StateError::PerUserSplitWithoutProbe("app_main".into())
+        );
+    }
+
+    #[test]
+    fn only_passthrough_admits_names_that_are_not_configured() {
+        // The distinction the resolver hangs off. Shared and per-user pools
+        // both refuse an unknown name outright.
+        assert!(!BackendAuth::Shared.is_passthrough());
+        assert!(!BackendAuth::PerUser.is_passthrough());
+        assert!(BackendAuth::Passthrough.is_passthrough());
+    }
+
+    #[test]
+    fn a_passthrough_pool_says_so_for_as_long_as_it_is_on() {
+        // Not a misconfiguration and not dismissible: this is the one pool
+        // where a credential havuz has never seen becomes a database login.
+        let mut p = pool();
+        p.backend_auth = BackendAuth::Passthrough;
+        let warnings = state_with_pool("app_main", p).warnings();
+        assert!(
+            warnings.contains(&Warning::PassthroughPool { pool: "app_main".into() }),
+            "the operator has to be able to see this from the dashboard: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn a_passthrough_pool_with_no_configured_users_is_not_a_complaint() {
+        // Having no users is the mode working as asked. Warning about it
+        // teaches operators to ignore the banner that does matter.
+        let ungranted = |auth| {
+            let mut p = pool();
+            p.backend_auth = auth;
+            let mut state = State::default();
+            state.pools.insert("app_main".into(), p);
+            state.warnings()
+        };
+
+        let warnings = ungranted(BackendAuth::Passthrough);
+        assert!(!warnings.contains(&Warning::PoolWithoutUsers { pool: "app_main".into() }), "{warnings:?}");
+
+        let warnings = ungranted(BackendAuth::Shared);
+        assert!(
+            warnings.contains(&Warning::PoolWithoutUsers { pool: "app_main".into() }),
+            "a shared pool with no users really is unreachable: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn backend_auth_survives_a_round_trip_under_its_wire_name() {
+        // The name in the state file and the name in the API payload are the
+        // same string, and both are what an operator types.
+        for (mode, wire) in [
+            (BackendAuth::Shared, "shared"),
+            (BackendAuth::PerUser, "per_user"),
+            (BackendAuth::Passthrough, "passthrough"),
+        ] {
+            assert_eq!(mode.as_str(), wire);
+            assert_eq!(serde_json::to_value(mode).unwrap(), serde_json::json!(wire));
+            assert_eq!(serde_json::from_value::<BackendAuth>(serde_json::json!(wire)).unwrap(), mode);
+        }
     }
 
     #[test]

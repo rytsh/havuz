@@ -194,6 +194,12 @@ struct CreatePool {
     aliases: Vec<String>,
     /// Whose credentials backend connections are opened with. Defaults to one
     /// shared service account, which is what every other pooler does.
+    ///
+    /// `per_user` opens them as the connecting havuz user. `passthrough` does
+    /// the same and additionally admits clients havuz has no user record for,
+    /// by putting their credentials in front of the database — which is how a
+    /// pool ends up needing no stored backend credential at all, and is also
+    /// why it raises a standing warning.
     #[serde(default)]
     backend_auth: BackendAuth,
     /// Let a per-user pool ask for a password on an unencrypted socket.
@@ -255,12 +261,12 @@ async fn create_pool(
         // The handshake refuses this per connection anyway; catching it here
         // means the operator finds out while creating the pool rather than
         // when the first client fails to connect to it.
-        return Err(ApiError::BadRequest(
-            "per-user authentication asks clients for their password, so it needs client-facing TLS; \
+        return Err(ApiError::BadRequest(format!(
+            "backend_auth = {} asks clients for their password, so it needs client-facing TLS; \
              set server.tls.cert and server.tls.key and restart, or accept the risk with \
-             allow_password_without_tls"
-                .into(),
-        ));
+             allow_password_without_tls",
+            body.backend_auth.as_str()
+        )));
     }
     let (family, profile) = havuz_registry::resolve(&body.family, body.profile.as_deref())
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
@@ -1748,6 +1754,59 @@ mod tests {
 
         let (_, identities) = get(&app, "/api/v1/pools/app_main/identities").await;
         assert_eq!(identities["max_size_is_per_user"], true);
+    }
+
+    #[tokio::test]
+    async fn a_passthrough_pool_can_be_created_with_no_backend_credential_at_all() {
+        // The reason the mode exists: nothing here has a backend password to
+        // store, so there is nothing to seal, rotate or leak.
+        let (app, state) = app();
+        let mut payload = pool_payload();
+        payload["backend_auth"] = json!("passthrough");
+        payload["settings"]["username"] = json!("");
+        payload["settings"]["password"] = json!("");
+
+        let (status, body) = post(&app, "/api/v1/pools", payload).await;
+        assert_eq!(status, StatusCode::CREATED, "body: {body}");
+        assert_eq!(body["backend_auth"], "passthrough");
+        assert_eq!(body["has_backend_password"], false);
+        assert!(body["backend_ceiling"].is_null(), "max_size is a per-user budget here too");
+        assert_eq!(state.store.load().pools["app_main"].backend_user, "");
+    }
+
+    #[tokio::test]
+    async fn a_passthrough_pool_stays_flagged_for_as_long_as_it_is_on() {
+        // It is not a misconfiguration, so it is not fixable — which is exactly
+        // why it has to stay on the dashboard rather than be reported once.
+        let (app, _) = app();
+        let mut payload = pool_payload();
+        payload["backend_auth"] = json!("passthrough");
+        let (status, body) = post(&app, "/api/v1/pools", payload).await;
+        assert_eq!(status, StatusCode::CREATED, "body: {body}");
+
+        let (_, summary) = get(&app, "/api/v1/summary").await;
+        let warnings = summary["warnings"].as_array().unwrap();
+        assert!(warnings.iter().any(|w| w["kind"] == "passthrough_pool"), "body: {summary}");
+        assert!(
+            !warnings.iter().any(|w| w["kind"] == "pool_without_users"),
+            "having no users is the mode working as asked: {summary}"
+        );
+    }
+
+    #[tokio::test]
+    async fn passthrough_needs_client_tls_for_the_same_reason_per_user_auth_does() {
+        // It asks for a real database password, so it is governed by the same
+        // rule. A weaker one here would make the stricter one pointless.
+        let (app, state) = app_without_tls();
+        let mut payload = pool_payload();
+        payload["backend_auth"] = json!("passthrough");
+
+        let (status, body) = post(&app, "/api/v1/pools", payload).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+        let message = body["error"]["message"].as_str().unwrap_or_default();
+        assert!(message.contains("TLS"), "body: {body}");
+        assert!(message.contains("passthrough"), "the refusal must name the mode that caused it: {body}");
+        assert!(state.store.load().pools.is_empty());
     }
 
     #[tokio::test]

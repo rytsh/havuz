@@ -24,14 +24,32 @@
 //!   runs over is not always havuz's to judge. What is at stake is worth being
 //!   plain about: this password opens the database, so leaking it does not give
 //!   an eavesdropper a session through havuz, it gives them the database.
-//! * **The stored verifier is still checked.** Not configurable at all.
-//!   Skipping it would turn havuz into a credential-stuffing proxy pointed at
-//!   the database, and would leave `disabled`, `read_only` and the pool grants
-//!   with nothing to hang off.
+//! * **The stored verifier is still checked**, whenever there is one. Skipping
+//!   it would turn havuz into a credential-stuffing proxy pointed at the
+//!   database, and would leave `disabled`, `read_only` and the pool grants with
+//!   nothing to hang off.
 //!
 //! What havuz still does not do is *store* the password. It is held for the
 //! life of the session, handed to the connector, and gone when the last client
 //! of that user disconnects.
+//!
+//! ## The exception to the exception
+//!
+//! "Whenever there is one" is doing real work in that second bullet. A pool set
+//! to `backend_auth = passthrough` exists precisely so that an operator need
+//! not enter a backend credential anywhere, which means it will meet clients it
+//! has no verifier for. There are only two honest things to do with such a
+//! client, and refusing it is one of them; the other is to ask the database,
+//! which is what [`ClientAuth::Unproven`] does.
+//!
+//! That path still ends before `AuthenticationOk`: [`Authenticator::admit`]
+//! opens a backend connection with the credentials the client just supplied and
+//! the client is refused if it fails. So the client-visible protocol is
+//! unchanged. What *is* different, and cannot be argued away, is that the
+//! attempt reached PostgreSQL's authentication. Configured users are unaffected
+//! — they keep their verifier, their grants and their flags, and are checked
+//! locally as before — and once an unknown identity has been vouched for its
+//! verifier is remembered in memory, so only the first attempt costs this.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -53,10 +71,26 @@ use crate::stream::MaybeTls;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthDenial {
     UnknownUser,
-    UnknownPool { pool: String },
-    NotGranted { user: String, pool: String },
+    UnknownPool {
+        pool: String,
+    },
+    NotGranted {
+        user: String,
+        pool: String,
+    },
     Disabled,
-    TooManyConnections { scope: String },
+    TooManyConnections {
+        scope: String,
+    },
+    /// A passthrough pool could not reach the database to find out whether the
+    /// credentials were any good.
+    ///
+    /// Kept apart from [`UnknownUser`](Self::UnknownUser) because it is not a
+    /// verdict on the client. Telling someone their password is wrong when the
+    /// database is merely down sends them to rotate a working credential.
+    Unverifiable {
+        reason: String,
+    },
 }
 
 impl AuthDenial {
@@ -64,6 +98,7 @@ impl AuthDenial {
         match self {
             AuthDenial::UnknownPool { .. } => sqlstate::UNDEFINED_DATABASE,
             AuthDenial::TooManyConnections { .. } => sqlstate::TOO_MANY_CONNECTIONS,
+            AuthDenial::Unverifiable { .. } => sqlstate::CANNOT_CONNECT_NOW,
             _ => sqlstate::INVALID_AUTHORIZATION,
         }
     }
@@ -79,28 +114,79 @@ impl AuthDenial {
             AuthDenial::TooManyConnections { scope } => {
                 format!("too many connections for {scope}")
             }
+            // Says nothing about the credentials, because nothing is known
+            // about them. This is the pool reporting its own state.
+            AuthDenial::Unverifiable { reason } => {
+                format!("cannot verify credentials against the database right now: {reason}")
+            }
             _ => "authentication failed".to_string(),
         }
     }
 }
 
 /// How a client should prove who it is, and what havuz needs out of it.
+///
+/// An enum rather than a struct of flags because the three cases have different
+/// requirements and mixing them up is a security bug, not a logic error: there
+/// is no way to spell "no verifier, and do not ask the database either".
 #[derive(Debug, Clone)]
-pub struct ClientAuth {
-    pub verifier: ScramVerifier,
-    /// The pool opens backend connections as this client, so the handshake
-    /// must come away holding the plaintext password.
-    pub needs_plaintext: bool,
-    /// The pool has been told it may ask for that password on an unencrypted
-    /// socket. Only consulted when `needs_plaintext` is set; the SCRAM path
-    /// never learns a password and so has nothing to expose.
-    pub allow_without_tls: bool,
+pub enum ClientAuth {
+    /// A full SCRAM run against a verifier havuz stores. The password is never
+    /// learned, and nothing about it reaches the backend.
+    Scram { verifier: ScramVerifier },
+    /// Ask for the password itself, check it against a stored verifier, then
+    /// hand it to the backend. Used by pools that open connections as the
+    /// client.
+    Plaintext {
+        verifier: ScramVerifier,
+        /// The pool has been told it may ask on an unencrypted socket.
+        allow_without_tls: bool,
+    },
+    /// Ask for the password, and let the database be the one to check it.
+    ///
+    /// Only reachable on a `passthrough` pool, and only for an identity havuz
+    /// has no record of. [`Authenticator::admit`] must succeed before the
+    /// client is told anything, so this is a *slower* path than the other two
+    /// rather than a weaker one — but it does mean the attempt itself reaches
+    /// PostgreSQL, which is the trade the mode exists to make.
+    Unproven { allow_without_tls: bool },
+}
+
+impl ClientAuth {
+    /// Whether the handshake has to come away holding the plaintext password.
+    fn needs_plaintext(&self) -> bool {
+        !matches!(self, ClientAuth::Scram { .. })
+    }
+
+    fn allow_without_tls(&self) -> bool {
+        match self {
+            ClientAuth::Scram { .. } => false,
+            ClientAuth::Plaintext { allow_without_tls, .. } | ClientAuth::Unproven { allow_without_tls } => {
+                *allow_without_tls
+            }
+        }
+    }
 }
 
 /// Resolves a client identity against havuz's own user list.
+#[async_trait::async_trait]
 pub trait Authenticator: Send + Sync + 'static {
     /// Return the auth policy for `user`, provided the user may reach `pool`.
     fn resolve(&self, user: &str, pool: &str) -> Result<ClientAuth, AuthDenial>;
+
+    /// Prove an identity havuz has no verifier for, by using it.
+    ///
+    /// Called only after [`resolve`](Self::resolve) returned
+    /// [`ClientAuth::Unproven`], and always before `AuthenticationOk`: a client
+    /// whose password the database rejects must be refused at the handshake
+    /// like any other, not admitted and then dropped at the first checkout.
+    ///
+    /// The default refuses. An implementation that has no way to ask the
+    /// database must not be able to admit an unproven client by omission.
+    async fn admit(&self, user: &str, pool: &str, credential: &BackendCredential) -> Result<(), AuthDenial> {
+        let _ = (user, pool, credential);
+        Err(AuthDenial::UnknownUser)
+    }
 }
 
 /// A client's database password, held only for the life of its session.
@@ -286,14 +372,14 @@ impl<A: Authenticator> ClientHandshake<A> {
             }
         };
 
-        let credential = if auth.needs_plaintext {
+        if auth.needs_plaintext() {
             // Asking for a password on a plaintext socket hands it to anyone on
             // the path, and the whole point of this pool is that the password
             // also opens the database. Refused by default; an operator who
             // knows something about the link that havuz cannot see may say so
             // per pool, and then gets told about it every single time.
             if !stream.is_encrypted() {
-                if !auth.allow_without_tls {
+                if !auth.allow_without_tls() {
                     let text = format!(
                         "pool \"{pool}\" authenticates against the database as you, so it needs your password \
                          and will only ask for it over TLS; connect with sslmode=require or higher"
@@ -310,10 +396,32 @@ impl<A: Authenticator> ClientHandshake<A> {
                      and use it against the database directly"
                 );
             }
-            Some(self.cleartext(&mut stream, &auth.verifier, &user, &pool).await?)
-        } else {
-            self.scram(&mut stream, auth.verifier).await?;
-            None
+        }
+
+        let credential = match auth {
+            ClientAuth::Scram { verifier } => {
+                self.scram(&mut stream, verifier).await?;
+                None
+            }
+            ClientAuth::Plaintext { verifier, .. } => {
+                Some(self.cleartext(&mut stream, Some(&verifier), &user, &pool).await?)
+            }
+            ClientAuth::Unproven { .. } => {
+                let credential = self.cleartext(&mut stream, None, &user, &pool).await?;
+
+                // The only check this identity gets. It happens here, before
+                // `AuthenticationOk`, so a client with a bad password sees the
+                // same refusal at the same point in the exchange as everyone
+                // else — and so that a bad password never becomes a pooled
+                // connection set keyed on it.
+                if let Err(denial) = self.authenticator.admit(&user, &pool, &credential).await {
+                    tracing::info!(%user, %pool, ?denial, "connection refused by the database");
+                    let msg = Message::fatal(denial.sqlstate(), &denial.client_message());
+                    let _ = msg.write(&mut stream).await;
+                    return Err(ProtoError::auth(format!("{denial:?}")));
+                }
+                Some(credential)
+            }
         };
 
         Message::authentication_ok().write(&mut stream).await.map_err(|e| ProtoError::protocol(e.to_string()))?;
@@ -328,15 +436,22 @@ impl<A: Authenticator> ClientHandshake<A> {
         ))
     }
 
-    /// Ask for the password itself, and check it against the stored verifier.
+    /// Ask for the password itself, and check it against a stored verifier.
     ///
     /// Verifying locally first means a wrong password is refused by havuz and
     /// never reaches the database, so a pool in this mode cannot be used to
     /// brute-force database roles.
+    ///
+    /// `None` is the one case where there is nothing to verify against: a
+    /// passthrough pool meeting an identity for the first time. The caller must
+    /// then put the credential in front of the database via
+    /// [`Authenticator::admit`] before admitting the client — this function
+    /// deliberately does not, so that "took a password without checking it"
+    /// stays a single, visible call site.
     async fn cleartext(
         &self,
         stream: &mut MaybeTls,
-        verifier: &ScramVerifier,
+        verifier: Option<&ScramVerifier>,
         user: &str,
         pool: &str,
     ) -> ProtoResult<BackendCredential> {
@@ -349,15 +464,17 @@ impl<A: Authenticator> ClientHandshake<A> {
             .map_err(|_| ProtoError::auth("password is not valid utf-8"))?
             .to_string();
 
-        // Recomputing with the stored salt and iteration count is the only way
-        // to check a plaintext against a verifier, and it is the same work the
-        // SCRAM path does.
-        let candidate = ScramVerifier::from_password_with(&password, verifier.salt(), verifier.iterations());
-        if candidate.stored_key() != verifier.stored_key() {
-            tracing::info!(%user, %pool, "connection refused: password does not match the stored verifier");
-            let denial = AuthDenial::UnknownUser;
-            let _ = Message::fatal(denial.sqlstate(), &denial.client_message()).write(stream).await;
-            return Err(ProtoError::auth("password did not verify"));
+        if let Some(verifier) = verifier {
+            // Recomputing with the stored salt and iteration count is the only
+            // way to check a plaintext against a verifier, and it is the same
+            // work the SCRAM path does.
+            let candidate = ScramVerifier::from_password_with(&password, verifier.salt(), verifier.iterations());
+            if candidate.stored_key() != verifier.stored_key() {
+                tracing::info!(%user, %pool, "connection refused: password does not match the stored verifier");
+                let denial = AuthDenial::UnknownUser;
+                let _ = Message::fatal(denial.sqlstate(), &denial.client_message()).write(stream).await;
+                return Err(ProtoError::auth("password did not verify"));
+            }
         }
 
         Ok(BackendCredential(password))
@@ -501,6 +618,14 @@ mod tests {
         pools: Vec<String>,
         per_user: bool,
         allow_without_tls: bool,
+        /// Admit names the user list has never heard of, by asking the
+        /// stand-in database below.
+        passthrough: bool,
+        /// What that stand-in database answers.
+        database_says_yes: bool,
+        /// Every credential the handshake put in front of it, so a test can
+        /// assert that a password did — or did not — reach the database.
+        offered: Arc<std::sync::Mutex<Vec<(String, String, String)>>>,
     }
 
     impl TestAuth {
@@ -515,6 +640,9 @@ mod tests {
                 pools: vec!["app_main".into(), "other".into()],
                 per_user: false,
                 allow_without_tls: false,
+                passthrough: false,
+                database_says_yes: true,
+                offered: Arc::new(std::sync::Mutex::new(Vec::new())),
             })
         }
 
@@ -533,24 +661,56 @@ mod tests {
             auth.allow_without_tls = true;
             Arc::new(auth)
         }
+
+        /// A pool with no user record for the client at all.
+        fn passthrough() -> Arc<Self> {
+            let mut auth = (*Self::per_user_without_tls()).clone();
+            auth.passthrough = true;
+            Arc::new(auth)
+        }
+
+        /// The same, with the database rejecting whatever it is given.
+        fn passthrough_rejecting() -> Arc<Self> {
+            let mut auth = (*Self::passthrough()).clone();
+            auth.database_says_yes = false;
+            Arc::new(auth)
+        }
+
+        fn offered(&self) -> Vec<(String, String, String)> {
+            self.offered.lock().unwrap().clone()
+        }
     }
 
+    #[async_trait::async_trait]
     impl Authenticator for TestAuth {
         fn resolve(&self, user: &str, pool: &str) -> Result<ClientAuth, AuthDenial> {
             if !self.pools.iter().any(|p| p == pool) {
                 return Err(AuthDenial::UnknownPool { pool: pool.into() });
             }
             let Some((verifier, grants)) = self.users.get(user) else {
+                if self.passthrough {
+                    return Ok(ClientAuth::Unproven { allow_without_tls: self.allow_without_tls });
+                }
                 return Err(AuthDenial::UnknownUser);
             };
             if !grants.iter().any(|g| g == pool) {
                 return Err(AuthDenial::NotGranted { user: user.into(), pool: pool.into() });
             }
-            Ok(ClientAuth {
-                verifier: verifier.clone(),
-                needs_plaintext: self.per_user,
-                allow_without_tls: self.allow_without_tls,
+            let verifier = verifier.clone();
+            Ok(if self.per_user {
+                ClientAuth::Plaintext { verifier, allow_without_tls: self.allow_without_tls }
+            } else {
+                ClientAuth::Scram { verifier }
             })
+        }
+
+        async fn admit(&self, user: &str, pool: &str, credential: &BackendCredential) -> Result<(), AuthDenial> {
+            self.offered.lock().unwrap().push((pool.to_string(), user.to_string(), credential.expose().to_string()));
+            if self.database_says_yes {
+                Ok(())
+            } else {
+                Err(AuthDenial::UnknownUser)
+            }
         }
     }
 
@@ -913,6 +1073,111 @@ mod tests {
         assert!(server.await.unwrap().is_err());
         let err = client.await.unwrap().unwrap_err();
         assert!(err.contains("28000"), "got: {err}");
+    }
+
+    // --- passthrough ---
+
+    #[tokio::test]
+    async fn an_unknown_name_is_admitted_only_after_the_database_says_so() {
+        // The one case where havuz has nothing to check against. It does not
+        // guess and it does not refuse outright; it asks, and the client waits.
+        let auth = TestAuth::passthrough();
+        let (addr, server) = spawn_per_user_server_as(auth.clone(), false).await;
+        let client = tokio::spawn(async move { client_connect(addr, "nobody_here", "app_main", "hunter2").await });
+
+        let (_, outcome) = server.await.unwrap().expect("the database vouched for it");
+        client.await.unwrap().expect("client must reach AuthenticationOk");
+
+        assert_eq!(
+            auth.offered(),
+            vec![("app_main".to_string(), "nobody_here".to_string(), "hunter2".to_string())],
+            "the credential has to reach the database, because nothing else can judge it"
+        );
+        let HandshakeOutcome::Established { credential, .. } = outcome else {
+            panic!("expected an established session");
+        };
+        assert_eq!(credential.expect("this is what opens the backend").expose(), "hunter2");
+    }
+
+    #[tokio::test]
+    async fn a_database_refusal_ends_the_handshake_and_not_the_first_query() {
+        // Refused at the same point in the exchange as every other bad
+        // password, so clients and drivers see an ordinary auth failure rather
+        // than a connection that came up and then fell over.
+        let (addr, server) = spawn_per_user_server_as(TestAuth::passthrough_rejecting(), false).await;
+        let client = tokio::spawn(async move { client_connect(addr, "nobody_here", "app_main", "hunter2").await });
+
+        let err = server.await.unwrap().unwrap_err();
+        assert!(matches!(err, ProtoError::Auth(_)), "got {err:?}");
+        let client_error = client.await.unwrap().unwrap_err();
+        assert!(client_error.contains("28000"), "got: {client_error}");
+        assert!(!client_error.contains("nobody_here"), "still not a user enumeration oracle: {client_error}");
+    }
+
+    #[tokio::test]
+    async fn passthrough_does_not_reach_past_a_configured_user() {
+        // The rule the whole mode rests on: a name havuz knows keeps its
+        // verifier, and a wrong password for it is refused here. Otherwise
+        // `disabled`, `read_only` and the pool grants would be advisory.
+        let auth = TestAuth::passthrough();
+        let (addr, server) = spawn_per_user_server_as(auth.clone(), false).await;
+        let client = tokio::spawn(async move { client_connect(addr, "svc_orders", "app_main", "wrong").await });
+
+        assert!(server.await.unwrap().is_err());
+        let err = client.await.unwrap().unwrap_err();
+        assert!(err.contains("28000"), "got: {err}");
+        assert!(auth.offered().is_empty(), "a configured user's bad password must not become a database login");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_name_still_will_not_be_asked_for_a_password_in_the_clear() {
+        // Passthrough asks for a real database password like per-user auth
+        // does, so it is governed by the same rule and not a weaker one.
+        let mut auth = (*TestAuth::passthrough()).clone();
+        auth.allow_without_tls = false;
+        let auth = Arc::new(auth);
+        let (addr, server) = spawn_per_user_server_as(auth.clone(), false).await;
+        let client = tokio::spawn(async move { client_connect(addr, "nobody_here", "app_main", "hunter2").await });
+
+        let err = server.await.unwrap().unwrap_err();
+        assert!(matches!(err, ProtoError::Tls(_)), "got {err:?}");
+        assert!(client.await.unwrap().unwrap_err().contains("TLS"));
+        assert!(auth.offered().is_empty(), "refused before the password was even asked for");
+    }
+
+    #[tokio::test]
+    async fn an_authenticator_with_no_way_to_ask_refuses_rather_than_admits() {
+        // The default `admit`. A family that cannot reach a database must not
+        // let an unproven client in by not implementing anything.
+        struct Silent;
+        #[async_trait::async_trait]
+        impl Authenticator for Silent {
+            fn resolve(&self, _user: &str, _pool: &str) -> Result<ClientAuth, AuthDenial> {
+                Ok(ClientAuth::Unproven { allow_without_tls: true })
+            }
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handshake = ClientHandshake::new(Arc::new(Silent));
+        let server = tokio::spawn(async move {
+            let (socket, peer) = listener.accept().await.unwrap();
+            handshake.run(socket, peer, "app_main").await
+        });
+        let client = tokio::spawn(async move { client_connect(addr, "anyone", "app_main", "hunter2").await });
+
+        assert!(server.await.unwrap().is_err());
+        assert!(client.await.unwrap().unwrap_err().contains("28000"));
+    }
+
+    #[tokio::test]
+    async fn a_database_that_cannot_be_reached_is_not_reported_as_a_bad_password() {
+        // Telling someone their password is wrong when the database is merely
+        // down sends them to rotate a credential that works.
+        let denial = AuthDenial::Unverifiable { reason: "connection refused".into() };
+        assert_eq!(denial.sqlstate(), sqlstate::CANNOT_CONNECT_NOW);
+        assert!(!denial.client_message().contains("authentication failed"), "{}", denial.client_message());
+        assert!(denial.client_message().contains("connection refused"));
     }
 
     #[tokio::test]
