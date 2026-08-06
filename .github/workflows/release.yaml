@@ -174,10 +174,16 @@ jobs:
 
       # The manifest that ties the two architectures together is written by the
       # merge job; all this one has to hand over is the digest it produced.
+      #
+      # The `sha256:` prefix comes off because the digest becomes a file name
+      # and an artifact upload refuses a colon in one. The merge job puts it
+      # back.
       - name: Export the digest
         run: |
+          set -eu
           mkdir -p /tmp/digests
-          touch "/tmp/digests/${{ steps.build.outputs.digest }}"
+          DIGEST="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${DIGEST#sha256:}"
       - uses: actions/upload-artifact@v4
         with:
           name: digest-${{ matrix.image }}-${{ matrix.arch }}
@@ -224,7 +230,7 @@ jobs:
             TAGS="${TAGS} ${FLOATING}"
           fi
           docker buildx imagetools create ${TAGS} \
-            $(printf "${IMAGE}@%s " *)
+            $(printf "${IMAGE}@sha256:%s " *)
       - name: Show what landed
         run: docker buildx imagetools inspect "ghcr.io/${{ github.repository }}:${{ needs.meta.outputs.version }}${{ matrix.image == 'jdbc' && '-jdbc' || '' }}"
 
