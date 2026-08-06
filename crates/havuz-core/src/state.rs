@@ -271,20 +271,38 @@ impl State {
                     out.push(Warning::UsersWithoutBackendRole { pool: name.clone(), users: stranded });
                 }
             }
+            // An idle-in-transaction limit is about reclaiming a pool slot, and
+            // in session mode there is no slot to reclaim: the client holds its
+            // backend until it disconnects either way. Ending it early would
+            // only shorten the lock wait, which is not what the setting says it
+            // does, so it does nothing here and that has to be visible.
+            if !pool.mode.multiplexes() && !pool.limits.idle_in_transaction_timeout.is_zero() {
+                out.push(Warning::IdleTimeoutInSessionMode { pool: name.clone() });
+            }
             // Read-only is enforced by refusing the statements that would turn
             // `default_transaction_read_only` back off, which means reading
             // every statement. Session mode is a byte shovel and does not, so
             // the guarantee silently weakens to "on by default".
+            //
+            // A read-only *pool* in session mode is the worse of the two: the
+            // operator marked the route, not a person, so the expectation is
+            // that nothing coming through the port can write. Say so without
+            // naming users, because the flag applies to all of them and to
+            // every user added later.
             if !pool.mode.multiplexes() {
-                let mut readers: Vec<String> = self
-                    .users
-                    .iter()
-                    .filter(|(_, user)| user.read_only && user.pools.iter().any(|p| p == name))
-                    .map(|(user, _)| user.clone())
-                    .collect();
-                readers.sort();
-                if !readers.is_empty() {
-                    out.push(Warning::ReadOnlyNotEnforced { pool: name.clone(), users: readers });
+                if pool.read_only {
+                    out.push(Warning::ReadOnlyNotEnforced { pool: name.clone(), pool_wide: true, users: Vec::new() });
+                } else {
+                    let mut readers: Vec<String> = self
+                        .users
+                        .iter()
+                        .filter(|(_, user)| user.read_only && user.pools.iter().any(|p| p == name))
+                        .map(|(user, _)| user.clone())
+                        .collect();
+                    readers.sort();
+                    if !readers.is_empty() {
+                        out.push(Warning::ReadOnlyNotEnforced { pool: name.clone(), pool_wide: false, users: readers });
+                    }
                 }
             }
         }
@@ -326,11 +344,22 @@ pub enum Warning {
     SplitWithoutReplicas {
         pool: String,
     },
-    /// A read-only user can reach a session-mode pool, where the guarantee
+    /// An idle-in-transaction limit is set on a session-mode pool, where it is
+    /// not enforced. The client owns its backend for the whole session there,
+    /// so ending it early would free nothing that disconnecting would not.
+    IdleTimeoutInSessionMode {
+        pool: String,
+    },
+    /// A read-only guarantee is claimed on a session-mode pool, where it
     /// cannot be held: havuz inspects no statements there, so the client can
     /// simply turn the setting off again.
+    ///
+    /// `pool_wide` distinguishes the two sources. Set, the pool itself is
+    /// marked read-only and `users` is empty because every client is affected;
+    /// clear, `users` are the read-only users that can reach a writable pool.
     ReadOnlyNotEnforced {
         pool: String,
+        pool_wide: bool,
         users: Vec<String>,
     },
     /// Read/write split with no sticky window: a read issued straight after a
@@ -582,6 +611,26 @@ pub struct PoolConfig {
     /// actually takes the unencrypted path.
     #[serde(default)]
     pub allow_password_without_tls: bool,
+    /// Every session on this pool is opened read-only, whoever connects.
+    ///
+    /// [`UserConfig::read_only`] says a *person* may not write; this says a
+    /// *route* may not be written through. They are different questions and the
+    /// second one is the one an operator usually has: a reporting pool, a BI
+    /// tool's port, a replica-backed alias next to the read-write one. Answering
+    /// it per user means remembering the flag on every user ever granted the
+    /// pool, and the one that gets forgotten is silently allowed to write.
+    ///
+    /// Enforced exactly as the user flag is — `default_transaction_read_only`
+    /// set on the backend, with the statements that would turn it off refused —
+    /// so it is PostgreSQL that rejects the write, not a classifier guessing at
+    /// one. The two combine by OR: a read-only user stays read-only on a
+    /// writable pool, and a writable user becomes read-only here.
+    ///
+    /// Carries the same caveat as the user flag, and [`Warning::ReadOnlyNotEnforced`]
+    /// says so: in session mode havuz inspects no statements, so a client can
+    /// set the parameter back itself.
+    #[serde(default)]
+    pub read_only: bool,
     /// How much of this pool's traffic reaches the query trace store.
     #[serde(default)]
     pub trace: TraceLevel,
@@ -797,6 +846,26 @@ pub struct PoolLimits {
     /// credential rotations converge.
     #[serde(with = "humantime_serde")]
     pub max_lifetime: Duration,
+    /// How long a client may sit inside an open transaction without sending
+    /// anything before its session is ended. Zero, the default, means no limit.
+    ///
+    /// Transaction mode's whole premise is that an idle client holds nothing.
+    /// A client that runs `BEGIN` and then stops talking — a debugger on a
+    /// breakpoint, a request that threw between the transaction and the commit
+    /// — breaks that premise: it holds a backend, and its locks, until it
+    /// disconnects. One such client can take a pool slot for hours.
+    ///
+    /// Off by default because ending someone's transaction is destructive and
+    /// the operator is the one who knows whether their longest legitimate
+    /// think-time is a second or a minute. Set it comfortably above that.
+    ///
+    /// Only enforced where it means something. In session mode the client owns
+    /// its backend for the whole session anyway, so ending it early would free
+    /// nothing that disconnecting would not — see
+    /// [`Warning::IdleTimeoutInSessionMode`].
+    #[serde(default)]
+    #[serde(with = "humantime_serde")]
+    pub idle_in_transaction_timeout: Duration,
 }
 
 impl Default for PoolLimits {
@@ -809,6 +878,7 @@ impl Default for PoolLimits {
             connect_timeout: Duration::from_secs(5),
             idle_timeout: Duration::from_secs(600),
             max_lifetime: Duration::from_secs(1800),
+            idle_in_transaction_timeout: Duration::ZERO,
         }
     }
 }
@@ -882,6 +952,7 @@ mod tests {
             routing: Default::default(),
             backend_auth: Default::default(),
             allow_password_without_tls: false,
+            read_only: false,
             trace: Default::default(),
             disabled: false,
             description: None,
@@ -1410,6 +1481,134 @@ mod tests {
         p.allow_password_without_tls = true;
         let state = state_with_pool("app_main", p);
         assert!(!state.warnings().iter().any(|w| matches!(w, Warning::PasswordWithoutTls { .. })));
+    }
+
+    #[test]
+    fn a_read_only_pool_in_session_mode_says_so_without_naming_users() {
+        // The flag was put on the route, so listing the users who happen to
+        // hold a grant today would be answering a different question — and
+        // would go stale the moment another one is added.
+        let mut p = pool();
+        p.mode = PoolMode::Session;
+        p.read_only = true;
+        let state = state_with_pool("app_main", p);
+
+        let warning = state.warnings().into_iter().find_map(|w| match w {
+            Warning::ReadOnlyNotEnforced { pool, pool_wide, users } if pool == "app_main" => Some((pool_wide, users)),
+            _ => None,
+        });
+        assert_eq!(warning, Some((true, Vec::new())));
+    }
+
+    #[test]
+    fn a_read_only_pool_that_multiplexes_is_enforceable_and_quiet() {
+        let mut p = pool();
+        p.mode = PoolMode::Transaction;
+        p.read_only = true;
+        let state = state_with_pool("app_main", p);
+        assert!(
+            !state.warnings().iter().any(|w| matches!(w, Warning::ReadOnlyNotEnforced { .. })),
+            "havuz reads every statement here, so the guarantee holds"
+        );
+    }
+
+    #[test]
+    fn a_read_only_user_on_a_writable_session_pool_is_still_named() {
+        let mut p = pool();
+        p.mode = PoolMode::Session;
+        let mut state = state_with_pool("app_main", p);
+        state.users.get_mut("svc").unwrap().read_only = true;
+
+        let warning = state.warnings().into_iter().find_map(|w| match w {
+            Warning::ReadOnlyNotEnforced { pool, pool_wide, users } if pool == "app_main" => Some((pool_wide, users)),
+            _ => None,
+        });
+        assert_eq!(warning, Some((false, vec!["svc".to_string()])));
+    }
+
+    #[test]
+    fn a_read_only_pool_does_not_warn_twice_about_its_read_only_users() {
+        // Both sources are present, and there is still one thing wrong: the
+        // pool cannot enforce read-only. Saying it twice trains operators to
+        // stop reading the banner.
+        let mut p = pool();
+        p.mode = PoolMode::Session;
+        p.read_only = true;
+        let mut state = state_with_pool("app_main", p);
+        state.users.get_mut("svc").unwrap().read_only = true;
+
+        assert_eq!(state.warnings().iter().filter(|w| matches!(w, Warning::ReadOnlyNotEnforced { .. })).count(), 1);
+    }
+
+    #[test]
+    fn read_only_defaults_off_and_survives_a_round_trip() {
+        // `#[serde(default)]` means a state.json written before this field
+        // existed still loads, and loads as writable — the only answer that
+        // cannot surprise an operator who never asked for the feature.
+        let stored = serde_json::to_value(pool()).unwrap();
+        assert_eq!(stored["read_only"], serde_json::json!(false));
+
+        let mut p = pool();
+        p.read_only = true;
+        let decoded: PoolConfig = serde_json::from_value(serde_json::to_value(&p).unwrap()).unwrap();
+        assert_eq!(decoded, p);
+
+        let mut legacy = stored.as_object().unwrap().clone();
+        legacy.remove("read_only");
+        let decoded: PoolConfig = serde_json::from_value(serde_json::Value::Object(legacy)).unwrap();
+        assert!(!decoded.read_only);
+    }
+
+    #[test]
+    fn an_idle_in_transaction_limit_on_a_session_pool_is_flagged_as_inert() {
+        // It is not wrong, it just does nothing: the client owns its backend
+        // until it disconnects either way, so there is no slot to reclaim.
+        let mut p = pool();
+        p.mode = PoolMode::Session;
+        p.limits.idle_in_transaction_timeout = Duration::from_secs(30);
+        let state = state_with_pool("app_main", p);
+        assert!(
+            state
+                .warnings()
+                .iter()
+                .any(|w| matches!(w, Warning::IdleTimeoutInSessionMode { pool } if pool == "app_main")),
+            "a setting that silently does nothing is worse than one that is refused"
+        );
+    }
+
+    #[test]
+    fn an_idle_in_transaction_limit_is_quiet_where_it_is_enforced() {
+        let mut p = pool();
+        p.mode = PoolMode::Transaction;
+        p.limits.idle_in_transaction_timeout = Duration::from_secs(30);
+        let state = state_with_pool("app_main", p);
+        assert!(!state.warnings().iter().any(|w| matches!(w, Warning::IdleTimeoutInSessionMode { .. })));
+
+        // And off is off, in either mode.
+        let mut p = pool();
+        p.mode = PoolMode::Session;
+        let state = state_with_pool("app_main", p);
+        assert!(!state.warnings().iter().any(|w| matches!(w, Warning::IdleTimeoutInSessionMode { .. })));
+    }
+
+    #[test]
+    fn an_idle_in_transaction_limit_defaults_off_and_survives_a_round_trip() {
+        // The field arrived after pools existed, so a `state.json` written
+        // before it must still load — and must load as "no limit", because
+        // inventing one would start ending sessions nobody asked to end.
+        let limits = PoolLimits::default();
+        assert_eq!(limits.idle_in_transaction_timeout, Duration::ZERO);
+
+        let mut stored = serde_json::to_value(&limits).unwrap();
+        assert_eq!(stored["idle_in_transaction_timeout"], serde_json::json!("0s"));
+
+        stored.as_object_mut().unwrap().remove("idle_in_transaction_timeout");
+        let decoded: PoolLimits = serde_json::from_value(stored).unwrap();
+        assert_eq!(decoded.idle_in_transaction_timeout, Duration::ZERO);
+
+        let set = PoolLimits { idle_in_transaction_timeout: Duration::from_secs(90), ..Default::default() };
+        let decoded: PoolLimits = serde_json::from_value(serde_json::to_value(&set).unwrap()).unwrap();
+        assert_eq!(decoded, set);
     }
 
     #[test]

@@ -121,7 +121,9 @@ pool orders_rw   database=orders   aliases=[orders]      # dbname=orders
 pool orders_ro   database=orders   aliases=[orders_bi]   # dbname=orders_bi
 ```
 
-Both sit on one port, over one database, with different pooling modes. Without
+Both sit on one port, over one database, with different pooling modes — and,
+if you want, different answers to whether writes are allowed at all; see
+[Read-only pools](#read-only-pools). Without
 aliases only one of them could be called `orders`, and the other would be
 unreachable under the name its clients already write. Aliases and pool names
 share one namespace per port, because a client sends one string and must reach
@@ -414,11 +416,110 @@ havuz makes it safe with three rules:
 * **A transaction never changes target midway.** A plain `BEGIN` goes to the
   primary, because the client has not said what is coming.
 
+That last rule has two exemptions, and both are guarantees rather than guesses.
+`BEGIN READ ONLY` and `START TRANSACTION READ ONLY` may start on a replica,
+because the client has said what is coming and PostgreSQL holds it to that. So
+may a plain `BEGIN` on a [read-only pool or user](#read-only-pools), where
+`default_transaction_read_only` is already on the backend and every statement
+that would take it off has already been refused. Everything else about the
+transaction is unchanged: it is pinned to whichever target it started on, and
+the sticky window still sends it to the primary if this session wrote recently.
+
 What it cannot see: a `SELECT` that calls a function which writes. No proxy can,
 short of running the statement. That is a documented limit.
 
 A replica is used only while it is healthy *and* its lag has been measured and
 is within `max_replica_lag`. Never measured is not the same as caught up.
+
+### Read-only pools
+
+A pool can be marked `read_only`, and then nothing gets written through it — by
+anyone, including users granted access to it later.
+
+This is deliberately a property of the **route** rather than of a person. havuz
+also has a per-user `read_only` flag, and it answers a different question:
+"may this identity write, anywhere". The question an operator usually has is
+"may anything be written through *this port*", and answering it one user at a
+time means the flag has to be remembered on every user ever granted the pool.
+The one that gets forgotten is silently allowed to write.
+
+It pairs with aliases, which is where a reporting pool comes from in the first
+place:
+
+```
+pool orders_rw   database=orders   aliases=[orders]      read_only=false
+pool orders_ro   database=orders   aliases=[orders_bi]   read_only=true
+```
+
+One port, one database, two routes with different answers. The BI tool keeps
+its connection string and cannot write through it whatever credentials it has.
+
+**PostgreSQL does the refusing.** havuz sets `default_transaction_read_only` on
+the backend and rejects the statements that would turn it off again — `SET`,
+`RESET`, `SET SESSION CHARACTERISTICS`, the lot. It does not try to classify
+writes, because no classifier can see the `INSERT` inside a function a `SELECT`
+calls. The two flags combine by OR: neither can loosen the other, so a
+read-only user stays read-only on a writable pool.
+
+**Session mode cannot enforce it.** There havuz forwards bytes without reading
+statements, so the setting is applied once as a default and the client can set
+it back. It is a guardrail, not a guarantee, and the dashboard says so for as
+long as the combination exists. Transaction mode, or `GRANT`s in the database.
+
+**A family that cannot hold a session read-only refuses the flag** rather than
+storing it and ignoring it. The JDBC bridge is the current example: it relays no
+statements it could inspect and has no portable setting to lean on, so ticking
+the box there is a `400` with the reason. A pool the dashboard calls read-only
+and that accepts writes is worse than being told no.
+
+**The refusal names its source.** With two flags on two pages, "this user is
+read-only" is the wrong answer when the pool is the reason — it sends someone to
+a user record with the box unticked. A pool-level refusal says which pool.
+
+**It makes replicas usable for reporting.** A read-only session cannot write,
+so its plain `BEGIN` is routed like `BEGIN READ ONLY`: to a replica, if
+`read_write_split` is on. Without that a reporting pool sent every explicit
+transaction to the primary while the replicas sat idle.
+
+The flag is patchable on a live pool — `PATCH /api/v1/pools/{name}` — because
+the reason to reach for it is usually a migration or a failover rather than a
+design decision. It is read at connect time, so it binds the *next* session;
+`POST /api/v1/pools/{name}/kick` ends the ones already open so they come back
+under the new policy. Pausing the pool would do that too, and would lock the
+readers out along with the writers.
+
+### Idle in transaction
+
+Transaction mode's premise is that an idle client holds nothing. A client that
+runs `BEGIN` and then stops talking breaks it: a debugger on a breakpoint, a
+request that threw between the transaction and the commit, a queue worker that
+lost its broker. It holds a backend, and its locks, until it disconnects — and
+one of those can take a pool slot for hours.
+
+`idle_in_transaction_timeout` on the pool ends such a session. Off by default,
+because ending someone's transaction is destructive and only the operator knows
+whether their longest legitimate think-time is a second or a minute.
+
+```
+PATCH /api/v1/pools/reports  { "idle_in_transaction_timeout": "30s" }
+```
+
+Three things about how it lands:
+
+* **It measures silence, not length.** A transaction that keeps sending
+  statements is doing work and is not the problem this solves.
+* **It ends the session between two client messages**, which is the only moment
+  at which that is safe. The backend is rolled back, discarded and returned to
+  the pool rather than thrown away.
+* **The client gets `25P03`** — PostgreSQL's own code and wording for this. A
+  client that already handles it from the database does not have to learn a
+  second spelling because a pooler is in the way.
+
+It is not applied in session mode, and the dashboard says so rather than letting
+the setting look enforced: there the client owns its backend from connect to
+disconnect, so ending the session early frees nothing that the client
+disconnecting would not. If the concern there is locks rather than pool
+capacity, PostgreSQL's own `idle_in_transaction_session_timeout` is the tool.
 
 ### Three decisions worth knowing about
 

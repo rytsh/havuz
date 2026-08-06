@@ -327,7 +327,14 @@ impl RouteIntent {
 /// What this cannot see: a `SELECT` that calls a function which writes. No
 /// proxy can, short of running the statement. That is a documented limit, not
 /// an oversight.
-pub fn route_intent(sql: &str) -> RouteIntent {
+///
+/// `session_read_only` says PostgreSQL will refuse every write on this session
+/// whatever it asks for — a read-only pool or a read-only user, with
+/// `default_transaction_read_only` set and the statements that would unset it
+/// already refused. It is the difference between "this statement looks like a
+/// read" and "this session cannot write", and it only changes the answer for
+/// the statement that opens a transaction. See [`statement_route_intent`].
+pub fn route_intent(sql: &str, session_read_only: bool) -> RouteIntent {
     // Blank fragments carry no information, so they are dropped rather than
     // counted as reads. If nothing substantive remains we have learned nothing
     // and must fail safe.
@@ -338,20 +345,39 @@ pub fn route_intent(sql: &str) -> RouteIntent {
         return RouteIntent::Write;
     }
     // A multi-statement batch is read-only only if every part is.
-    if statements.iter().any(|s| statement_route_intent(s) == RouteIntent::Write) {
+    if statements.iter().any(|s| statement_route_intent(s, session_read_only) == RouteIntent::Write) {
         RouteIntent::Write
     } else {
         RouteIntent::Read
     }
 }
 
-fn statement_route_intent(statement: &str) -> RouteIntent {
+fn statement_route_intent(statement: &str, session_read_only: bool) -> RouteIntent {
     let normalized = strip_leading_noise(statement);
     if normalized.trim().is_empty() {
         // An empty statement is harmless, but it also tells us nothing; treat
         // it as read so a trailing semicolon does not force a batch to the
         // primary.
         return RouteIntent::Read;
+    }
+
+    // A transaction opener decides where the whole transaction runs, because
+    // the router pins it to that target for the duration. So it is the one
+    // statement worth asking a harder question about than "does this look like
+    // a read": may this transaction write *at all*?
+    //
+    // Two things can answer no, and both are guarantees rather than guesses.
+    // The statement can say so — `BEGIN READ ONLY` — or the session can, when
+    // havuz has already put `default_transaction_read_only` on the backend and
+    // closed every way of taking it off. A plain `BEGIN` with neither is a
+    // write: the client has not said what is coming, and finding out halfway
+    // through means a transaction split across two servers.
+    if opens_transaction(normalized) {
+        return if session_read_only || starts_read_only_transaction(normalized) {
+            RouteIntent::Read
+        } else {
+            RouteIntent::Write
+        };
     }
 
     let first = leading_words(normalized, 1);
@@ -395,18 +421,27 @@ fn statement_route_intent(statement: &str) -> RouteIntent {
     RouteIntent::Read
 }
 
+/// Does this statement open a transaction block?
+///
+/// `BEGIN` and `START TRANSACTION` only. `SAVEPOINT` nests inside one that is
+/// already open and has therefore already been routed, and `COMMIT`/`ROLLBACK`
+/// close one — none of them choose a target.
+pub fn opens_transaction(sql: &str) -> bool {
+    let normalized = strip_literals(strip_leading_noise(sql)).to_ascii_uppercase();
+    let words: Vec<&str> = normalized.split_whitespace().collect();
+    matches!(words.first().copied(), Some("BEGIN"))
+        || (words.first().copied() == Some("START") && words.get(1).copied() == Some("TRANSACTION"))
+}
+
 /// Does this statement open an explicitly read-only transaction?
 ///
 /// A plain `BEGIN` does not qualify: the client has not told us what comes
 /// next, and guessing would mean routing a transaction to a replica and
-/// discovering the write halfway through.
+/// discovering the write halfway through. `BEGIN READ ONLY` is the client
+/// promising there is no write coming, and PostgreSQL holds it to that promise.
 pub fn starts_read_only_transaction(sql: &str) -> bool {
     let normalized = strip_literals(strip_leading_noise(sql)).to_ascii_uppercase();
-    let words: Vec<&str> = normalized.split_whitespace().collect();
-    let opens = matches!(words.first().copied(), Some("BEGIN"))
-        || (words.first().copied() == Some("START") && words.get(1).copied() == Some("TRANSACTION"));
-
-    opens && normalized.contains("READ ONLY")
+    opens_transaction(sql) && normalized.contains("READ ONLY")
 }
 
 /// Replace the contents of quoted strings with nothing.
@@ -713,6 +748,13 @@ mod tests {
 
     // --- read/write routing ---
 
+    /// Routing as an ordinary writable session sees it. The read-only variant
+    /// only changes the answer for a transaction opener, so every case that is
+    /// not one is stated once, here.
+    fn intent(sql: &str) -> RouteIntent {
+        route_intent(sql, false)
+    }
+
     #[test]
     fn plain_reads_can_go_to_a_replica() {
         for sql in [
@@ -725,7 +767,7 @@ mod tests {
             "WITH recent AS (SELECT * FROM t) SELECT * FROM recent",
             "/* app */ SELECT 1",
         ] {
-            assert_eq!(route_intent(sql), RouteIntent::Read, "{sql:?} should be routable to a replica");
+            assert_eq!(intent(sql), RouteIntent::Read, "{sql:?} should be routable to a replica");
         }
     }
 
@@ -743,7 +785,7 @@ mod tests {
             "BEGIN",
             "COMMIT",
         ] {
-            assert_eq!(route_intent(sql), RouteIntent::Write, "{sql:?} must reach the primary");
+            assert_eq!(intent(sql), RouteIntent::Write, "{sql:?} must reach the primary");
         }
     }
 
@@ -757,7 +799,7 @@ mod tests {
             "SELECT * FROM t FOR SHARE",
             "select id from t where x = 1 for key share",
         ] {
-            assert_eq!(route_intent(sql), RouteIntent::Write, "{sql:?} takes locks");
+            assert_eq!(intent(sql), RouteIntent::Write, "{sql:?} takes locks");
         }
     }
 
@@ -770,60 +812,60 @@ mod tests {
             "SELECT pg_advisory_lock(1)",
             "SELECT * INTO new_table FROM t",
         ] {
-            assert_eq!(route_intent(sql), RouteIntent::Write, "{sql:?} has side effects");
+            assert_eq!(intent(sql), RouteIntent::Write, "{sql:?} has side effects");
         }
     }
 
     #[test]
     fn a_data_modifying_cte_is_a_write_however_it_ends() {
         assert_eq!(
-            route_intent("WITH gone AS (DELETE FROM t RETURNING *) SELECT count(*) FROM gone"),
+            intent("WITH gone AS (DELETE FROM t RETURNING *) SELECT count(*) FROM gone"),
             RouteIntent::Write,
             "a SELECT on the outside does not make this a read"
         );
         assert_eq!(
-            route_intent("WITH added AS (INSERT INTO t VALUES (1) RETURNING id) SELECT * FROM added"),
+            intent("WITH added AS (INSERT INTO t VALUES (1) RETURNING id) SELECT * FROM added"),
             RouteIntent::Write
         );
     }
 
     #[test]
     fn explain_analyze_actually_runs_the_statement() {
-        assert_eq!(route_intent("EXPLAIN SELECT * FROM t"), RouteIntent::Read);
+        assert_eq!(intent("EXPLAIN SELECT * FROM t"), RouteIntent::Read);
         assert_eq!(
-            route_intent("EXPLAIN ANALYZE DELETE FROM t"),
+            intent("EXPLAIN ANALYZE DELETE FROM t"),
             RouteIntent::Write,
             "ANALYZE executes, so this is not a read"
         );
-        assert_eq!(route_intent("EXPLAIN (ANALYZE, BUFFERS) SELECT 1"), RouteIntent::Write);
+        assert_eq!(intent("EXPLAIN (ANALYZE, BUFFERS) SELECT 1"), RouteIntent::Write);
     }
 
     #[test]
     fn keywords_inside_string_literals_do_not_misroute() {
         // Without literal stripping this would be forced to the primary
         // forever, which is a silent performance bug rather than an error.
-        assert_eq!(route_intent("SELECT 'for update' AS label"), RouteIntent::Read);
-        assert_eq!(route_intent("SELECT * FROM t WHERE note = 'nextval(x)'"), RouteIntent::Read);
-        assert_eq!(route_intent("SELECT $$ delete from t $$ AS doc"), RouteIntent::Read);
+        assert_eq!(intent("SELECT 'for update' AS label"), RouteIntent::Read);
+        assert_eq!(intent("SELECT * FROM t WHERE note = 'nextval(x)'"), RouteIntent::Read);
+        assert_eq!(intent("SELECT $$ delete from t $$ AS doc"), RouteIntent::Read);
         // And a real lock clause is still caught next to a decoy literal.
-        assert_eq!(route_intent("SELECT 'harmless' FROM t FOR UPDATE"), RouteIntent::Write);
+        assert_eq!(intent("SELECT 'harmless' FROM t FOR UPDATE"), RouteIntent::Write);
     }
 
     #[test]
     fn unknown_statements_fail_safe_to_the_primary() {
         // Stale reads are silent; misrouted writes are loud. Prefer loud.
-        assert_eq!(route_intent("VACUUM"), RouteIntent::Write);
-        assert_eq!(route_intent("DO $$ BEGIN END $$"), RouteIntent::Write);
-        assert_eq!(route_intent(""), RouteIntent::Write);
-        assert_eq!(route_intent("   "), RouteIntent::Write);
-        assert_eq!(route_intent("NOTIFY chan"), RouteIntent::Write);
+        assert_eq!(intent("VACUUM"), RouteIntent::Write);
+        assert_eq!(intent("DO $$ BEGIN END $$"), RouteIntent::Write);
+        assert_eq!(intent(""), RouteIntent::Write);
+        assert_eq!(intent("   "), RouteIntent::Write);
+        assert_eq!(intent("NOTIFY chan"), RouteIntent::Write);
     }
 
     #[test]
     fn a_batch_is_read_only_when_every_statement_is() {
-        assert_eq!(route_intent("SELECT 1; SELECT 2"), RouteIntent::Read);
-        assert_eq!(route_intent("SELECT 1;"), RouteIntent::Read, "a trailing semicolon is not a statement");
-        assert_eq!(route_intent("SELECT 1; UPDATE t SET x = 1"), RouteIntent::Write);
+        assert_eq!(intent("SELECT 1; SELECT 2"), RouteIntent::Read);
+        assert_eq!(intent("SELECT 1;"), RouteIntent::Read, "a trailing semicolon is not a statement");
+        assert_eq!(intent("SELECT 1; UPDATE t SET x = 1"), RouteIntent::Write);
     }
 
     #[test]
@@ -838,6 +880,62 @@ mod tests {
         assert!(!starts_read_only_transaction("START TRANSACTION"));
         assert!(!starts_read_only_transaction("BEGIN READ WRITE"));
         assert!(!starts_read_only_transaction("SELECT 'read only'"), "not even in a literal");
+    }
+
+    #[test]
+    fn an_explicitly_read_only_transaction_is_routed_as_a_read() {
+        // The promise is the client's and PostgreSQL holds it to it, so the
+        // transaction can start on a replica instead of pinning itself to the
+        // primary for the sake of a `BEGIN` that said nothing.
+        assert_eq!(intent("BEGIN READ ONLY"), RouteIntent::Read);
+        assert_eq!(intent("START TRANSACTION READ ONLY"), RouteIntent::Read);
+        assert_eq!(intent("begin transaction isolation level repeatable read, read only"), RouteIntent::Read);
+
+        assert_eq!(intent("BEGIN"), RouteIntent::Write, "a plain BEGIN still says nothing about what follows");
+        assert_eq!(intent("START TRANSACTION"), RouteIntent::Write);
+        assert_eq!(intent("BEGIN READ WRITE"), RouteIntent::Write);
+    }
+
+    #[test]
+    fn a_read_only_session_may_open_its_transactions_on_a_replica() {
+        // Nothing in this session can write: `default_transaction_read_only` is
+        // on the backend and every statement that would take it off has already
+        // been refused. So a plain `BEGIN` is as provably read-only here as
+        // `BEGIN READ ONLY` is anywhere.
+        let read_only = |sql: &str| route_intent(sql, true);
+
+        assert_eq!(read_only("BEGIN"), RouteIntent::Read);
+        assert_eq!(read_only("START TRANSACTION"), RouteIntent::Read);
+        assert_eq!(read_only("BEGIN ISOLATION LEVEL SERIALIZABLE"), RouteIntent::Read);
+
+        // Everything else keeps its ordinary answer. A statement that looks
+        // like a write still goes to the primary, where PostgreSQL refuses it
+        // with the error the client expects — rather than to a replica, where
+        // the failure would also trip the circuit breaker.
+        assert_eq!(read_only("INSERT INTO t VALUES (1)"), RouteIntent::Write);
+        assert_eq!(read_only("SELECT * FROM t FOR UPDATE"), RouteIntent::Write);
+        assert_eq!(read_only("SELECT 1"), RouteIntent::Read);
+    }
+
+    #[test]
+    fn only_the_statement_that_opens_a_transaction_is_treated_as_one() {
+        assert!(opens_transaction("BEGIN"));
+        assert!(opens_transaction("start transaction"));
+        // These run inside a transaction that has already chosen its target.
+        assert!(!opens_transaction("SAVEPOINT s1"));
+        assert!(!opens_transaction("COMMIT"));
+        assert!(!opens_transaction("ROLLBACK"));
+        assert!(!opens_transaction("SELECT 'begin'"), "not from inside a literal");
+    }
+
+    #[test]
+    fn a_transaction_opener_in_a_batch_does_not_carry_the_rest() {
+        // The batch rule is unchanged: every part has to be a read. A write
+        // sitting behind `BEGIN READ ONLY` would be refused by PostgreSQL
+        // anyway, but it must not be refused on a replica.
+        assert_eq!(intent("BEGIN READ ONLY; SELECT 1"), RouteIntent::Read);
+        assert_eq!(intent("BEGIN READ ONLY; INSERT INTO t VALUES (1)"), RouteIntent::Write);
+        assert_eq!(route_intent("BEGIN; INSERT INTO t VALUES (1)", true), RouteIntent::Write);
     }
 
     #[test]

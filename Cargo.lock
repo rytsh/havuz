@@ -526,6 +526,7 @@ dependencies = [
  "havuz-registry",
  "havuz-secrets",
  "http-body-util",
+ "humantime-serde",
  "mime_guess",
  "rust-embed",
  "serde",

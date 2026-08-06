@@ -28,6 +28,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+# The pool patch takes durations in the same humantime spelling the state file
+# uses, so `"30s"` means the same thing on both sides of the API.
+humantime-serde = { workspace = true }
 mime_guess = { workspace = true }
 rust-embed = { workspace = true, optional = true }
 

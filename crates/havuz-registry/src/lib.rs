@@ -84,6 +84,18 @@ pub struct Capabilities {
     /// Extended query protocol with named prepared statements. If true, a
     /// transaction-mode pool needs a statement rewriter to be usable.
     pub prepared_statements: bool,
+    /// A session can be opened read-only and held that way.
+    ///
+    /// Needs two things the driver has to supply together: a way to tell the
+    /// server "refuse writes on this session" — PostgreSQL's
+    /// `default_transaction_read_only` — and enough of a view of the traffic to
+    /// stop the client turning it off again. A family with only the first has a
+    /// suggestion, not a restriction.
+    ///
+    /// False means `read_only` is refused on the pool rather than accepted and
+    /// ignored. An operator who ticks a box called read-only and gets a pool
+    /// that writes is worse off than one who was told no.
+    pub read_only_sessions: bool,
     /// Out-of-band query cancellation on a side channel (PG CancelRequest).
     pub cancel_request: bool,
     /// Bulk streaming mode that must bypass message-level inspection.
@@ -102,6 +114,7 @@ impl Capabilities {
         md5_auth: false,
         per_user_auth: false,
         prepared_statements: false,
+        read_only_sessions: false,
         cancel_request: false,
         bulk_copy: false,
         reports_transaction_status: false,
@@ -316,6 +329,10 @@ const JDBC: FamilyDescriptor = FamilyDescriptor {
         // is havuz's own rewriting, which exists to move a statement between
         // backends and has nothing to move it between here.
         prepared_statements: true,
+        // The bridge relays no statements of its own to inspect and has no
+        // portable GUC to set through a JDBC URL, so it could offer a default
+        // and not a guarantee. It offers neither.
+        read_only_sessions: false,
         cancel_request: false,
         bulk_copy: false,
         // The agent reports it from the driver rather than inferring it, which

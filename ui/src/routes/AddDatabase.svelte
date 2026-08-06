@@ -31,6 +31,7 @@
   let listenPort = $state<number | undefined>(undefined);
   let backendAuth = $state<BackendAuth>("shared");
   let allowPasswordWithoutTls = $state(false);
+  let readOnly = $state(false);
 
   /**
    * Whether this process can offer TLS to clients at all.
@@ -99,6 +100,7 @@
     mode = family.default_pool_mode;
     backendAuth = "shared";
     allowPasswordWithoutTls = false;
+    readOnly = false;
     tracing = "on";
     traceDepth = "statements";
     // Seed defaults straight from the schema so the form starts valid.
@@ -172,6 +174,7 @@
       aliases: parseAliases(aliasText),
       backend_auth: backendAuth,
       allow_password_without_tls: backendAuth !== "shared" && allowPasswordWithoutTls,
+      read_only: readOnly,
       trace: traceLevel,
       limits: { max_size: maxSize, max_client_connections: maxClients },
       settings,
@@ -409,6 +412,31 @@
           the network traffic gets a working database credential and can connect directly, leaving Havuz out of it
           entirely. Only reasonable when something else already encrypts the link. The pool stays flagged on the
           dashboard for as long as this is on.
+        </div>
+      </div>
+    {/if}
+
+    {#if selected.capabilities.read_only_sessions}
+      <div class="field">
+        <label class="font-normal">
+          <input type="checkbox" bind:checked={readOnly} />
+          Read-only pool
+        </label>
+        <div class="help">
+          Refuses writes through this pool for everyone reaching it, including users granted access later — a property
+          of the route, not of a person. PostgreSQL does the refusing, through
+          <code>default_transaction_read_only</code>, so a write hidden inside a function is caught too. Use it for
+          reporting and BI ports; two pools over one database can share a port and be told apart by name.
+        </div>
+      </div>
+    {/if}
+
+    {#if readOnly && mode === "session"}
+      <div class="warning">
+        <strong>Session mode cannot enforce this.</strong>
+        <div>
+          Havuz forwards bytes without reading statements there, so the setting is applied as a default the client can
+          turn off again. Choose transaction mode above, or take the write privileges away in the database.
         </div>
       </div>
     {/if}

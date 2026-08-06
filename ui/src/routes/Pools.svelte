@@ -17,8 +17,28 @@
   let editAliases = $state("");
   let editTrace = $state<TraceLevel>("statements");
   let editAllowPasswordWithoutTls = $state(false);
+  let editReadOnly = $state(false);
   /** Only per-user pools ever ask for a password, so only they can leak one. */
   let editIsPerUser = $state(false);
+  /** What the pool was when the panel opened, so a *change* can be reacted to. */
+  let editWasReadOnly = $state(false);
+  /**
+   * Whether the pool being tuned belongs to a family that can actually hold a
+   * session read-only. The server refuses the rest; offering the box anyway
+   * would turn a documented limitation into a rejected save.
+   */
+  let editCanBeReadOnly = $state(false);
+
+  /** Families that can hold a session read-only, by id. */
+  let readOnlyFamilies = $state<Set<string>>(new Set());
+
+  /**
+   * Idle-in-transaction limit, in seconds. Zero is "no limit".
+   *
+   * Held as a number rather than the API's humantime string because an operator
+   * setting this is picking a number of seconds, not writing a duration.
+   */
+  let editIdleInTransaction = $state(0);
 
   const traceLabel: Record<TraceLevel, string> = {
     off: "not traced",
@@ -94,7 +114,27 @@
     editAliases = pool.aliases.join(", ");
     editTrace = pool.trace;
     editAllowPasswordWithoutTls = pool.allow_password_without_tls;
+    editReadOnly = pool.read_only;
+    editWasReadOnly = pool.read_only;
+    editCanBeReadOnly = readOnlyFamilies.has(pool.family);
     editIsPerUser = pool.backend_auth !== "shared";
+    editIdleInTransaction = parseSeconds(pool.limits.idle_in_transaction_timeout);
+  }
+
+  /**
+   * Read a humantime duration back as whole seconds.
+   *
+   * The server writes what it stores — "0s", "30s", "5m" — and this form offers
+   * seconds. Anything it cannot read comes back as 0, which reads as "no limit"
+   * and is the safe way to be wrong: the field is only sent when the operator
+   * changes it, so a misparse cannot silently switch a limit off.
+   */
+  function parseSeconds(value: string): number {
+    const total = [...value.matchAll(/(\d+)\s*(ms|us|µs|ns|s|m|h)/g)].reduce((sum, [, n, unit]) => {
+      const seconds: Record<string, number> = { ns: 1e-9, us: 1e-6, "µs": 1e-6, ms: 1e-3, s: 1, m: 60, h: 3600 };
+      return sum + Number(n) * (seconds[unit] ?? 0);
+    }, 0);
+    return Math.round(total);
   }
 
   async function saveConfiguration(event: Event) {
@@ -109,6 +149,8 @@
         listen_port: editListenPort,
         aliases: parseAliases(editAliases),
         trace: editTrace,
+        idle_in_transaction_timeout: `${Math.max(0, Math.round(editIdleInTransaction))}s`,
+        ...(editCanBeReadOnly ? { read_only: editReadOnly } : {}),
         // Sent only where it means something. On a shared pool the server would
         // store it and nothing would ever read it, which is a worse kind of
         // confusing than not offering it.
@@ -118,8 +160,31 @@
     if (!error) editing = null;
   }
 
+  /**
+   * Freezing writes only binds the next handshake, so the clients already
+   * connected keep writing until they reconnect. Offered as a separate,
+   * confirmed action rather than folded into Save: ending live sessions is not
+   * something to do as a side effect of ticking a box.
+   */
+  function kick(name: string) {
+    if (!confirm(`Disconnect every client on "${name}"? They reconnect on the current settings.`)) return;
+    act(name, async () => {
+      const result = await api.kickPool(name);
+      probes = { ...probes, [name]: `${result.kicked} session${result.kicked === 1 ? "" : "s"} ended` };
+    });
+  }
+
   $effect(() => {
     refresh();
+    // Only to decide whether the read-only box is offered. A failure here must
+    // not take the page down with it: the worst case is a box that is missing
+    // for a family that supports it, and the API refuses the rest anyway.
+    api
+      .families()
+      .then((families) => {
+        readOnlyFamilies = new Set(families.filter((f) => f.capabilities.read_only_sessions).map((f) => f.id));
+      })
+      .catch(() => {});
   });
 </script>
 
@@ -176,6 +241,16 @@
               {/if}
             {:else}
               <div class="muted text-xs">{pool.database} as {pool.backend_user}</div>
+            {/if}
+            {#if pool.read_only}
+              <span
+                class="badge"
+                class:warn={pool.mode === "session"}
+                title={pool.mode === "session"
+                  ? "Applied as a default only: session mode reads no statements, so a client can turn it back off"
+                  : "Every session through this pool is opened read-only, whoever connects"}
+                >read-only</span
+              >
             {/if}
           </td>
           <td>
@@ -234,6 +309,12 @@
             <div class="row">
               <button class="action" disabled={busy === pool.name} onclick={() => probe(pool.name)}>Test</button>
               <button class="action" disabled={busy === pool.name} onclick={() => configure(pool)}>Configure</button>
+              <button
+                class="action"
+                disabled={busy === pool.name}
+                title="End every live session on this pool. Clients reconnect and pick up the current settings."
+                onclick={() => kick(pool.name)}>Disconnect clients</button
+              >
               {#if pool.disabled}
                 <button class="action" disabled={busy === pool.name} onclick={() => act(pool.name, () => api.resumePool(pool.name))}>
                   Resume
@@ -294,13 +375,52 @@
             <option value="full">Queries and their results</option>
           </select>
         </div>
+        <div class="field mb-0">
+          <label for="edit-idle-in-txn">Idle in transaction limit (s)</label>
+          <input id="edit-idle-in-txn" type="number" min="0" bind:value={editIdleInTransaction} />
+          <p class="muted mb-0 text-xs">
+            0 = no limit. A client that opens a transaction and stops talking holds a backend nobody else can use.
+          </p>
+        </div>
       </div>
+      {#if editIdleInTransaction > 0 && editMode === "session"}
+        <div class="warning mb-0">
+          Session mode gives each client its own backend until it disconnects, so ending a session for sitting in a
+          transaction frees nothing that disconnecting would not. This limit will not be applied. If the concern is
+          locks rather than pool capacity, set PostgreSQL's own <code>idle_in_transaction_session_timeout</code>.
+        </div>
+      {/if}
+      {#if editCanBeReadOnly}
+        <div class="field mb-0">
+          <label class="font-normal">
+            <input type="checkbox" bind:checked={editReadOnly} />
+            Read-only: refuse writes through this pool
+          </label>
+          <p class="muted mb-0 text-xs">
+            Applies to everyone reaching this pool, including users added later. PostgreSQL does the refusing, through
+            <code>default_transaction_read_only</code>, so a write hidden inside a function is caught too.
+          </p>
+        </div>
+      {/if}
       {#if editIsPerUser}
         <div class="field mb-0">
           <label class="font-normal">
             <input type="checkbox" bind:checked={editAllowPasswordWithoutTls} />
             Ask for passwords even without TLS
           </label>
+        </div>
+      {/if}
+      {#if editReadOnly && !editWasReadOnly}
+        <div class="warning mb-0">
+          This binds the next connection. Clients already attached keep writing until they reconnect — use
+          <strong>Disconnect clients</strong> on the pool once you have saved if you meant writes to stop now.
+        </div>
+      {/if}
+      {#if editReadOnly && editMode === "session"}
+        <div class="warning mb-0">
+          In session mode Havuz forwards bytes without reading statements, so this is applied as a default the client
+          can turn off again. It is a guardrail here, not a guarantee. Move the pool to transaction mode, or take the
+          write privileges away in the database.
         </div>
       {/if}
       {#if editIsPerUser && editAllowPasswordWithoutTls}

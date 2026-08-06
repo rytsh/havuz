@@ -97,6 +97,15 @@ export const api = {
       `/api/v1/pools/${encodeURIComponent(name)}/probe`,
       { method: "POST" },
     ),
+  /**
+   * End every live session on a pool without closing it.
+   *
+   * A session reads its policy — read-only above all — once, at connect time.
+   * This is how an operator who has just frozen writes stops waiting for the
+   * clients already inside to reconnect on their own.
+   */
+  kickPool: (name: string) =>
+    request<{ pool: string; kicked: number }>(`/api/v1/pools/${encodeURIComponent(name)}/kick`, { method: "POST" }),
 
   createUser: (body: unknown) => request<{ name: string }>("/api/v1/users", { method: "POST", body: JSON.stringify(body) }),
   updateUser: (name: string, body: unknown) =>

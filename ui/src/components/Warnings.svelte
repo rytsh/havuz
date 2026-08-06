@@ -67,11 +67,22 @@
             `later attempts are refused by havuz. Users you have configured are unaffected: their password, pool ` +
             `grants, read-only and disabled flags all still apply first.`,
         };
+      case "idle_timeout_in_session_mode":
+        return {
+          title: `${w.pool}: the idle-in-transaction limit does nothing here`,
+          detail:
+            `This pool runs in session mode, where a client holds its backend from connect to disconnect. Ending a ` +
+            `session for sitting in a transaction would free nothing that the client disconnecting would not, so the ` +
+            `limit is not applied. Move the pool to transaction mode, or set PostgreSQL's own ` +
+            `idle_in_transaction_session_timeout if the concern is locks rather than pool capacity.`,
+        };
       case "read_only_not_enforced":
         return {
           title: `${w.pool}: read-only is not enforced in session mode`,
           detail:
-            `${w.users.join(", ")} ${w.users.length === 1 ? "is" : "are"} marked read-only, but this pool runs in ` +
+            (w.pool_wide
+              ? `This pool is marked read-only, so every client through it is meant to be unable to write. But it runs in `
+              : `${w.users.join(", ")} ${w.users.length === 1 ? "is" : "are"} marked read-only, but this pool runs in `) +
             `session mode, where havuz forwards bytes without reading statements. The setting is applied as a ` +
             `default and the client can turn it off again. Move the pool to transaction mode, or enforce it with ` +
             `database privileges instead.`,

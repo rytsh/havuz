@@ -29,6 +29,7 @@ use crate::scram::ScramVerifier;
 use crate::session::{
     complete_startup, AuthDenial, Authenticator, BackendCredential, ClientAuth, ClientHandshake, HandshakeOutcome,
 };
+use crate::txn::ReadOnlyReason;
 
 /// The registry id this family serves. Pools configured for anything else are
 /// not ours, and are skipped rather than mishandled.
@@ -70,6 +71,20 @@ struct PoolEntry {
     /// no credential to borrow.
     shared: Arc<PoolGroup>,
     per_user: RwLock<HashMap<String, Arc<UserGroup>>>,
+}
+
+/// What the configuration says about one session, read once at connect time.
+///
+/// Resolved together because they come from the same two records — the pool and
+/// the user — and reading them twice would let a patch land in between and give
+/// one session two configurations.
+struct ResolvedPolicy {
+    /// Why this session cannot write, if it cannot.
+    read_only: Option<ReadOnlyReason>,
+    /// How long it may sit inside an open transaction. Zero means no limit.
+    idle_in_transaction: Duration,
+    /// This identity's personal client-connection cap. Zero means none.
+    session_limit: u32,
 }
 
 /// One user's own connections to a pool.
@@ -216,6 +231,46 @@ impl PgFamily {
     /// requiring the pool to be rebuilt underneath its clients.
     fn trace_level(&self, name: &str) -> TraceLevel {
         self.state.load().pools.get(name).map(|p| p.trace).unwrap_or_default()
+    }
+
+    /// What a session may do and how many of them this identity may hold,
+    /// resolved once at connect time.
+    ///
+    /// Read-only has two sources and they combine by OR, because both are
+    /// restrictions and neither is a grant: the pool says what may be done
+    /// through this route, the user says what this identity may do anywhere.
+    /// Neither can loosen the other, so the order they are read in does not
+    /// matter and there is no precedence rule to remember.
+    ///
+    /// The pool half is the one that survives a client havuz has no record of.
+    /// Under passthrough there is no user row to hang a flag on, so a per-user
+    /// answer would be "writable" for exactly the clients nobody vetted.
+    ///
+    /// When both say no, the reported reason is the pool's. It is the one an
+    /// operator can act on without leaving the pool broken for everyone else,
+    /// and clearing the user flag alone would change nothing.
+    fn session_policy(&self, pool: &str, user: &str) -> ResolvedPolicy {
+        let state = self.state.load();
+        let config = state.pools.get(pool);
+        let (user_read_only, session_limit) =
+            state.users.get(user).map(|user| (user.read_only, user.max_client_connections)).unwrap_or((false, 0));
+
+        let read_only = if config.is_some_and(|pool| pool.read_only) {
+            Some(ReadOnlyReason::Pool)
+        } else if user_read_only {
+            Some(ReadOnlyReason::User)
+        } else {
+            None
+        };
+
+        ResolvedPolicy {
+            read_only,
+            // A pool that vanished between routing and lookup imposes no limit
+            // rather than a default one: inventing a timeout for a pool we
+            // cannot read would end sessions for a reason nobody configured.
+            idle_in_transaction: config.map(|pool| pool.limits.idle_in_transaction_timeout).unwrap_or_default(),
+            session_limit,
+        }
     }
 
     /// Bring the live pool set in line with the configuration.
@@ -552,16 +607,10 @@ impl ProtocolFamily for PgFamily {
             }
         };
 
-        // What this user is allowed to do, read once at connect time. Changing
-        // it later takes effect on the next connection — and, for anything
-        // urgent, on a kick.
-        let (read_only, session_limit) = self
-            .state
-            .load()
-            .users
-            .get(&identity.user)
-            .map(|user| (user.read_only, user.max_client_connections))
-            .unwrap_or((false, 0));
+        // What this session is allowed to do, read once at connect time.
+        // Changing it later takes effect on the next connection — and, for
+        // anything urgent, on a kick.
+        let resolved = self.session_policy(&identity.pool, &identity.user);
 
         // The per-user connection budget. Counted here rather than at accept
         // time because that is the first point the user is known.
@@ -570,7 +619,7 @@ impl ProtocolFamily for PgFamily {
             &identity.pool,
             identity.application_name.as_deref(),
             &identity.peer.to_string(),
-            session_limit,
+            resolved.session_limit,
         ) {
             Ok(session) => session,
             Err(havuz_pg_too_many) => {
@@ -656,11 +705,21 @@ impl ProtocolFamily for PgFamily {
         // Enforced by PostgreSQL, not by guessing which statements are writes:
         // no classifier can see the INSERT inside a SELECT that calls a
         // function, and `default_transaction_read_only` does not have to.
-        if read_only {
+        if resolved.read_only.is_some() {
             params.enforce_read_only();
         }
 
-        let policy = crate::txn::SessionPolicy { read_only, kick: session.signal(), cancel: Some(cancel.clone()) };
+        let policy = crate::txn::SessionPolicy {
+            read_only: resolved.read_only,
+            // Only carried into the transaction-mode relay. Session mode hands
+            // the client its own backend for the whole session, so ending it
+            // early would free nothing that disconnecting would not, and
+            // `State::warnings` says so rather than letting the setting look
+            // like it applies everywhere.
+            idle_in_transaction: resolved.idle_in_transaction,
+            kick: session.signal(),
+            cancel: Some(cancel.clone()),
+        };
 
         let outcome = if mode.multiplexes() {
             // Transaction mode: the startup checkout has done its job (the
@@ -1042,6 +1101,7 @@ mod tests {
             routing: Default::default(),
             backend_auth: Default::default(),
             allow_password_without_tls: false,
+            read_only: false,
             trace: Default::default(),
             disabled: false,
             description: None,
@@ -1081,6 +1141,86 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(family.trace_level("app_main"), TraceLevel::Full, "without a pool rebuild");
+    }
+
+    #[tokio::test]
+    async fn a_read_only_pool_makes_every_session_on_it_read_only() {
+        // The point of the pool-level flag: it does not depend on remembering
+        // to tick a box on each user, including the ones added next year.
+        let key = MasterKey::generate();
+        let mut state = state_with_user("hunter2", &key);
+        state.pools.get_mut("app_main").unwrap().read_only = true;
+        let store = Arc::new(StateStore::ephemeral(state));
+        let family = family_for(store, key);
+
+        assert_eq!(family.session_policy("app_main", "svc_orders").read_only, Some(ReadOnlyReason::Pool));
+        assert_eq!(
+            family.session_policy("app_main", "someone_with_no_record").read_only,
+            Some(ReadOnlyReason::Pool),
+            "a passthrough client has no user row to carry the flag; the route still does"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_two_read_only_flags_can_only_take_permissions_away() {
+        let key = MasterKey::generate();
+        let state = state_with_user("hunter2", &key);
+        let store = Arc::new(StateStore::ephemeral(state));
+        let family = family_for(store.clone(), key);
+
+        assert_eq!(family.session_policy("app_main", "svc_orders").read_only, None, "neither flag set");
+
+        store
+            .update(|s| {
+                s.users.get_mut("svc_orders").unwrap().read_only = true;
+                true
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            family.session_policy("app_main", "svc_orders").read_only,
+            Some(ReadOnlyReason::User),
+            "a read-only user on a writable pool"
+        );
+
+        store
+            .update(|s| {
+                s.pools.get_mut("app_main").unwrap().read_only = true;
+                s.users.get_mut("svc_orders").unwrap().read_only = false;
+                true
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            family.session_policy("app_main", "svc_orders").read_only,
+            Some(ReadOnlyReason::Pool),
+            "a writable user must not be able to write through a read-only pool"
+        );
+    }
+
+    #[tokio::test]
+    async fn freezing_writes_takes_effect_without_rebuilding_the_pool() {
+        // Same contract as the trace level: patched at runtime, read by the
+        // next handshake. The sessions already open keep their policy, which is
+        // what the pool kick endpoint exists to resolve.
+        let key = MasterKey::generate();
+        let store = Arc::new(StateStore::ephemeral(state_with_user("hunter2", &key)));
+        let family = family_for(store.clone(), key);
+        assert_eq!(family.session_policy("app_main", "svc_orders").read_only, None);
+
+        store
+            .update(|s| {
+                s.pools.get_mut("app_main").unwrap().read_only = true;
+                true
+            })
+            .await
+            .unwrap();
+        assert_eq!(family.session_policy("app_main", "svc_orders").read_only, Some(ReadOnlyReason::Pool));
+
+        let vanished = family.session_policy("no_such_pool", "nobody");
+        assert_eq!(vanished.read_only, None, "a pool we cannot read must not invent a policy");
+        assert_eq!(vanished.idle_in_transaction, Duration::ZERO, "nor a timeout nobody configured");
+        assert_eq!(vanished.session_limit, 0);
     }
 
     #[tokio::test]

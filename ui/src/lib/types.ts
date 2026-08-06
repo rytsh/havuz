@@ -42,6 +42,14 @@ export interface PoolLimits {
   connect_timeout: string;
   idle_timeout: string;
   max_lifetime: string;
+  /**
+   * How long a client may sit inside an open transaction before its session is
+   * ended. "0s" means no limit, which is the default.
+   *
+   * Only enforced in transaction and statement mode. In session mode the client
+   * owns its backend for the whole session anyway.
+   */
+  idle_in_transaction_timeout: string;
 }
 
 /**
@@ -79,6 +87,14 @@ export interface Pool {
    * a pooler password.
    */
   allow_password_without_tls: boolean;
+  /**
+   * Whether every session through this pool is opened read-only, whoever
+   * connects.
+   *
+   * A property of the route rather than of a person, unlike User.read_only.
+   * The two combine by OR, so this can only ever take permissions away.
+   */
+  read_only: boolean;
   trace: TraceLevel;
   /** The port clients reach this pool on. Pools may share one. */
   listen_port: number;
@@ -129,7 +145,8 @@ export type Warning =
   | { kind: "pool_without_users"; pool: string }
   | { kind: "split_without_replicas"; pool: string }
   | { kind: "no_sticky_window"; pool: string }
-  | { kind: "read_only_not_enforced"; pool: string; users: string[] }
+  | { kind: "read_only_not_enforced"; pool: string; pool_wide: boolean; users: string[] }
+  | { kind: "idle_timeout_in_session_mode"; pool: string }
   | { kind: "users_without_backend_role"; pool: string; users: string[] }
   | { kind: "password_without_tls"; pool: string }
   | { kind: "passthrough_pool"; pool: string };
@@ -225,6 +242,11 @@ export interface Capabilities {
   /** Backend connections can be opened as the connecting client. */
   per_user_auth: boolean;
   prepared_statements: boolean;
+  /**
+   * A session can be opened read-only and held that way. False means the pool's
+   * read_only flag is refused rather than accepted and ignored.
+   */
+  read_only_sessions: boolean;
   cancel_request: boolean;
   bulk_copy: boolean;
   reports_transaction_status: boolean;

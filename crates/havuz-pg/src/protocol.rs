@@ -530,6 +530,11 @@ pub mod sqlstate {
     /// What PostgreSQL itself raises for a write in a read-only transaction.
     /// havuz reuses it when refusing a statement that would escape `read_only`.
     pub const READ_ONLY_SQL_TRANSACTION: &str = "25006";
+    /// PostgreSQL's own code for ending a session that sat inside an open
+    /// transaction. Reused verbatim: it is the same event, and a client that
+    /// already handles it from the database should not have to learn a second
+    /// spelling because a pooler is in the way.
+    pub const IDLE_IN_TRANSACTION_SESSION_TIMEOUT: &str = "25P03";
 }
 
 #[cfg(test)]

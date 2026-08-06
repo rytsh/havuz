@@ -31,6 +31,8 @@
 //! **A backend is only borrowed when there is work.** An idle client holds
 //! nothing. That is the entire source of the fan-in.
 
+use std::time::Duration;
+
 use havuz_control::{HolderHandle, KickSignal, PrimaryReason, TraceContext, TraceSpan, TraceStore};
 use havuz_pool::Checkout;
 use havuz_proto::{BackendConn, FlowEvent, PinReason, ProtoError, ProtoResult, SessionState};
@@ -67,13 +69,35 @@ pub struct TxnOutcome {
     pub param_syncs: u64,
 }
 
+/// Why a session cannot write.
+///
+/// Carried rather than collapsed to a boolean because it is the first thing the
+/// person reading the error needs. "This user is read-only" sends someone to
+/// the Users page, and if the pool is the source they will find a user with the
+/// box unticked and no explanation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadOnlyReason {
+    /// The pool refuses writes through it, whoever connects.
+    Pool,
+    /// This identity is read-only wherever it connects.
+    User,
+}
+
 /// How a session is allowed to behave, beyond what its statements ask for.
 #[derive(Debug, Clone, Default)]
 pub struct SessionPolicy {
-    /// Refuse anything that would let this session write. The writes
-    /// themselves are refused by PostgreSQL; this only closes the statements
-    /// that would turn the setting back off.
-    pub read_only: bool,
+    /// Refuse anything that would let this session write, and why.
+    ///
+    /// The writes themselves are refused by PostgreSQL; this only closes the
+    /// statements that would turn the setting back off.
+    pub read_only: Option<ReadOnlyReason>,
+    /// How long this session may sit inside an open transaction without
+    /// sending anything. Zero means no limit.
+    ///
+    /// Transaction mode's whole premise is that an idle client holds nothing.
+    /// A client that opens a transaction and stops talking breaks that premise
+    /// and holds a backend nobody else can use.
+    pub idle_in_transaction: Duration,
     /// Resolves when an operator ends this session.
     pub kick: KickSignal,
     /// This session's slot in the cancellation registry, retargeted as it
@@ -145,6 +169,13 @@ async fn transaction_relay_inner(
         // next client would receive the tail of this one's result set. Waiting
         // until the client is between statements costs an operator the time of
         // one query and keeps the pool intact.
+        //
+        // It is also where the idle-in-transaction limit lands, and for the
+        // same reason: between two client messages is the only moment at which
+        // ending a session cannot corrupt a backend. The timer only runs while
+        // a transaction is open, because outside one this wait is exactly what
+        // transaction mode is for and holds nothing.
+        let idle_limit = policy.idle_in_transaction;
         let msg = tokio::select! {
             biased;
             _ = policy.kick.kicked() => {
@@ -156,6 +187,23 @@ async fn transaction_relay_inner(
                 .await;
                 break;
             }
+            _ = tokio::time::sleep(idle_limit), if !idle_limit.is_zero() && state.in_transaction() => {
+                // PostgreSQL's own code and wording for this, because it is the
+                // same event and a client that already handles it from the
+                // database should not have to learn a second spelling.
+                let _ = Message::fatal(
+                    sqlstate::IDLE_IN_TRANSACTION_SESSION_TIMEOUT,
+                    "terminating connection due to idle-in-transaction timeout",
+                )
+                .write(client)
+                .await;
+                tracing::info!(
+                    pool = %group.name(),
+                    timeout_ms = idle_limit.as_millis() as u64,
+                    "ended a session idle inside an open transaction"
+                );
+                break;
+            }
             read = Message::read(client) => match read {
                 Ok(msg) => msg,
                 Err(_) => break,
@@ -164,14 +212,24 @@ async fn transaction_relay_inner(
 
         let intent = classify(&msg);
 
-        // A read-only user gets `default_transaction_read_only`, and PostgreSQL
-        // does the actual refusing. That only holds while the client cannot
-        // turn the setting back off, so the statements that would are answered
-        // here and never forwarded.
-        if policy.read_only {
+        // A read-only session gets `default_transaction_read_only`, and
+        // PostgreSQL does the actual refusing. That only holds while the client
+        // cannot turn the setting back off, so the statements that would are
+        // answered here and never forwarded.
+        if let Some(reason) = policy.read_only {
             if let Some(sql) = param_sql(&msg) {
                 if params::defeats_read_only(&sql) {
-                    let detail = "this user is read-only; the session cannot be made writable";
+                    // Naming the source is the whole point: the two flags live
+                    // on different pages, and looking at the wrong one turns a
+                    // one-minute fix into a hunt.
+                    let detail = &match reason {
+                        ReadOnlyReason::Pool => {
+                            format!("pool \"{}\" is read-only; the session cannot be made writable", group.name())
+                        }
+                        ReadOnlyReason::User => {
+                            "this user is read-only; the session cannot be made writable".to_string()
+                        }
+                    };
                     let _ = Message::error_response("ERROR", sqlstate::READ_ONLY_SQL_TRANSACTION, detail)
                         .write(client)
                         .await;
@@ -242,7 +300,7 @@ async fn transaction_relay_inner(
             // The route is decided once per checkout, from the first message
             // that carries SQL. Deciding per message would let a transaction
             // span two servers and see two different snapshots.
-            let intent = message_intent(&msg, &statements);
+            let intent = message_intent(&msg, &statements, policy.read_only.is_some());
             current_route = group.router().choose(intent, &mut routing);
 
             let mut acquired = group.pool_for(current_route).acquire().await;
@@ -770,16 +828,16 @@ fn retarget_cancel(scope: Option<&CancelScope>, held: Option<&Checkout<PgConnect
 ///
 /// A message with no SQL tells us nothing, and "nothing" must mean the primary:
 /// a `Bind` to a statement we have somehow lost track of could be anything.
-fn message_intent(msg: &Message, statements: &ClientStatements) -> RouteIntent {
+fn message_intent(msg: &Message, statements: &ClientStatements, read_only: bool) -> RouteIntent {
     match msg.tag {
         b'Q' => {
             let end = msg.body.iter().position(|b| *b == 0).unwrap_or(msg.body.len());
-            route_intent(&String::from_utf8_lossy(&msg.body[..end]))
+            route_intent(&String::from_utf8_lossy(&msg.body[..end]), read_only)
         }
         b'P' => {
             let mut parts = msg.body.splitn(3, |b| *b == 0);
             match (parts.next(), parts.next()) {
-                (Some(_name), Some(sql)) => route_intent(&String::from_utf8_lossy(sql)),
+                (Some(_name), Some(sql)) => route_intent(&String::from_utf8_lossy(sql), read_only),
                 _ => RouteIntent::Write,
             }
         }
@@ -790,7 +848,7 @@ fn message_intent(msg: &Message, statements: &ClientStatements) -> RouteIntent {
             match parts.next() {
                 Some(name) => {
                     let name = String::from_utf8_lossy(name);
-                    statements.get(&name).map(|s| route_intent(&s.sql)).unwrap_or(RouteIntent::Write)
+                    statements.get(&name).map(|s| route_intent(&s.sql, read_only)).unwrap_or(RouteIntent::Write)
                 }
                 None => RouteIntent::Write,
             }
@@ -976,6 +1034,7 @@ mod tests {
     use super::*;
     use crate::backend::BackendConfig;
     use crate::group::PoolGroup;
+    use crate::protocol::ErrorField;
     use bytes::Bytes;
     use havuz_control::CancelHook;
     use havuz_core::{PoolLimits, SslMode};
@@ -1160,6 +1219,7 @@ mod tests {
             },
             backend_auth: Default::default(),
             allow_password_without_tls: false,
+            read_only: false,
             trace: Default::default(),
             disabled: false,
             description: None,
@@ -1502,7 +1562,7 @@ mod tests {
             let mut client = MaybeTls::Plain(socket);
             let mut state = SessionState::new(PoolMode::Transaction);
             let mut params = ClientParams::new();
-            if policy.read_only {
+            if policy.read_only.is_some() {
                 params.enforce_read_only();
             }
             transaction_relay_inner(&mut client, &group, &mut state, &mut params, policy, None, None).await
@@ -1534,7 +1594,12 @@ mod tests {
 
         let (mut client, relay) = open_policy_session(
             pool.clone(),
-            SessionPolicy { read_only: true, kick: KickSignal::never(), cancel: None },
+            SessionPolicy {
+                read_only: Some(ReadOnlyReason::User),
+                kick: KickSignal::never(),
+                cancel: None,
+                ..Default::default()
+            },
         )
         .await;
 
@@ -1558,7 +1623,12 @@ mod tests {
 
         let (mut client, relay) = open_policy_session(
             pool.clone(),
-            SessionPolicy { read_only: true, kick: KickSignal::never(), cancel: None },
+            SessionPolicy {
+                read_only: Some(ReadOnlyReason::User),
+                kick: KickSignal::never(),
+                cancel: None,
+                ..Default::default()
+            },
         )
         .await;
 
@@ -1586,6 +1656,158 @@ mod tests {
         assert!(!log.iter().any(|sql| sql == "RESET ALL"), "RESET ALL would clear the setting: {log:?}");
     }
 
+    /// Send one statement and return the `ErrorResponse` text, if there was one.
+    async fn refusal(client: &mut TcpStream, sql: &str) -> Option<String> {
+        client.write_all(&query(sql).encode()).await.unwrap();
+        let mut detail = None;
+        loop {
+            let reply = Message::read(client).await.unwrap();
+            if reply.tag == b'E' {
+                detail = reply
+                    .error_fields()
+                    .into_iter()
+                    .find(|(field, _)| *field == ErrorField::Message as u8)
+                    .map(|(_, text)| text);
+            }
+            if reply.tag == b'Z' {
+                return detail;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refusal_names_which_read_only_flag_caused_it() {
+        // The two flags live on different pages. Saying "this user is
+        // read-only" when the pool is the source sends someone to a user record
+        // with the box unticked and no explanation.
+        let server = FakeServer::start().await;
+
+        let (mut client, relay) = open_policy_session(
+            server.pool(2),
+            SessionPolicy { read_only: Some(ReadOnlyReason::User), ..Default::default() },
+        )
+        .await;
+        let detail = refusal(&mut client, "SET default_transaction_read_only = off").await;
+        assert_eq!(detail.as_deref(), Some("this user is read-only; the session cannot be made writable"));
+        drop(client);
+        relay.await.unwrap().unwrap();
+
+        let (mut client, relay) = open_policy_session(
+            server.pool(2),
+            SessionPolicy { read_only: Some(ReadOnlyReason::Pool), ..Default::default() },
+        )
+        .await;
+        let detail = refusal(&mut client, "SET default_transaction_read_only = off").await.unwrap();
+        assert!(detail.contains("read-only"), "{detail}");
+        assert!(detail.contains("app_main"), "the pool has to be named, not just blamed: {detail}");
+        assert!(!detail.contains("user"), "and the user must not be blamed for it: {detail}");
+        drop(client);
+        relay.await.unwrap().unwrap();
+    }
+
+    // --- idle in transaction ---
+
+    #[tokio::test]
+    async fn a_session_idle_inside_a_transaction_is_ended() {
+        // The client that breaks transaction mode's premise: it holds a backend
+        // while doing nothing, and only a disconnect would have freed it.
+        let server = FakeServer::start().await;
+        let pool = server.pool(2);
+
+        let (mut client, relay) = open_policy_session(
+            pool.clone(),
+            SessionPolicy { idle_in_transaction: Duration::from_millis(80), ..Default::default() },
+        )
+        .await;
+
+        exchange(&mut client, "BEGIN").await;
+        let reply = Message::read(&mut client).await.unwrap();
+        assert_eq!(reply.tag, b'E');
+        let fields = reply.error_fields();
+        assert!(
+            fields.iter().any(|(field, value)| *field == ErrorField::Code as u8 && value == "25P03"),
+            "PostgreSQL's own code for this, so a client that already handles it does not have to learn a second: {fields:?}"
+        );
+        assert!(fields.iter().any(|(field, value)| *field == ErrorField::Severity as u8 && value == "FATAL"));
+
+        drop(client);
+        relay.await.unwrap().unwrap();
+
+        // And the backend came back clean rather than being thrown away, which
+        // is the whole reason this is done between two client messages.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(pool.combined_pool_snapshot().idle, 1, "the backend must be reusable");
+        assert!(
+            server.log().iter().any(|sql| sql == "ROLLBACK"),
+            "the open transaction must be undone: {:?}",
+            server.log()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_idle_client_outside_a_transaction_is_left_alone() {
+        // Waiting here is exactly what transaction mode is for: the client
+        // holds nothing, so there is nothing to reclaim.
+        let server = FakeServer::start().await;
+
+        let (mut client, relay) = open_policy_session(
+            server.pool(2),
+            SessionPolicy { idle_in_transaction: Duration::from_millis(50), ..Default::default() },
+        )
+        .await;
+
+        exchange(&mut client, "SELECT 1").await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(exchange(&mut client, "SELECT 2").await, vec![b'C', b'Z'], "the session must still be usable");
+
+        client.write_all(&Message::terminate().encode()).await.unwrap();
+        drop(client);
+        relay.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_transaction_that_keeps_talking_is_not_ended() {
+        // The timer measures silence, not transaction length. A long-running
+        // transaction that is doing work is not the problem this solves.
+        let server = FakeServer::start().await;
+
+        let (mut client, relay) = open_policy_session(
+            server.pool(2),
+            SessionPolicy { idle_in_transaction: Duration::from_millis(120), ..Default::default() },
+        )
+        .await;
+
+        exchange(&mut client, "BEGIN").await;
+        for _ in 0..4 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert_eq!(exchange(&mut client, "SELECT 1").await, vec![b'C', b'Z']);
+        }
+        assert_eq!(exchange(&mut client, "COMMIT").await, vec![b'C', b'Z']);
+
+        client.write_all(&Message::terminate().encode()).await.unwrap();
+        drop(client);
+        relay.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn zero_means_no_idle_limit() {
+        let server = FakeServer::start().await;
+
+        let (mut client, relay) = open_policy_session(
+            server.pool(2),
+            SessionPolicy { idle_in_transaction: Duration::ZERO, ..Default::default() },
+        )
+        .await;
+
+        exchange(&mut client, "BEGIN").await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(exchange(&mut client, "SELECT 1").await, vec![b'C', b'Z'], "off must mean off");
+
+        client.write_all(&Message::terminate().encode()).await.unwrap();
+        drop(client);
+        relay.await.unwrap().unwrap();
+    }
+
     #[tokio::test]
     async fn an_idle_session_is_kicked_as_soon_as_it_is_signalled() {
         let server = FakeServer::start().await;
@@ -1593,9 +1815,11 @@ mod tests {
         let registry = havuz_control::SessionRegistry::new();
         let session = registry.register("svc_orders", "app_main", None, "127.0.0.1:5000", 0).unwrap();
 
-        let (mut client, relay) =
-            open_policy_session(pool.clone(), SessionPolicy { read_only: false, kick: session.signal(), cancel: None })
-                .await;
+        let (mut client, relay) = open_policy_session(
+            pool.clone(),
+            SessionPolicy { read_only: None, kick: session.signal(), cancel: None, ..Default::default() },
+        )
+        .await;
 
         // Establish that the session is working before ending it.
         assert_eq!(exchange(&mut client, "SELECT 1").await, vec![b'C', b'Z']);
@@ -1626,9 +1850,11 @@ mod tests {
         let registry = havuz_control::SessionRegistry::new();
         let session = registry.register("svc_orders", "app_main", None, "127.0.0.1:5000", 0).unwrap();
 
-        let (mut client, relay) =
-            open_policy_session(pool.clone(), SessionPolicy { read_only: false, kick: session.signal(), cancel: None })
-                .await;
+        let (mut client, relay) = open_policy_session(
+            pool.clone(),
+            SessionPolicy { read_only: None, kick: session.signal(), cancel: None, ..Default::default() },
+        )
+        .await;
         exchange(&mut client, "SELECT 1").await;
 
         registry.kick_user("svc_orders");
@@ -1657,9 +1883,11 @@ mod tests {
         let session = registry.register("svc_orders", "app_main", None, "127.0.0.1:5000", 0).unwrap();
         registry.kick_user("svc_orders");
 
-        let (mut client, relay) =
-            open_policy_session(pool.clone(), SessionPolicy { read_only: false, kick: session.signal(), cancel: None })
-                .await;
+        let (mut client, relay) = open_policy_session(
+            pool.clone(),
+            SessionPolicy { read_only: None, kick: session.signal(), cancel: None, ..Default::default() },
+        )
+        .await;
 
         let goodbye = tokio::time::timeout(Duration::from_secs(2), Message::read(&mut client))
             .await
@@ -1677,9 +1905,11 @@ mod tests {
         let mine = registry.register("svc_orders", "app_main", None, "a", 0).unwrap();
         let _theirs = registry.register("svc_reports", "app_main", None, "b", 0).unwrap();
 
-        let (mut client, relay) =
-            open_policy_session(pool.clone(), SessionPolicy { read_only: false, kick: mine.signal(), cancel: None })
-                .await;
+        let (mut client, relay) = open_policy_session(
+            pool.clone(),
+            SessionPolicy { read_only: None, kick: mine.signal(), cancel: None, ..Default::default() },
+        )
+        .await;
 
         // Kicking a different user must leave this session alone.
         assert_eq!(registry.kick_user("svc_reports"), 1);
@@ -1705,7 +1935,12 @@ mod tests {
 
         let (mut client, relay) = open_policy_session(
             pool.clone(),
-            SessionPolicy { read_only: false, kick: KickSignal::never(), cancel: Some(scope.clone()) },
+            SessionPolicy {
+                read_only: None,
+                kick: KickSignal::never(),
+                cancel: Some(scope.clone()),
+                ..Default::default()
+            },
         )
         .await;
 
@@ -1738,7 +1973,12 @@ mod tests {
 
         let (mut client, relay) = open_policy_session(
             pool.clone(),
-            SessionPolicy { read_only: false, kick: KickSignal::never(), cancel: Some(scope.clone()) },
+            SessionPolicy {
+                read_only: None,
+                kick: KickSignal::never(),
+                cancel: Some(scope.clone()),
+                ..Default::default()
+            },
         )
         .await;
         exchange(&mut client, "SELECT 1").await;
@@ -2188,6 +2428,98 @@ mod tests {
         // reads a different snapshot from the transaction they are inside.
         assert_eq!(outcome.to_replica, 0);
         assert_eq!(replica.queries(), 0);
+        assert_eq!(primary.queries(), 4);
+    }
+
+    #[tokio::test]
+    async fn an_explicitly_read_only_transaction_runs_on_the_replica() {
+        // `BEGIN READ ONLY` is the client saying no write is coming, and
+        // PostgreSQL holds it to that. Sending the whole transaction to the
+        // primary anyway was leaving a replica idle for no reason.
+        let primary = FakeServer::start().await;
+        let replica = FakeServer::start().await;
+        let group = group_with(primary.addr, 3, &[replica.addr], true);
+
+        let (outcome, _) = run_session(
+            group,
+            vec![query("BEGIN READ ONLY"), query("SELECT 1"), query("SELECT 2"), query("COMMIT"), Message::terminate()],
+        )
+        .await;
+
+        // One checkout, held for the whole transaction, on the replica.
+        assert_eq!(outcome.checkouts, 1);
+        assert_eq!(outcome.to_replica, 1);
+        assert_eq!(replica.queries(), 4, "and every statement stayed there, as a primary transaction would");
+        assert_eq!(primary.queries(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_read_only_session_opens_its_transactions_on_the_replica() {
+        // Nothing here can write: the GUC is on the backend and every escape is
+        // refused. So a plain `BEGIN` on a read-only pool is as safe to start on
+        // a replica as an explicitly read-only one — which is what makes a
+        // reporting pool actually use the replicas it was given.
+        let primary = FakeServer::start().await;
+        let replica = FakeServer::start().await;
+        let group = group_with(primary.addr, 3, &[replica.addr], true);
+
+        let (mut client, relay) =
+            open_policy_session(group, SessionPolicy { read_only: Some(ReadOnlyReason::Pool), ..Default::default() })
+                .await;
+
+        for sql in ["BEGIN", "SELECT 1", "COMMIT"] {
+            assert_eq!(exchange(&mut client, sql).await, vec![b'C', b'Z']);
+        }
+        client.write_all(&Message::terminate().encode()).await.unwrap();
+        drop(client);
+        let outcome = relay.await.unwrap().unwrap();
+
+        assert_eq!(outcome.to_replica, 1, "one checkout, on the replica, held across the transaction");
+        // Three client statements plus the parameter sync that puts
+        // `default_transaction_read_only` on the backend — which is what makes
+        // starting here safe in the first place.
+        assert_eq!(replica.queries(), 4);
+        assert_eq!(primary.queries(), 0, "the primary should not have been touched at all");
+    }
+
+    #[tokio::test]
+    async fn a_writable_session_still_sends_a_plain_begin_to_the_primary() {
+        // The guarantee only comes from the session being read-only. Without it
+        // a plain `BEGIN` says nothing about what follows, and finding out
+        // halfway through means a transaction split across two servers.
+        let primary = FakeServer::start().await;
+        let replica = FakeServer::start().await;
+        let group = group_with(primary.addr, 3, &[replica.addr], true);
+
+        let (outcome, _) =
+            run_session(group, vec![query("BEGIN"), query("SELECT 1"), query("COMMIT"), Message::terminate()]).await;
+
+        assert_eq!(outcome.to_replica, 0);
+        assert_eq!(primary.queries(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_read_only_transaction_still_follows_its_own_write_to_the_primary() {
+        // The sticky window is about this session's own writes, and a session
+        // that cannot write is never sticky. But one that can, then opens a
+        // read-only transaction, must still be sent where its write went.
+        let primary = FakeServer::start().await;
+        let replica = FakeServer::start().await;
+        let group = group_with(primary.addr, 3, &[replica.addr], true);
+
+        let (outcome, _) = run_session(
+            group,
+            vec![
+                query("INSERT INTO t VALUES (1)"),
+                query("BEGIN READ ONLY"),
+                query("SELECT * FROM t"),
+                query("COMMIT"),
+                Message::terminate(),
+            ],
+        )
+        .await;
+
+        assert_eq!(outcome.to_replica, 0, "a read-only transaction is still a read, and reads follow their write");
         assert_eq!(primary.queries(), 4);
     }
 

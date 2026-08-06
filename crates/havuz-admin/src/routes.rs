@@ -1,6 +1,7 @@
 //! HTTP routes.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use axum::extract::{Path, Query, State};
 use axum::response::IntoResponse;
@@ -28,6 +29,7 @@ pub fn router(state: AdminState) -> Router {
         .route("/pools/{name}/resume", post(resume_pool))
         .route("/pools/{name}/drain", post(drain_pool))
         .route("/pools/{name}/probe", post(probe_pool))
+        .route("/pools/{name}/kick", post(kick_pool))
         .route("/pools/{name}/targets", get(pool_targets))
         .route("/pools/{name}/identities", get(pool_identities))
         .route("/users", get(list_users).post(create_user))
@@ -96,6 +98,8 @@ struct PoolView {
     backend_auth: BackendAuth,
     /// Whether this pool will ask for a password on an unencrypted socket.
     allow_password_without_tls: bool,
+    /// Whether every session through this pool is opened read-only.
+    read_only: bool,
     trace: TraceLevel,
     /// Whether a password is stored. Never the password itself.
     has_backend_password: bool,
@@ -127,6 +131,7 @@ fn pool_view(name: &str, config: &PoolConfig, state: &havuz_core::State, runtime
         aliases: config.aliases.clone(),
         backend_auth: config.backend_auth,
         allow_password_without_tls: config.allow_password_without_tls,
+        read_only: config.read_only,
         trace: config.trace,
         has_backend_password: state.secrets.contains(&havuz_secrets::pool_backend_password(name)),
         targets: config.targets.clone(),
@@ -209,6 +214,14 @@ struct CreatePool {
     /// is on, because the password in question opens the database directly.
     #[serde(default)]
     allow_password_without_tls: bool,
+    /// Open every session on this pool read-only, whoever connects.
+    ///
+    /// A property of the route rather than of a person, which is the form the
+    /// question usually takes: a reporting port, a BI alias beside the
+    /// read-write one. Combines with the per-user flag by OR, so it can only
+    /// ever take permissions away.
+    #[serde(default)]
+    read_only: bool,
     /// How much of this pool's traffic is recorded. Defaults to statements
     /// only: the timings and outcomes are what a pooler is asked to explain,
     /// and the row values are the part that turns a trace into a copy of the
@@ -270,6 +283,15 @@ async fn create_pool(
     }
     let (family, profile) = havuz_registry::resolve(&body.family, body.profile.as_deref())
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+
+    if body.read_only && !family.capabilities.read_only_sessions {
+        // Storing it would produce a pool the dashboard calls read-only and
+        // that writes. Refusing is the only answer that does not lie.
+        return Err(ApiError::BadRequest(format!(
+            "family '{}' cannot hold a session read-only; take the write privileges away in the database instead",
+            family.id
+        )));
+    }
 
     if body.backend_auth.is_per_user() && !family.capabilities.per_user_auth {
         // Refusing beats accepting and quietly pooling everyone through the
@@ -335,6 +357,7 @@ async fn create_pool(
         routing: body.routing.unwrap_or_default(),
         backend_auth: body.backend_auth,
         allow_password_without_tls: body.allow_password_without_tls,
+        read_only: body.read_only,
         trace: body.trace,
         disabled: false,
         description: body.description,
@@ -395,6 +418,25 @@ struct UpdatePool {
     /// every client out of a pool that has no other way in.
     #[serde(default)]
     allow_password_without_tls: Option<bool>,
+    /// Freeze or unfreeze writes through this pool.
+    ///
+    /// Patchable rather than create-only because the reason to reach for it is
+    /// usually an incident — a migration running, a replica being promoted —
+    /// and recreating a pool to stop writes would drop every client anyway.
+    ///
+    /// Read at connect time, so it binds the *next* session. Clients already
+    /// connected keep the policy they started under until they reconnect;
+    /// `POST /pools/{name}/kick` is how an operator stops waiting for that.
+    #[serde(default)]
+    read_only: Option<bool>,
+    /// How long a client may sit inside an open transaction before its session
+    /// is ended, as a humantime string like `"30s"`. `"0s"` means no limit.
+    ///
+    /// Patchable because the reason to set it is usually a pool that has just
+    /// run out of backends, and finding out which client is holding one is
+    /// something the operator is doing right then.
+    #[serde(default, with = "humantime_serde::option")]
+    idle_in_transaction_timeout: Option<Duration>,
 }
 
 async fn update_pool(
@@ -409,6 +451,15 @@ async fn update_pool(
     let family = existing.family.clone();
     if let Some(listen_port) = body.listen_port {
         check_listen_port(&state, &name, listen_port, &family)?;
+    }
+    // Same refusal as at creation, and for the same reason: a pool that reports
+    // `read_only` and accepts writes is worse than one that said no.
+    if body.read_only == Some(true)
+        && !havuz_registry::family(&family).is_some_and(|f| f.capabilities.read_only_sessions)
+    {
+        return Err(ApiError::BadRequest(format!(
+            "family '{family}' cannot hold a session read-only; take the write privileges away in the database instead"
+        )));
     }
     // Withdrawing the exemption from a pool that only exists because of it
     // would leave every client refused at the handshake with no way back
@@ -447,6 +498,12 @@ async fn update_pool(
                 }
                 if let Some(allow) = body.allow_password_without_tls {
                     pool.allow_password_without_tls = allow;
+                }
+                if let Some(read_only) = body.read_only {
+                    pool.read_only = read_only;
+                }
+                if let Some(timeout) = body.idle_in_transaction_timeout {
+                    pool.limits.idle_in_transaction_timeout = timeout;
                 }
                 true
             }
@@ -535,6 +592,25 @@ async fn set_disabled(state: &AdminState, name: &str, disabled: bool) -> Result<
         return Err(ApiError::NotFound(format!("pool '{name}'")));
     }
     state.families.sync_all().map_err(|e| ApiError::Internal(e.to_string()))
+}
+
+/// End every live session on a pool, without closing the pool.
+///
+/// The counterpart to the settings a session reads once and then keeps —
+/// `read_only` above all. Turning a pool read-only binds the next handshake;
+/// this is how the clients already inside it are made to take the new answer,
+/// and it is why freezing writes does not require pausing the pool and locking
+/// readers out with them.
+///
+/// Graceful in the same way [`kick_user`] is: each session stops at its next
+/// statement boundary, so a long query finishes rather than returning a
+/// half-read backend to the pool. Clients reconnect and land on the new policy.
+async fn kick_pool(State(state): State<AdminState>, Path(name): Path<String>) -> Result<impl IntoResponse, ApiError> {
+    if !state.store.load().pools.contains_key(&name) {
+        return Err(ApiError::NotFound(format!("pool '{name}'")));
+    }
+    let kicked = state.registries.sessions.kick_pool(&name);
+    Ok(Json(json!({ "pool": name, "kicked": kicked })))
 }
 
 async fn drain_pool(State(state): State<AdminState>, Path(name): Path<String>) -> Result<impl IntoResponse, ApiError> {
@@ -1117,6 +1193,153 @@ mod tests {
         assert_eq!(body["limits"]["max_size"], 12);
         assert_eq!(body["limits"]["max_client_connections"], 240);
         assert!(state.families.pool_snapshots().iter().any(|pool| pool.name == "app_main" && pool.max_size == 12));
+    }
+
+    #[tokio::test]
+    async fn a_pool_can_be_created_read_only() {
+        let (app, state) = app();
+        let mut payload = pool_payload();
+        payload["read_only"] = json!(true);
+
+        let (status, body) = post(&app, "/api/v1/pools", payload).await;
+        assert_eq!(status, StatusCode::CREATED, "body: {body}");
+        assert_eq!(body["read_only"], true);
+        assert!(state.store.load().pools["app_main"].read_only);
+    }
+
+    #[tokio::test]
+    async fn a_pool_is_writable_unless_asked_otherwise() {
+        let (app, state) = app();
+        let (status, body) = post(&app, "/api/v1/pools", pool_payload()).await;
+        assert_eq!(status, StatusCode::CREATED, "body: {body}");
+        assert_eq!(body["read_only"], false, "a pooler that quietly refuses writes is worse than one that does not");
+        assert!(!state.store.load().pools["app_main"].read_only);
+    }
+
+    #[tokio::test]
+    async fn writes_can_be_frozen_and_thawed_on_a_live_pool() {
+        // The reason to reach for this is an incident — a migration, a
+        // promotion — so it has to work without recreating the pool and
+        // dropping every reader along with the writers.
+        let (app, state) = app();
+        post(&app, "/api/v1/pools", pool_payload()).await;
+
+        let (status, body) = patch(&app, "/api/v1/pools/app_main", json!({ "read_only": true })).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(body["read_only"], true);
+        assert!(state.store.load().pools["app_main"].read_only);
+
+        let (_, body) = patch(&app, "/api/v1/pools/app_main", json!({ "read_only": false })).await;
+        assert_eq!(body["read_only"], false);
+        assert!(!state.store.load().pools["app_main"].read_only);
+    }
+
+    #[tokio::test]
+    async fn patching_something_else_leaves_read_only_alone() {
+        let (app, state) = app();
+        let mut payload = pool_payload();
+        payload["read_only"] = json!(true);
+        post(&app, "/api/v1/pools", payload).await;
+
+        let (_, body) = patch(&app, "/api/v1/pools/app_main", json!({ "max_size": 12 })).await;
+        assert_eq!(body["read_only"], true, "an absent field is not a request to turn writes back on");
+        assert!(state.store.load().pools["app_main"].read_only);
+    }
+
+    #[tokio::test]
+    async fn a_read_only_session_pool_is_flagged_as_unenforceable() {
+        // `pool_payload` asks for session mode, where havuz reads no
+        // statements. The setting still applies as a default, so it is a
+        // guardrail and the dashboard has to say which.
+        let (app, _) = app();
+        let mut payload = pool_payload();
+        payload["read_only"] = json!(true);
+        post(&app, "/api/v1/pools", payload).await;
+
+        let (_, body) = get(&app, "/api/v1/pools").await;
+        let warning = body["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|w| w["kind"] == "read_only_not_enforced")
+            .expect("a promise havuz cannot keep must be visible");
+        assert_eq!(warning["pool"], "app_main");
+        assert_eq!(warning["pool_wide"], true);
+    }
+
+    #[tokio::test]
+    async fn an_idle_in_transaction_limit_can_be_set_on_a_live_pool() {
+        // The moment an operator wants this is the moment a pool has run out of
+        // backends, so it cannot require recreating the pool.
+        let (app, state) = app();
+        post(&app, "/api/v1/pools", pool_payload()).await;
+        assert_eq!(state.store.load().pools["app_main"].limits.idle_in_transaction_timeout, Duration::ZERO);
+
+        let (status, body) =
+            patch(&app, "/api/v1/pools/app_main", json!({ "idle_in_transaction_timeout": "45s" })).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(body["limits"]["idle_in_transaction_timeout"], "45s");
+        assert_eq!(state.store.load().pools["app_main"].limits.idle_in_transaction_timeout, Duration::from_secs(45));
+
+        // Absent is not a request to turn it off.
+        patch(&app, "/api/v1/pools/app_main", json!({ "max_size": 12 })).await;
+        assert_eq!(state.store.load().pools["app_main"].limits.idle_in_transaction_timeout, Duration::from_secs(45));
+
+        let (_, body) = patch(&app, "/api/v1/pools/app_main", json!({ "idle_in_transaction_timeout": "0s" })).await;
+        assert_eq!(body["limits"]["idle_in_transaction_timeout"], "0s", "and it can be turned off again");
+    }
+
+    #[tokio::test]
+    async fn an_idle_limit_on_a_session_pool_is_stored_but_flagged() {
+        // Refusing it would be wrong — the pool may be moved to transaction
+        // mode next — but letting it look enforced would be worse.
+        let (app, _) = app();
+        post(&app, "/api/v1/pools", pool_payload()).await; // session mode
+        patch(&app, "/api/v1/pools/app_main", json!({ "idle_in_transaction_timeout": "30s" })).await;
+
+        let (_, body) = get(&app, "/api/v1/pools").await;
+        assert!(
+            body["warnings"].as_array().unwrap().iter().any(|w| w["kind"] == "idle_timeout_in_session_mode"),
+            "body: {body}"
+        );
+
+        patch(&app, "/api/v1/pools/app_main", json!({ "mode": "transaction" })).await;
+        let (_, body) = get(&app, "/api/v1/pools").await;
+        assert!(
+            !body["warnings"].as_array().unwrap().iter().any(|w| w["kind"] == "idle_timeout_in_session_mode"),
+            "the warning must go once the setting means something: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pool_can_be_emptied_of_clients_without_being_paused() {
+        // Freezing writes binds the next handshake, so the clients already
+        // inside keep the policy they started under. This is the way out that
+        // does not also lock readers out.
+        let (app, state) = app();
+        post(&app, "/api/v1/pools", pool_payload()).await;
+
+        let (status, body) = post(&app, "/api/v1/pools/app_main/kick", json!({})).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(body["kicked"], 0);
+
+        let sessions = state.registries.sessions;
+        let mine = sessions.register("svc", "app_main", None, "10.0.0.1:5000", 0).unwrap();
+        let elsewhere = sessions.register("svc", "reports", None, "10.0.0.2:5000", 0).unwrap();
+
+        let (_, body) = post(&app, "/api/v1/pools/app_main/kick", json!({})).await;
+        assert_eq!(body["kicked"], 1);
+        assert!(mine.signal().is_kicked());
+        assert!(!elsewhere.signal().is_kicked(), "and only this pool's sessions");
+
+        assert!(!state.store.load().pools["app_main"].disabled, "the pool must still accept the reconnects");
+    }
+
+    #[tokio::test]
+    async fn kicking_a_pool_that_does_not_exist_is_a_404() {
+        let (app, _) = app();
+        let (status, _) = post(&app, "/api/v1/pools/ghost/kick", json!({})).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -1906,6 +2129,45 @@ mod tests {
             "the reason must name the limitation, not the credentials: {body}"
         );
         assert!(state.store.load().pools.is_empty());
+    }
+
+    #[tokio::test]
+    async fn read_only_is_refused_by_families_that_cannot_hold_a_session_read_only() {
+        // Storing it would give the dashboard a pool labelled read-only that
+        // accepts writes. The JDBC bridge relays no statements it could inspect
+        // and has no portable setting to lean on.
+        let (app, state) = app();
+        let payload = json!({
+            "name": "legacy",
+            "family": "jdbc",
+            "listen_port": 6433,
+            "read_only": true,
+            "settings": {
+                "url": "jdbc:oracle:thin:@//db.internal:1521/ORCLPDB1",
+                "driver_paths": "/opt/havuz/drivers/ojdbc11.jar",
+                "username": "app",
+                "password": "hunter2",
+            },
+            "limits": { "max_size": 3, "max_client_connections": 100 }
+        });
+
+        let (status, body) = post(&app, "/api/v1/pools", payload.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+        assert!(
+            body["error"]["message"].as_str().unwrap_or_default().contains("read-only"),
+            "the reason must name the limitation: {body}"
+        );
+        assert!(state.store.load().pools.is_empty());
+
+        // And it cannot be smuggled in afterwards either.
+        let mut writable = payload;
+        writable["read_only"] = json!(false);
+        let (status, body) = post(&app, "/api/v1/pools", writable).await;
+        assert_eq!(status, StatusCode::CREATED, "body: {body}");
+
+        let (status, _) = patch(&app, "/api/v1/pools/legacy", json!({ "read_only": true })).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(!state.store.load().pools["legacy"].read_only);
     }
 
     #[tokio::test]

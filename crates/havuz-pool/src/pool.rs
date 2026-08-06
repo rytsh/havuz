@@ -534,6 +534,7 @@ mod tests {
             connect_timeout: Duration::from_millis(100),
             idle_timeout: Duration::from_secs(600),
             max_lifetime: Duration::from_secs(1800),
+            idle_in_transaction_timeout: Duration::ZERO,
         }
     }
 
