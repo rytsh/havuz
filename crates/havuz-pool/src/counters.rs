@@ -25,6 +25,14 @@ pub(crate) struct Counters {
     pub connect_error_total: AtomicU64,
     /// Backends discarded because they were broken or too old.
     pub discarded_total: AtomicU64,
+    /// Backends closed because they could not be made clean enough to reuse.
+    ///
+    /// A subset of `discarded_total`, kept apart because the two mean opposite
+    /// things to an operator. A broken connection is the database's doing; an
+    /// unclean one is a pool that is not recycling, and if this tracks
+    /// `checkout_total` the pool is a connection limiter wearing a pool's
+    /// dashboard.
+    pub unclean_total: AtomicU64,
 
     /// Sum and count let us derive a mean without keeping a histogram on the
     /// hot path; `max` catches the tail that a mean hides.
@@ -61,6 +69,7 @@ impl Counters {
             timeout_total: self.timeout_total.load(Ordering::Relaxed),
             connect_error_total: self.connect_error_total.load(Ordering::Relaxed),
             discarded_total: self.discarded_total.load(Ordering::Relaxed),
+            unclean_total: self.unclean_total.load(Ordering::Relaxed),
             wait: WaitStats {
                 samples,
                 mean_micros: if samples == 0 { 0 } else { total / samples },
@@ -91,6 +100,9 @@ pub struct PoolSnapshot {
     pub timeout_total: u64,
     pub connect_error_total: u64,
     pub discarded_total: u64,
+    /// Of those, the ones closed because nothing could clean them. See
+    /// [`PoolSnapshot::recycle_rate`].
+    pub unclean_total: u64,
 
     pub wait: WaitStats,
 }
@@ -122,6 +134,24 @@ impl PoolSnapshot {
         self.waiting > 0 && self.active >= self.max_size as u64
     }
 
+    /// Fraction of checkouts that ended with the connection going back on the
+    /// shelf rather than being closed.
+    ///
+    /// The number that says whether this is a pool or a connection limiter. A
+    /// healthy pool sits near 1.0; a pool with nothing to clean its connections
+    /// with sits at 0.0 while every other figure on the dashboard looks normal.
+    ///
+    /// `None` before the first checkout, because a rate over no samples is not
+    /// zero — it is unknown, and printing 0% would send someone hunting for a
+    /// problem that has not happened yet.
+    pub fn recycle_rate(&self) -> Option<f32> {
+        if self.checkout_total == 0 {
+            return None;
+        }
+        let recycled = self.checkout_total.saturating_sub(self.unclean_total);
+        Some(recycled as f32 / self.checkout_total as f32)
+    }
+
     /// Fold another pool's numbers into this one.
     ///
     /// Used wherever several `Pool`s add up to one thing an operator thinks of
@@ -144,6 +174,7 @@ impl PoolSnapshot {
         self.timeout_total += other.timeout_total;
         self.connect_error_total += other.connect_error_total;
         self.discarded_total += other.discarded_total;
+        self.unclean_total += other.unclean_total;
         self.max_size = self.max_size.saturating_add(other.max_size);
 
         let total_micros = self.wait.mean_micros * self.wait.samples + other.wait.mean_micros * other.wait.samples;

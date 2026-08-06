@@ -76,6 +76,16 @@
             `limit is not applied. Move the pool to transaction mode, or set PostgreSQL's own ` +
             `idle_in_transaction_session_timeout if the concern is locks rather than pool capacity.`,
         };
+      case "pool_without_reset":
+        return {
+          title: `${w.pool}: backend connections are closed, not reused`,
+          detail:
+            `Nothing is configured that can clear a connection's session state, so rather than risk handing one ` +
+            `client's temporary tables and settings to the next, every connection is closed when its client ` +
+            `leaves. The pool still caps how many exist at once, which is why nothing else here looks wrong — but ` +
+            `every client that connects pays for a fresh database handshake. Pick the driver profile matching your ` +
+            `database, or set a reset query for it.`,
+        };
       case "read_only_not_enforced":
         return {
           title: `${w.pool}: read-only is not enforced in session mode`,

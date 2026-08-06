@@ -45,6 +45,8 @@ pub enum StateError {
     UnknownProfile { pool: String, family: String, profile: String },
     #[error("pool '{pool}' uses family '{family}' which has no driver yet")]
     FamilyNotImplemented { pool: String, family: String },
+    #[error("pool '{pool}' requests {mode} mode, which family '{family}' does not support; it offers {offered}")]
+    PoolModeUnsupported { pool: String, family: String, mode: &'static str, offered: String },
     #[error("pool '{pool}' requests {mode} mode, but profile '{profile}' only supports up to {max}")]
     PoolModeTooAggressive { pool: String, profile: String, mode: &'static str, max: &'static str },
     #[error("pool '{0}' has no targets")]
@@ -305,6 +307,16 @@ impl State {
                     }
                 }
             }
+
+            // The most expensive thing a pool can quietly not do. Without a way
+            // to clear a connection there is nothing safe to hand the next
+            // client, so every one of them is closed on return: the pool caps
+            // how many connections exist at once and never saves a handshake.
+            // Nothing in the dashboard says so — `open` and `active` look
+            // exactly as they would if recycling worked.
+            if !pool.recycles() {
+                out.push(Warning::PoolWithoutReset { pool: name.clone() });
+            }
         }
         out
     }
@@ -385,6 +397,12 @@ pub enum Warning {
     /// that has never been seen, so a first attempt from anyone who can reach
     /// the port reaches PostgreSQL's authentication.
     PassthroughPool {
+        pool: String,
+    },
+    /// The pool has no way to clear a backend connection, so it closes every
+    /// one instead of reusing it. It still caps how many exist at once, which
+    /// is why nothing else on the dashboard looks wrong.
+    PoolWithoutReset {
         pool: String,
     },
 }
@@ -658,6 +676,20 @@ impl PoolConfig {
             None => family.default_profile(),
         };
 
+        // The family's own list comes first, because it is the broader claim
+        // and produces the better message: "jdbc does not do statement mode"
+        // sends an operator somewhere useful, where "profile 'generic' only
+        // supports up to session" suggests another profile would help.
+        if !family.pool_modes.contains(&self.mode) {
+            let offered: Vec<&str> = family.pool_modes.iter().map(|mode| mode.as_str()).collect();
+            return Err(StateError::PoolModeUnsupported {
+                pool: name.into(),
+                family: self.family.clone(),
+                mode: self.mode.as_str(),
+                offered: offered.join(", "),
+            });
+        }
+
         // A profile may cap the pooling mode below what the family supports:
         // Redshift cannot be driven as hard as upstream Postgres.
         if rank(self.mode) > rank(profile.quirks.max_pool_mode) {
@@ -706,6 +738,56 @@ impl PoolConfig {
     /// told rather than shown a comforting one.
     pub fn backend_ceiling(&self) -> Option<u32> {
         (!self.backend_auth.is_per_user()).then_some(self.limits.max_size)
+    }
+
+    /// The driver profile this pool runs under.
+    ///
+    /// Falls back to the family's default, which is what the pool actually gets
+    /// when `profile` is unset. An unknown profile is impossible after
+    /// [`PoolConfig::validate`] and treated as the default here rather than
+    /// panicking on a state file someone edited by hand.
+    pub fn profile(&self) -> Option<&'static havuz_registry::DriverProfile> {
+        let family = havuz_registry::family(&self.family)?;
+        Some(match &self.profile {
+            Some(id) => family.profile(id).unwrap_or_else(|| family.default_profile()),
+            None => family.default_profile(),
+        })
+    }
+
+    /// Statement that returns a backend connection to a reusable state.
+    ///
+    /// The pool's own setting wins, then the profile's. Both may be absent,
+    /// and that is [`PoolConfig::recycles`] returning false rather than an
+    /// error: an operator who has not yet found the right statement for their
+    /// database should get a working pool that churns connections, not a
+    /// refusal.
+    ///
+    /// Only meaningful for families that expose a `reset_query` field.
+    /// PostgreSQL resets with `DISCARD ALL` from inside the driver and has no
+    /// such field, so this returns `None` there and means nothing by it.
+    pub fn reset_query(&self) -> Option<String> {
+        let configured =
+            self.settings.get("reset_query").and_then(|value| value.as_str()).map(str::trim).filter(|s| !s.is_empty());
+        match configured {
+            Some(sql) => Some(sql.to_string()),
+            None => self.profile()?.quirks.session.reset_query.map(str::to_string),
+        }
+    }
+
+    /// Whether a backend connection can go back on the shelf when its client
+    /// leaves, rather than being closed.
+    ///
+    /// True for every family that cleans up from inside its driver. False only
+    /// where the family asks the operator for a reset statement and neither
+    /// they nor the profile supplied one — see [`Warning::PoolWithoutReset`].
+    pub fn recycles(&self) -> bool {
+        let Some(family) = havuz_registry::family(&self.family) else {
+            return true;
+        };
+        if !family.config_fields.iter().any(|field| field.name == "reset_query") {
+            return true;
+        }
+        self.reset_query().is_some()
     }
 
     /// Best-case client-to-backend ratio this pool can deliver.
@@ -959,6 +1041,16 @@ mod tests {
         }
     }
 
+    /// A pool on the family that asks the operator for its reset statement.
+    fn jdbc_pool() -> PoolConfig {
+        let mut pool = pool();
+        pool.family = "jdbc".into();
+        pool.database = String::new();
+        pool.settings.insert("url".into(), serde_json::json!("jdbc:postgresql://db:5432/appdb"));
+        pool.settings.insert("driver_paths".into(), serde_json::json!("/opt/havuz/drivers/postgresql.jar"));
+        pool
+    }
+
     fn state_with_pool(name: &str, pool: PoolConfig) -> State {
         let mut state = State::default();
         state.pools.insert(name.into(), pool);
@@ -1016,6 +1108,86 @@ mod tests {
         p.profile = Some("cockroachdb".into());
         p.mode = PoolMode::Transaction;
         state_with_pool("app_main", p).validate().unwrap();
+    }
+
+    #[test]
+    fn a_family_that_does_not_offer_a_mode_refuses_it_before_the_profile_is_consulted() {
+        // Previously unchecked: validation only ever read the profile cap, so a
+        // family could advertise a mode list nothing enforced.
+        let mut p = jdbc_pool();
+        p.mode = PoolMode::Statement;
+        let err = state_with_pool("legacy", p).validate().unwrap_err();
+        assert_eq!(
+            err,
+            StateError::PoolModeUnsupported {
+                pool: "legacy".into(),
+                family: "jdbc".into(),
+                mode: "statement",
+                offered: "session, transaction".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn the_generic_jdbc_profile_still_refuses_transaction_mode() {
+        // The family offers it now; the profile that knows nothing about its
+        // database does not, and that is the check that has to hold.
+        let mut p = jdbc_pool();
+        p.mode = PoolMode::Transaction;
+        let err = state_with_pool("legacy", p).validate().unwrap_err();
+        assert_eq!(
+            err,
+            StateError::PoolModeTooAggressive {
+                pool: "legacy".into(),
+                profile: "generic".into(),
+                mode: "transaction",
+                max: "session",
+            }
+        );
+    }
+
+    #[test]
+    fn a_jdbc_profile_that_classifies_may_run_in_transaction_mode() {
+        let mut p = jdbc_pool();
+        p.profile = Some("postgresql".into());
+        p.mode = PoolMode::Transaction;
+        state_with_pool("legacy", p).validate().unwrap();
+    }
+
+    #[test]
+    fn the_reset_query_falls_back_to_the_profile_and_the_setting_overrides_it() {
+        let mut p = jdbc_pool();
+        p.profile = Some("postgresql".into());
+        assert_eq!(p.reset_query().as_deref(), Some("DISCARD ALL"));
+        assert!(p.recycles());
+
+        p.settings.insert("reset_query".into(), serde_json::json!("  RESET ALL  "));
+        assert_eq!(p.reset_query().as_deref(), Some("RESET ALL"), "and is trimmed");
+
+        // Whitespace is not an override; it is an empty field.
+        p.settings.insert("reset_query".into(), serde_json::json!("   "));
+        assert_eq!(p.reset_query().as_deref(), Some("DISCARD ALL"));
+    }
+
+    #[test]
+    fn a_pool_with_nothing_to_clean_connections_with_says_so() {
+        // The failure this exists to surface: the pool works, the dashboard
+        // looks healthy, and every client disconnect costs a fresh handshake
+        // because nothing can be reused.
+        let p = jdbc_pool();
+        assert_eq!(p.reset_query(), None);
+        assert!(!p.recycles());
+
+        let warnings = state_with_pool("legacy", p).warnings();
+        assert!(warnings.contains(&Warning::PoolWithoutReset { pool: "legacy".into() }));
+    }
+
+    #[test]
+    fn a_family_that_resets_from_inside_its_driver_is_never_warned_about() {
+        // PostgreSQL has no reset_query field because it does not need one, and
+        // a warning there would be noise an operator cannot act on.
+        let warnings = state_with_pool("app_main", pool()).warnings();
+        assert!(!warnings.iter().any(|w| matches!(w, Warning::PoolWithoutReset { .. })));
     }
 
     #[test]

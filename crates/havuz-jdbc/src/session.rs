@@ -8,16 +8,43 @@
 //! would be a demo: JDBC, pgx, asyncpg and Npgsql all use the extended
 //! protocol, and a bridge whose whole purpose is to be reached by real
 //! applications has to speak what real applications send.
+//!
+//! ## Where the backend is held
+//!
+//! A session borrows a JDBC connection from the moment the client asks for work
+//! until the driver reports no transaction open, which is the same rule
+//! `havuz-pg` follows and for the same reason. Three things make it work here:
+//!
+//! **The transaction boundary is a fact, not a guess.** The agent answers with
+//! `inTransaction` read from `Connection.getAutoCommit()`. That is the JDBC
+//! equivalent of the `ReadyForQuery` status byte, and it means transaction
+//! boundaries are never inferred by looking for `COMMIT`.
+//!
+//! **What dirties a session is the product's answer, not ours.** The bridge
+//! sees SQL in a dialect it was not told the name of, so it cannot decide
+//! whether `ALTER SESSION` matters. [`SessionRules`] on the driver profile
+//! says, and anything it does not recognise pins — see
+//! [`havuz_registry::SessionRules::shareable`].
+//!
+//! **Prepared statements move with the client for free.** The agent creates and
+//! closes a `PreparedStatement` per call, so nothing on the Java side is bound
+//! to the connection this client happened to borrow. The metadata cached here
+//! describes the SQL, not the socket, and survives a handover untouched.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use bytes::{Buf, Bytes};
+use havuz_control::{HolderHandle, KickSignal};
 use havuz_pg::protocol::sqlstate;
 use havuz_pg::{FieldDescription, MaybeTls, Message, TransactionStatus};
-use havuz_proto::{ProtoError, ProtoResult};
+use havuz_pool::{Checkout, Pool};
+use havuz_proto::{FlowEvent, PinReason, ProtoError, ProtoResult, SessionState as FlowState};
+use havuz_registry::{PoolMode, SessionRules};
 use serde_json::{json, Value};
 
 use crate::agent::{Agent, AgentError};
+use crate::conn::JdbcConnector;
 use crate::rewrite::{self, Rewritten};
 use crate::types::{command_tag, pg_type};
 
@@ -69,14 +96,43 @@ pub struct SessionStats {
     pub rows: u64,
 }
 
+/// How a session is allowed to behave, beyond what its statements ask for.
+pub struct SessionPolicy {
+    /// How long a client may sit inside an open transaction before the session
+    /// is ended. Zero disables it.
+    ///
+    /// Only meaningful in a multiplexing mode: in session mode the client owns
+    /// its backend anyway, so ending it early frees nothing that disconnecting
+    /// would not. `State::warnings` says so rather than letting the setting
+    /// look like it applies everywhere.
+    pub idle_in_transaction: Duration,
+    /// Fires when an operator kills this session from the admin API.
+    pub kick: KickSignal,
+}
+
 /// Relay a client through the agent until one side hangs up.
 pub struct Session<'a> {
     agent: &'a Agent,
-    /// The agent's handle for this client's JDBC connection.
-    handle: &'a str,
+    pool: &'a Pool<JdbcConnector>,
+    /// The JDBC connection this client is holding, if it is holding one.
+    ///
+    /// `None` between transactions in a multiplexing mode, and that absence is
+    /// the entire source of the fan-in.
+    held: Option<Checkout<JdbcConnector>>,
+    /// The agent's handle for [`Session::held`]. Empty when nothing is held.
+    ///
+    /// Kept beside the checkout rather than read through it so an agent call
+    /// does not have to borrow `held` for the length of a round trip into the
+    /// JVM.
+    handle: String,
+    flow: FlowState,
+    rules: SessionRules,
+    policy: SessionPolicy,
+    holder: &'a HolderHandle,
+    /// What the dashboard calls the thing this session is holding.
+    target: String,
     statements: HashMap<String, Prepared>,
     portals: HashMap<String, Portal>,
-    in_transaction: bool,
     /// Set when a message failed and everything until `Sync` must be skipped,
     /// which is what the extended protocol requires and what stops a client
     /// from acting on the results of statements that never ran.
@@ -85,30 +141,111 @@ pub struct Session<'a> {
 }
 
 impl<'a> Session<'a> {
-    pub fn new(agent: &'a Agent, handle: &'a str) -> Self {
-        Self {
+    /// Start a session that already holds `checkout`.
+    ///
+    /// The caller acquires the first backend before the handshake completes,
+    /// which is what turns an exhausted pool into an error the client gets at
+    /// connect time instead of one it discovers on its first query. In a
+    /// multiplexing mode that backend is handed straight back: from here the
+    /// client holds nothing while it is idle.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        agent: &'a Agent,
+        pool: &'a Pool<JdbcConnector>,
+        checkout: Checkout<JdbcConnector>,
+        mode: PoolMode,
+        rules: SessionRules,
+        policy: SessionPolicy,
+        holder: &'a HolderHandle,
+        target: String,
+    ) -> Self {
+        let mut session = Self {
             agent,
-            handle,
+            pool,
+            handle: checkout.handle().to_string(),
+            held: Some(checkout),
+            flow: FlowState::new(mode),
+            rules,
+            policy,
+            holder,
+            target,
             statements: HashMap::new(),
             portals: HashMap::new(),
-            in_transaction: false,
             failed: false,
             stats: SessionStats::default(),
-        }
+        };
+        session.release_if_idle();
+        session.report_holder();
+        session
     }
 
     pub fn stats(&self) -> &SessionStats {
         &self.stats
     }
 
+    /// Why this session stopped being shareable, if it did.
+    ///
+    /// Always `None` in session mode, where nothing was ever shared and a
+    /// verdict would only flatter the pin rate.
+    pub fn pin(&self) -> Option<PinReason> {
+        self.flow.mode().multiplexes().then(|| self.flow.pin()).flatten()
+    }
+
+    /// The backend this session is still holding, for the caller to clean up.
+    pub fn into_checkout(self) -> Option<Checkout<JdbcConnector>> {
+        self.held
+    }
+
     /// Read and answer client messages until it disconnects.
     pub async fn run(&mut self, client: &mut MaybeTls) -> ProtoResult<()> {
         loop {
-            let message = match Message::read(client).await {
-                Ok(message) => message,
-                // A client that vanishes mid-session is ordinary, not an error:
-                // connection pools close idle connections all the time.
-                Err(_) => return Ok(()),
+            // Between two client messages is the only moment at which ending a
+            // session cannot leave a statement half-run, so both ways of ending
+            // one early live here. The idle timer runs only while a transaction
+            // is open: outside one this wait holds nothing and is exactly what
+            // transaction mode is for.
+            let idle_limit = self.policy.idle_in_transaction;
+            let ticking = !idle_limit.is_zero() && self.flow.in_transaction() && self.held.is_some();
+
+            let message = tokio::select! {
+                biased;
+                _ = self.policy.kick.kicked() => {
+                    let _ = Message::fatal(
+                        sqlstate::ADMIN_SHUTDOWN,
+                        "terminating connection due to administrator command",
+                    )
+                    .write(client)
+                    .await;
+                    return Ok(());
+                }
+                _ = tokio::time::sleep(idle_limit), if ticking => {
+                    // PostgreSQL's own code and wording, because it is the same
+                    // event and a client that already handles it from the
+                    // database should not have to learn a second spelling.
+                    let _ = Message::fatal(
+                        sqlstate::IDLE_IN_TRANSACTION_SESSION_TIMEOUT,
+                        "terminating connection due to idle-in-transaction timeout",
+                    )
+                    .write(client)
+                    .await;
+                    // The transaction is abandoned, not committed: the client
+                    // never said commit and guessing that it meant to would be
+                    // inventing a write nobody asked for.
+                    self.abandon().await;
+                    tracing::info!(
+                        pool = %self.pool.name(),
+                        timeout_ms = idle_limit.as_millis() as u64,
+                        "ended a jdbc session idle inside an open transaction"
+                    );
+                    return Ok(());
+                }
+                read = Message::read(client) => match read {
+                    Ok(message) => message,
+                    // A client that vanishes mid-session is ordinary, not an
+                    // error: connection pools close idle connections all the
+                    // time.
+                    Err(_) => return Ok(()),
+                },
             };
 
             match message.tag {
@@ -131,6 +268,97 @@ impl<'a> Session<'a> {
                     self.sync(client).await?;
                 }
             }
+        }
+    }
+
+    // --- holding a backend ---
+
+    /// The agent handle for this client's connection, borrowing one if the
+    /// client is not currently holding any.
+    async fn backend(&mut self) -> Result<String, AgentError> {
+        if self.held.is_some() {
+            return Ok(self.handle.clone());
+        }
+
+        let checkout = self.pool.acquire().await.map_err(|e| AgentError::Exhausted(e.to_string()))?;
+        self.handle = checkout.handle().to_string();
+        self.held = Some(checkout);
+        self.report_holder();
+        Ok(self.handle.clone())
+    }
+
+    /// Give the backend back if the client is between transactions.
+    ///
+    /// No reset on the way out, deliberately. Recycling after every transaction
+    /// would add a round trip into the JVM to every single one and undo most of
+    /// the benefit; it is unnecessary because anything that dirties the
+    /// connection was classified as a pin, and a pinned connection is never
+    /// released. The reset happens once, when the client finally goes away.
+    fn release_if_idle(&mut self) {
+        if !self.flow.is_releasable() {
+            self.report_holder();
+            return;
+        }
+        if self.held.take().is_some() {
+            self.handle.clear();
+            self.flow.released();
+        }
+        self.holder.clear();
+    }
+
+    /// Roll back and drop whatever this session is holding.
+    ///
+    /// Used when the session is ended from outside rather than by the client.
+    async fn abandon(&mut self) {
+        if self.held.is_none() {
+            return;
+        }
+        let handle = self.handle.clone();
+        if let Err(e) = self.agent.call("rollback", json!({ "session": handle })).await {
+            tracing::debug!(error = %e, "rolling back an abandoned jdbc transaction failed");
+            if let Some(checkout) = self.held.as_mut() {
+                checkout.poison();
+            }
+        }
+        self.flow.observe(FlowEvent::Idle);
+    }
+
+    /// Tell the dashboard what this session is doing with a backend.
+    fn report_holder(&self) {
+        match self.flow.pin() {
+            Some(reason) if self.held.is_some() => self.holder.pinned(reason, self.target.clone(), None),
+            _ if self.held.is_none() => self.holder.clear(),
+            _ if self.flow.in_transaction() => self.holder.idle_in_transaction(self.target.clone(), None),
+            _ => self.holder.session_reserved(self.target.clone(), None),
+        }
+    }
+
+    /// Fold one statement's outcome into the release decision.
+    fn observe(&mut self, sql: &str, in_transaction: bool) {
+        // Classification is skipped outside a multiplexing mode. In session
+        // mode the connection is never shared, so every statement would be
+        // reported as a pin and the pin breakdown — the one number that tells
+        // an operator why transaction mode is not paying off — would be noise.
+        if self.flow.mode().multiplexes() {
+            if let Some(reason) = self.rules.classify(sql) {
+                self.flow.observe(FlowEvent::MustPin(reason));
+            }
+        }
+        self.flow.observe(if in_transaction { FlowEvent::InTransaction } else { FlowEvent::Idle });
+    }
+
+    /// Record what an agent failure means for the connection underneath it.
+    ///
+    /// A database error is the statement's problem and leaves the connection
+    /// usable; anything else means the JVM stopped answering and what the
+    /// driver is doing is unknown. Unknown is not shareable.
+    fn observe_error(&mut self, error: &AgentError) {
+        if matches!(error, AgentError::Database { .. }) {
+            return;
+        }
+        self.flow.observe(FlowEvent::Broken);
+        if let Some(checkout) = self.held.as_mut() {
+            checkout.poison();
         }
     }
 
@@ -345,23 +573,57 @@ impl<'a> Session<'a> {
     // --- shared ---
 
     async fn run_sql(&mut self, sql: &str, values: &[Value]) -> Result<Outcome, AgentError> {
-        let result =
-            self.agent.call("execute", json!({ "session": self.handle, "sql": sql, "params": values })).await?;
+        let handle = self.backend().await?;
+        let result = match self.agent.call("execute", json!({ "session": handle, "sql": sql, "params": values })).await
+        {
+            Ok(result) => result,
+            Err(e) => {
+                self.observe_error(&e);
+                return Err(e);
+            }
+        };
         let outcome = Outcome::from(&result);
-        self.in_transaction = outcome.in_transaction;
+        self.observe(sql, outcome.in_transaction);
         Ok(outcome)
     }
 
-    async fn agent_describe(&self, sql: &str) -> Result<(Vec<FieldDescription>, usize), AgentError> {
-        let result = self.agent.call("describe", json!({ "session": self.handle, "sql": sql })).await?;
+    async fn agent_describe(&mut self, sql: &str) -> Result<(Vec<FieldDescription>, usize), AgentError> {
+        // Describing needs a live connection even though it runs nothing, so a
+        // `Parse` is where a multiplexing session starts holding one. That is
+        // the same point `havuz-pg` starts holding: the client asked for work.
+        let handle = self.backend().await?;
+        let result = match self.agent.call("describe", json!({ "session": handle, "sql": sql })).await {
+            Ok(result) => result,
+            Err(e) => {
+                self.observe_error(&e);
+                return Err(e);
+            }
+        };
         let columns = fields(result.get("columns"));
         let params = result.get("paramCount").and_then(Value::as_i64).unwrap_or(-1);
         Ok((columns, if params > 0 { params as usize } else { 0 }))
     }
 
     async fn control(&mut self, control: TransactionControl) -> Result<(), AgentError> {
-        let result = self.agent.call(control.method(), json!({ "session": self.handle })).await?;
-        self.in_transaction = result.get("inTransaction").and_then(Value::as_bool).unwrap_or(false);
+        // Ending a transaction nobody started needs no backend. PostgreSQL
+        // answers this with a warning and the tag, and borrowing a connection
+        // to tell a driver's idle `COMMIT` the same thing would spend a
+        // checkout on nothing.
+        if self.held.is_none() && control != TransactionControl::Begin {
+            self.flow.observe(FlowEvent::Idle);
+            return Ok(());
+        }
+
+        let handle = self.backend().await?;
+        let result = match self.agent.call(control.method(), json!({ "session": handle })).await {
+            Ok(result) => result,
+            Err(e) => {
+                self.observe_error(&e);
+                return Err(e);
+            }
+        };
+        let in_transaction = result.get("inTransaction").and_then(Value::as_bool).unwrap_or(false);
+        self.flow.observe(if in_transaction { FlowEvent::InTransaction } else { FlowEvent::Idle });
         Ok(())
     }
 
@@ -378,8 +640,16 @@ impl<'a> Session<'a> {
         Message::command_complete(&tag).write(client).await.map_err(protocol)
     }
 
+    /// End an exchange: hand the backend back if the client owes us nothing,
+    /// then tell it we are ready.
+    ///
+    /// Released before the `ReadyForQuery` rather than after, so the connection
+    /// is already available to whoever is queued behind this client by the time
+    /// this one is told it may send more.
     async fn ready(&mut self, client: &mut MaybeTls) -> ProtoResult<()> {
-        let status = if self.in_transaction { TransactionStatus::InTransaction } else { TransactionStatus::Idle };
+        let status =
+            if self.flow.in_transaction() { TransactionStatus::InTransaction } else { TransactionStatus::Idle };
+        self.release_if_idle();
         Message::ready_for_query(status).write(client).await.map_err(protocol)
     }
 
@@ -495,10 +765,44 @@ enum TransactionControl {
 
 impl TransactionControl {
     fn of(sql: &str) -> Option<Self> {
-        let word = sql.trim_start().split(|c: char| c.is_whitespace() || c == ';').next()?.to_ascii_uppercase();
-        match word.as_str() {
-            "BEGIN" | "START" => Some(Self::Begin),
-            "COMMIT" | "END" => Some(Self::Commit),
+        let mut words = sql
+            .trim_start()
+            .split(|c: char| c.is_whitespace() || c == ';')
+            .filter(|word| !word.is_empty())
+            .map(|word| word.to_ascii_uppercase());
+
+        let first = words.next()?;
+        let second = words.next();
+
+        match first.as_str() {
+            // `BEGIN` opens a transaction in PostgreSQL and an anonymous block
+            // in Oracle and Db2, and the client speaks PostgreSQL while the
+            // database may not. The two are told apart by what follows: a
+            // transaction start is either bare or carries one of the
+            // characteristics `BEGIN` accepts, and a block carries a statement.
+            //
+            // Getting this wrong is not cosmetic. A block treated as `BEGIN`
+            // would leave the client believing its PL/SQL ran when nothing but
+            // `setAutoCommit(false)` did.
+            "BEGIN" => matches!(
+                second.as_deref(),
+                None | Some("WORK")
+                    | Some("TRANSACTION")
+                    | Some("ISOLATION")
+                    | Some("READ")
+                    | Some("DEFERRABLE")
+                    | Some("NOT")
+            )
+            .then_some(Self::Begin),
+            // Only ever `START TRANSACTION`; anything else is a procedure a
+            // driver happened to name that way.
+            "START" => (second.as_deref() == Some("TRANSACTION")).then_some(Self::Begin),
+            "COMMIT" => Some(Self::Commit),
+            // PostgreSQL's synonym for COMMIT, and the terminator of a PL/SQL
+            // block. A bare `END` is the former; `END LOOP` and friends only
+            // ever arrive inside a block, which the `BEGIN` arm already refused
+            // to treat as control.
+            "END" => matches!(second.as_deref(), None | Some("WORK") | Some("TRANSACTION")).then_some(Self::Commit),
             "ROLLBACK" | "ABORT" => Some(Self::Rollback),
             _ => None,
         }
@@ -595,6 +899,8 @@ mod tests {
         // disagreeing about whether a transaction is open.
         assert_eq!(TransactionControl::of("begin"), Some(TransactionControl::Begin));
         assert_eq!(TransactionControl::of("  BEGIN;"), Some(TransactionControl::Begin));
+        assert_eq!(TransactionControl::of("BEGIN WORK"), Some(TransactionControl::Begin));
+        assert_eq!(TransactionControl::of("BEGIN ISOLATION LEVEL SERIALIZABLE"), Some(TransactionControl::Begin));
         assert_eq!(TransactionControl::of("start transaction"), Some(TransactionControl::Begin));
         assert_eq!(TransactionControl::of("COMMIT"), Some(TransactionControl::Commit));
         assert_eq!(TransactionControl::of("end"), Some(TransactionControl::Commit));
@@ -605,6 +911,21 @@ mod tests {
         assert_eq!(TransactionControl::of(""), None);
         // Not a transaction control statement, despite the prefix.
         assert_eq!(TransactionControl::of("beginning"), None);
+    }
+
+    #[test]
+    fn a_plsql_block_is_not_a_transaction_start() {
+        // The whole reason this bridge exists is databases that are not
+        // PostgreSQL, and in Oracle and Db2 `BEGIN` opens an anonymous block.
+        // Treating one as transaction control would answer the client with a
+        // `BEGIN` tag while nothing but setAutoCommit(false) had happened —
+        // the client's procedure would silently never run.
+        assert_eq!(TransactionControl::of("BEGIN DBMS_OUTPUT.PUT_LINE('x'); END;"), None);
+        assert_eq!(TransactionControl::of("begin\n  null;\nend;"), None);
+        assert_eq!(TransactionControl::of("BEGIN ATOMIC SET x = 1; END"), None);
+
+        // And `START` only ever means a transaction as `START TRANSACTION`.
+        assert_eq!(TransactionControl::of("START JOB 'nightly'"), None);
     }
 
     #[test]

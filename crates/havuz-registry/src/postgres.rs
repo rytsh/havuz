@@ -5,6 +5,7 @@
 //! covers most of what competitors advertise as separate "database support".
 
 use crate::field::{ConfigField, FieldKind, FieldRole, SelectOption};
+use crate::session::SessionRules;
 use crate::{Capabilities, DriverProfile, FamilyDescriptor, Maturity, PoolMode, Quirks};
 
 pub(crate) const POSTGRES: FamilyDescriptor = FamilyDescriptor {
@@ -25,6 +26,9 @@ pub(crate) const POSTGRES: FamilyDescriptor = FamilyDescriptor {
         reports_transaction_status: true,
         listen_notify: true,
         advisory_locks: true,
+        // `havuz_pg::classify` reads statements properly rather than matching
+        // leading words, so no profile here has to describe its own SQL.
+        classifies_statements: true,
     },
     pool_modes: &[PoolMode::Session, PoolMode::Transaction, PoolMode::Statement],
     // Transaction mode is what lets persistent application clients share a
@@ -56,6 +60,7 @@ const PROFILES: &[DriverProfile] = &[
             supports_listen_notify: false,
             supports_prepared_statements: true,
             max_pool_mode: PoolMode::Transaction,
+            session: SessionRules::OPAQUE,
         },
     },
     DriverProfile {
@@ -71,6 +76,7 @@ const PROFILES: &[DriverProfile] = &[
             supports_listen_notify: false,
             supports_prepared_statements: true,
             max_pool_mode: PoolMode::Transaction,
+            session: SessionRules::OPAQUE,
         },
     },
     DriverProfile {
@@ -84,6 +90,7 @@ const PROFILES: &[DriverProfile] = &[
             supports_listen_notify: false,
             supports_prepared_statements: true,
             max_pool_mode: PoolMode::Transaction,
+            session: SessionRules::OPAQUE,
         },
     },
     DriverProfile {
@@ -99,6 +106,7 @@ const PROFILES: &[DriverProfile] = &[
             // openGauss negotiates a non-standard SHA256 auth variant, so we
             // stay in session mode until that path is proven.
             max_pool_mode: PoolMode::Session,
+            session: SessionRules::OPAQUE,
         },
     },
 ];

@@ -60,6 +60,17 @@ pub fn render(pools: &[PoolSnapshot], targets: &[TargetReport], pins: &PinReport
         pools,
         |p| p.discarded_total as f64,
     );
+    // Tracking `havuz_pool_checkouts_total` means the pool is not recycling at
+    // all: it caps how many connections exist at once and saves no handshakes.
+    // Nothing else here would look wrong while that is true.
+    series(
+        &mut out,
+        "havuz_pool_connections_unclean_total",
+        "counter",
+        "Backends closed because nothing could clean them for reuse",
+        pools,
+        |p| p.unclean_total as f64,
+    );
 
     series(&mut out, "havuz_pool_wait_seconds_max", "gauge", "Longest observed checkout wait", pools, |p| {
         p.wait.max_micros as f64 / 1_000_000.0
@@ -219,6 +230,7 @@ mod tests {
             timeout_total: 2,
             connect_error_total: 0,
             discarded_total: 1,
+            unclean_total: 0,
             wait: WaitStats { samples: 1234, mean_micros: 1500, max_micros: 250_000 },
         }
     }

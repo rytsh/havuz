@@ -87,6 +87,26 @@
       .catch(() => (clientTls = null));
   });
 
+  /**
+   * How aggressive a mode is, so a profile's cap can be compared against the
+   * family's list. Mirrors `rank` in havuz-core's state validation.
+   */
+  const modeRank: Record<PoolMode, number> = { session: 0, transaction: 1, statement: 2 };
+
+  /**
+   * Modes this family offers that the chosen product can actually hold.
+   *
+   * The two are separate facts and the API enforces both: the JDBC bridge
+   * offers transaction mode, but only for a profile that has told havuz which
+   * of its statements leave state behind. Offering the option and then
+   * refusing the submission would be a worse way to say the same thing.
+   */
+  const availableModes = $derived.by<PoolMode[]>(() => {
+    if (!selected) return [];
+    const cap = selected.profiles.find((p) => p.id === profileId)?.quirks.max_pool_mode ?? "session";
+    return selected.pool_modes.filter((m) => modeRank[m] <= modeRank[cap]);
+  });
+
   function categoryOf(family: Family): string {
     if (family.id === "redis") return "cache";
     if (family.id === "jdbc") return "bridge";
@@ -97,7 +117,9 @@
     if (!family.usable || profile.maturity === "planned") return;
     selected = family;
     profileId = profile.id;
-    mode = family.default_pool_mode;
+    mode = modeRank[family.default_pool_mode] <= modeRank[profile.quirks.max_pool_mode]
+      ? family.default_pool_mode
+      : profile.quirks.max_pool_mode;
     backendAuth = "shared";
     allowPasswordWithoutTls = false;
     readOnly = false;
@@ -345,11 +367,29 @@
       <label for="mode">Pooling mode</label>
       <div class="help">Only transaction and statement mode can share a backend between clients.</div>
       <select id="mode" bind:value={mode}>
-        {#each selected.pool_modes as m (m)}
+        {#each availableModes as m (m)}
           <option value={m}>{m}</option>
         {/each}
       </select>
+      {#if availableModes.length < selected.pool_modes.length}
+        <div class="help">
+          {selectedProfile?.label ?? selected.label} cannot be pooled harder than
+          <code>{availableModes[availableModes.length - 1]}</code>. havuz would have to know which of its statements
+          leave state behind before it could hand a backend to another client, and for this product it does not.
+        </div>
+      {/if}
     </div>
+
+    {#if selectedProfile && selectedProfile.quirks.session.reset_query === null && selected.pool_modes.length > 1}
+      <div class="field">
+        <div class="help">
+          <strong>{selectedProfile.label} connections will be closed rather than reused.</strong>
+          havuz has no statement for clearing one, so returning it would risk handing this client's temporary tables
+          and settings to the next. The pool still caps how many connections exist at once, but every client that
+          connects pays for a fresh database handshake. Set a reset query below if your database has one.
+        </div>
+      </div>
+    {/if}
 
     <PoolModeGuide {mode} />
 

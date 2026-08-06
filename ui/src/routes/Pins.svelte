@@ -21,6 +21,8 @@
     holdable_cursor: "A cursor declared WITH HOLD survives commit. Drop WITH HOLD, or fetch the rows in one go.",
     bulk_transfer: "COPY takes over the connection for its duration. Expected and unavoidable for bulk loads.",
     replication: "Replication connections are inherently exclusive. Nothing to fix.",
+    procedure_state:
+      "A stored-procedure call left state behind that outlives the transaction \u2014 Oracle package globals, Db2 module variables. The statement text only says that procedural code ran, so havuz cannot tell a stateless call from a stateful one and pins either way. Move the state into a table, or keep these calls on a session-mode pool.",
     unclassified: "havuz could not classify this and pinned to stay safe. Please report the statement.",
   };
 

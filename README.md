@@ -422,15 +422,45 @@ Three things are worth knowing before turning it on.
 **A Java runtime is required**, 17 or newer, on `PATH` or named per pool. havuz
 says so at startup rather than failing on the first connection.
 
-**A reset query is required to reuse connections.** JDBC has no portable
-equivalent of `DISCARD ALL`, so without one havuz closes a connection rather
-than returning it: a temporary table or a changed `search_path` reaching the
-next client is a correctness bug, not a tuning choice. Set `DISCARD ALL` for
-PostgreSQL and whatever your database calls one elsewhere.
+**Pick the driver profile that matches your database.** The profile is not
+cosmetic here. It carries the two things a bridge cannot work out for itself:
+the statement that clears a connection, and which statements leave something
+behind. Choosing `generic` is choosing to tell havuz nothing, and havuz behaves
+accordingly.
 
-**Session mode only.** Transaction mode would need session state — schema,
-isolation level, autocommit — carried between backends, and that is a decision
-worth making with a second database in hand rather than in advance.
+| Profile | Reset | Pooling |
+| --- | --- | --- |
+| `generic` | none | session |
+| `postgresql` | `DISCARD ALL` | session, **transaction** |
+| `oracle` | `MODIFY_PACKAGE_STATE(REINITIALIZE)` | session |
+| `db2` | none | session |
+
+**Without a reset statement a pool does not reuse connections.** JDBC has no
+portable equivalent of `DISCARD ALL`, so without one havuz closes a connection
+rather than returning it: a temporary table or a changed `search_path` reaching
+the next client is a correctness bug, not a tuning choice. The pool still caps
+how many connections exist at once, and nothing else on the dashboard looks
+wrong — which is why `recycle_rate` and a banner say so out loud. Override the
+profile's statement with `reset_query` when you know better.
+
+**Transaction mode is offered where it can be made safe, and refused where it
+cannot.** The rule is the usual one: when a transaction ends, the backend must
+carry nothing belonging to the client that used it. Whether a product can
+promise that turns on a detail of how it spells "temporary table".
+
+PostgreSQL temporary tables are *created* per session, so the `CREATE` pins the
+connection and it is never shared again. Oracle global temporary tables and Db2
+declared global temporary tables are schema objects a DBA created once; only
+their **rows** are session-scoped, and they are filled by an ordinary `INSERT`
+that no classifier can tell from any other. So `postgresql` may multiplex and
+`oracle` and `db2` may not, and `PoolConfig::validate` refuses the mode rather
+than accepting it and degrading.
+
+Where it is allowed, a session borrows a connection from the moment the client
+asks for work until the driver reports no transaction open — read from
+`Connection.getAutoCommit()`, not inferred by looking for `COMMIT`. Anything the
+profile does not recognise pins, which shows up by name in the pin breakdown
+rather than silently costing fan-in.
 
 What is checkable, and checked: `tests/e2e/jdbc.sh` puts PostgreSQL behind the
 bridge, which looks like a strange choice for a feature about databases that are

@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use havuz_core::PoolLimits;
-use havuz_proto::{BackendConn, BackendConnector, ProtoError};
+use havuz_proto::{BackendConn, BackendConnector, ProtoError, ResetOutcome};
 use tokio::sync::{mpsc, Semaphore};
 
 use crate::counters::{Counters, PoolSnapshot};
@@ -390,6 +390,33 @@ impl<C: BackendConnector> Checkout<C> {
         self.discard = true;
     }
 
+    /// Clean the connection so the next client can have it, or give up on it.
+    ///
+    /// Every family did this by hand and did it the same way, which made the
+    /// interesting case — a reset that says the connection cannot be cleaned —
+    /// something each of them had to remember to count. Here it is counted
+    /// once, and [`PoolSnapshot::recycle_rate`] is the reason it is worth
+    /// counting: a pool that never recycles looks exactly like a healthy one
+    /// on every other figure.
+    ///
+    /// A reset that fails is treated as a reset that refused. The connection's
+    /// state is unknown either way, and unknown is not reusable.
+    pub async fn recycle(&mut self) -> ResetOutcome {
+        let outcome = match self.reset().await {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                tracing::debug!(pool = %self.inner.name, error = %e, "resetting a backend failed");
+                ResetOutcome::Discard
+            }
+        };
+
+        if outcome == ResetOutcome::Discard {
+            self.inner.counters.unclean_total.fetch_add(1, Ordering::Relaxed);
+            self.discard();
+        }
+        outcome
+    }
+
     pub fn pool_name(&self) -> &str {
         &self.inner.name
     }
@@ -444,7 +471,7 @@ impl<C: BackendConnector> Drop for Checkout<C> {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use havuz_proto::{ProtoResult, ResetOutcome};
+    use havuz_proto::ProtoResult;
     use std::sync::atomic::AtomicUsize;
 
     #[derive(Debug)]
@@ -453,6 +480,9 @@ mod tests {
         opened_at: Instant,
         broken: Arc<std::sync::atomic::AtomicBool>,
         closed: Arc<AtomicUsize>,
+        /// What `reset` answers. Mirrors a family that has no statement to
+        /// clean a connection with and must close it instead.
+        reset_outcome: ResetOutcome,
     }
 
     #[async_trait]
@@ -470,7 +500,7 @@ mod tests {
         }
 
         async fn reset(&mut self) -> ProtoResult<ResetOutcome> {
-            Ok(ResetOutcome::Cleaned)
+            Ok(self.reset_outcome)
         }
 
         async fn close(&mut self) {
@@ -485,6 +515,7 @@ mod tests {
         fail: Arc<std::sync::atomic::AtomicBool>,
         broken: Arc<std::sync::atomic::AtomicBool>,
         delay: Duration,
+        reset_outcome: ResetOutcome,
     }
 
     impl TestConnector {
@@ -496,7 +527,16 @@ mod tests {
                 fail: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 broken: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 delay: Duration::ZERO,
+                reset_outcome: ResetOutcome::Cleaned,
             })
+        }
+
+        /// A connector whose connections cannot be cleaned, which is what a
+        /// JDBC pool with no reset query looks like from in here.
+        fn uncleanable() -> Arc<Self> {
+            let mut connector = Arc::into_inner(Self::new()).expect("sole owner");
+            connector.reset_outcome = ResetOutcome::Discard;
+            Arc::new(connector)
         }
     }
 
@@ -517,6 +557,7 @@ mod tests {
                 opened_at: Instant::now(),
                 broken: self.broken.clone(),
                 closed: self.closed.clone(),
+                reset_outcome: self.reset_outcome,
             })
         }
 
@@ -819,6 +860,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_recycled_connection_goes_back_on_the_shelf() {
+        let connector = TestConnector::new();
+        let pool = Pool::new("app_main", connector.clone(), limits(3));
+
+        let mut checkout = pool.acquire().await.unwrap();
+        assert_eq!(checkout.recycle().await, ResetOutcome::Cleaned);
+        drop(checkout);
+
+        let s = pool.snapshot();
+        assert_eq!(s.idle, 1);
+        assert_eq!(s.unclean_total, 0);
+        assert_eq!(s.recycle_rate(), Some(1.0));
+    }
+
+    #[tokio::test]
+    async fn a_connection_that_cannot_be_cleaned_is_counted_apart_from_a_broken_one() {
+        // The failure this counter exists for: the pool works, `open` and
+        // `active` look healthy, and every client costs a fresh handshake
+        // because nothing can be handed on.
+        let connector = TestConnector::uncleanable();
+        let pool = Pool::new("app_main", connector.clone(), limits(3));
+
+        for _ in 0..4 {
+            let mut checkout = pool.acquire().await.unwrap();
+            assert_eq!(checkout.recycle().await, ResetOutcome::Discard);
+            drop(checkout);
+        }
+
+        let s = pool.snapshot();
+        assert_eq!(s.idle, 0, "nothing was ever reusable");
+        assert_eq!(s.checkout_total, 4);
+        assert_eq!(s.unclean_total, 4);
+        assert_eq!(s.discarded_total, 4, "unclean discards are a subset of all discards");
+        assert_eq!(s.recycle_rate(), Some(0.0));
+        assert_eq!(connector.opened.load(Ordering::Relaxed), 4, "a fresh connection for every client");
+    }
+
+    #[tokio::test]
+    async fn the_recycle_rate_is_unknown_rather_than_zero_before_the_first_checkout() {
+        let pool = Pool::new("app_main", TestConnector::new(), limits(3));
+        assert_eq!(pool.snapshot().recycle_rate(), None);
+    }
+
+    #[tokio::test]
     async fn connect_timeout_is_enforced() {
         let connector = Arc::new(TestConnector {
             next_id: AtomicUsize::new(1),
@@ -827,6 +912,7 @@ mod tests {
             fail: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             broken: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             delay: Duration::from_millis(500),
+            reset_outcome: ResetOutcome::Cleaned,
         });
         let mut lim = limits(3);
         lim.connect_timeout = Duration::from_millis(30);

@@ -9,10 +9,13 @@
 //! the static metadata needed to *describe* and *configure* a family.
 
 mod field;
+mod jdbc;
 mod postgres;
 mod schema;
+mod session;
 
 pub use field::{ConfigField, FieldError, FieldKind, FieldRole, SelectOption};
+pub use session::{PinReason, PinRule, SessionRules};
 
 use serde::{Deserialize, Serialize};
 
@@ -105,6 +108,16 @@ pub struct Capabilities {
     pub reports_transaction_status: bool,
     pub listen_notify: bool,
     pub advisory_locks: bool,
+    /// The driver understands statements well enough to decide for itself which
+    /// ones leave state behind.
+    ///
+    /// Not a property of the wire protocol but of what havuz can do with it,
+    /// and it belongs next to the other limits because it decides the same
+    /// thing they do: whether a pooling mode is offered. False means the
+    /// product must supply [`Quirks::session`] rules before it may exceed
+    /// [`PoolMode::Session`], because a family that cannot tell a `SELECT` from
+    /// an `ALTER SESSION` cannot promise a released backend is clean.
+    pub classifies_statements: bool,
 }
 
 impl Capabilities {
@@ -120,6 +133,7 @@ impl Capabilities {
         reports_transaction_status: false,
         listen_notify: false,
         advisory_locks: false,
+        classifies_statements: false,
     };
 }
 
@@ -128,7 +142,11 @@ impl Capabilities {
 /// The Postgres family covers CockroachDB, Redshift, YugabyteDB and friends:
 /// same wire protocol, different quirks. Naming follows dbx's `driver_profile`
 /// so connection profiles stay interchangeable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Serialize but not Deserialize, here and on [`Quirks`]: every field is
+/// `&'static`, so a round trip could only ever produce data that leaked. The
+/// admin API reads these out; nothing writes them in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct DriverProfile {
     pub id: &'static str,
     pub label: &'static str,
@@ -139,7 +157,7 @@ pub struct DriverProfile {
 }
 
 /// Per-product deviations from the family baseline.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct Quirks {
     /// `DISCARD ALL` is understood. CockroachDB and Redshift are not fully
     /// compatible here, so we fall back to targeted resets.
@@ -150,6 +168,12 @@ pub struct Quirks {
     pub supports_prepared_statements: bool,
     /// Highest pooling mode considered safe for this product.
     pub max_pool_mode: PoolMode,
+    /// What this product's statements do to the state a connection carries,
+    /// and how to clear it.
+    ///
+    /// Only read by families that cannot classify statements themselves; see
+    /// [`Capabilities::classifies_statements`].
+    pub session: SessionRules,
 }
 
 impl Quirks {
@@ -159,6 +183,10 @@ impl Quirks {
         supports_listen_notify: true,
         supports_prepared_statements: true,
         max_pool_mode: PoolMode::Transaction,
+        // `havuz-pg` classifies statements itself and resets with `DISCARD
+        // ALL`, so nothing here would ever be read. Stating the reset query
+        // anyway would put a second source of truth next to the first.
+        session: SessionRules::OPAQUE,
     };
 }
 
@@ -255,7 +283,7 @@ pub struct Connection {
 /// `Planned` entries are intentional: they let the UI show the roadmap without
 /// pretending a driver exists. Nothing dispatches on this list at runtime — the
 /// pool engine resolves behaviour through `havuz_proto::ProtocolFamily`.
-static FAMILIES: &[FamilyDescriptor] = &[postgres::POSTGRES, JDBC, MYSQL_PLANNED, REDIS_PLANNED];
+static FAMILIES: &[FamilyDescriptor] = &[postgres::POSTGRES, jdbc::JDBC, MYSQL_PLANNED, REDIS_PLANNED];
 
 const MYSQL_PLANNED: FamilyDescriptor = FamilyDescriptor {
     id: "mysql",
@@ -277,6 +305,7 @@ const MYSQL_PLANNED: FamilyDescriptor = FamilyDescriptor {
             supports_listen_notify: false,
             supports_prepared_statements: true,
             max_pool_mode: PoolMode::Session,
+            session: SessionRules::OPAQUE,
         },
     }],
     config_fields: &[],
@@ -302,170 +331,11 @@ const REDIS_PLANNED: FamilyDescriptor = FamilyDescriptor {
             supports_listen_notify: false,
             supports_prepared_statements: false,
             max_pool_mode: PoolMode::Session,
+            session: SessionRules::OPAQUE,
         },
     }],
     config_fields: &[],
 };
-
-const JDBC: FamilyDescriptor = FamilyDescriptor {
-    id: "jdbc",
-    label: "JDBC bridge",
-    description: "Oracle, DB2, Informix, Snowflake and the rest of the long tail, through a JVM sidecar.",
-    // Experimental, and the word is meant. Every other family relays frames; this
-    // one parses statements and composes result sets, so its correctness depends
-    // on a type mapping that only widens as more databases are tried.
-    maturity: Maturity::Experimental,
-    // There is no default: a JDBC URL names its own port, and a bridge that
-    // guessed 1521 would be guessing Oracle.
-    default_port: 0,
-    capabilities: Capabilities {
-        tls: true,
-        scram_sha256: true,
-        md5_auth: false,
-        // The sidecar holds one JDBC URL with one set of credentials in it, so
-        // there is nowhere to put a client's own.
-        per_user_auth: false,
-        // The client's prepared statements become the driver's. What is absent
-        // is havuz's own rewriting, which exists to move a statement between
-        // backends and has nothing to move it between here.
-        prepared_statements: true,
-        // The bridge relays no statements of its own to inspect and has no
-        // portable GUC to set through a JDBC URL, so it could offer a default
-        // and not a guarantee. It offers neither.
-        read_only_sessions: false,
-        cancel_request: false,
-        bulk_copy: false,
-        // The agent reports it from the driver rather than inferring it, which
-        // is the same standard the PostgreSQL side holds itself to.
-        reports_transaction_status: true,
-        listen_notify: false,
-        advisory_locks: false,
-    },
-    pool_modes: &[PoolMode::Session],
-    default_pool_mode: PoolMode::Session,
-    profiles: &[DriverProfile {
-        id: "generic",
-        label: "Generic JDBC",
-        maturity: Maturity::Experimental,
-        default_port: None,
-        quirks: Quirks {
-            supports_discard_all: false,
-            supports_advisory_locks: false,
-            supports_listen_notify: false,
-            supports_prepared_statements: true,
-            max_pool_mode: PoolMode::Session,
-        },
-    }],
-    config_fields: JDBC_FIELDS,
-};
-
-const JDBC_FIELDS: &[ConfigField] = &[
-    ConfigField {
-        name: "url",
-        label: "JDBC URL",
-        kind: FieldKind::Text,
-        required: true,
-        default: None,
-        help: Some("The driver's own connection string, including host, port and database."),
-        placeholder: Some("jdbc:oracle:thin:@//db.internal:1521/ORCLPDB1"),
-        secret: false,
-        // The URL carries host and port itself, so neither has a field of its
-        // own: two places to write the same host is two places to get it wrong.
-        role: Some(FieldRole::Host),
-    },
-    ConfigField {
-        name: "driver_class",
-        label: "Driver class",
-        kind: FieldKind::Text,
-        required: false,
-        default: None,
-        help: Some("Leave empty for a JAR that declares itself through META-INF/services."),
-        placeholder: Some("oracle.jdbc.OracleDriver"),
-        secret: false,
-        role: None,
-    },
-    ConfigField {
-        name: "driver_paths",
-        label: "Driver JARs",
-        kind: FieldKind::Text,
-        required: true,
-        default: None,
-        help: Some("Absolute paths, comma separated. Vendor drivers are usually not redistributable."),
-        placeholder: Some("/opt/havuz/drivers/ojdbc11.jar"),
-        secret: false,
-        role: None,
-    },
-    ConfigField {
-        name: "username",
-        label: "Database user",
-        kind: FieldKind::Text,
-        required: true,
-        default: None,
-        help: None,
-        placeholder: Some("app"),
-        secret: false,
-        role: Some(FieldRole::User),
-    },
-    ConfigField {
-        name: "password",
-        label: "Database password",
-        kind: FieldKind::Password,
-        required: false,
-        default: None,
-        help: Some("Stored encrypted. Never returned by the API."),
-        placeholder: None,
-        secret: true,
-        role: Some(FieldRole::Password),
-    },
-    ConfigField {
-        name: "reset_query",
-        label: "Reset query",
-        kind: FieldKind::Text,
-        required: false,
-        default: None,
-        help: Some(
-            "Run when a connection returns to the pool. JDBC has no portable equivalent of DISCARD ALL, so without \
-             one a connection is closed rather than reused: temporary tables and session settings would otherwise \
-             reach the next client. Use DISCARD ALL for PostgreSQL, RESET ALL elsewhere.",
-        ),
-        placeholder: Some("DISCARD ALL"),
-        secret: false,
-        role: None,
-    },
-    ConfigField {
-        name: "agent_jar",
-        label: "Agent JAR",
-        kind: FieldKind::Text,
-        required: false,
-        default: None,
-        help: Some("Defaults to the JAR built by agent/build.sh."),
-        placeholder: Some("/usr/share/havuz/havuz-agent.jar"),
-        secret: false,
-        role: None,
-    },
-    ConfigField {
-        name: "java",
-        label: "Java runtime",
-        kind: FieldKind::Text,
-        required: false,
-        default: Some("java"),
-        help: Some("Pin a runtime when the one on PATH is the wrong version. Needs 17 or newer."),
-        placeholder: None,
-        secret: false,
-        role: None,
-    },
-    ConfigField {
-        name: "connect_timeout",
-        label: "Connect timeout",
-        kind: FieldKind::Duration,
-        required: false,
-        default: Some("10s"),
-        help: None,
-        placeholder: None,
-        secret: false,
-        role: None,
-    },
-];
 
 /// All descriptors, including planned ones.
 pub fn families() -> &'static [FamilyDescriptor] {
@@ -641,6 +511,46 @@ mod tests {
                 "{} default pool mode is not in its supported list",
                 family.id
             );
+        }
+    }
+
+    #[test]
+    fn no_profile_claims_a_pooling_mode_its_family_does_not_offer() {
+        // The two are independently written and were previously allowed to
+        // disagree: `PoolConfig::validate` only ever consulted the profile, so
+        // a family could advertise session-only while a profile quietly
+        // permitted transaction mode.
+        for family in families() {
+            for profile in family.profiles {
+                assert!(
+                    family.pool_modes.contains(&profile.quirks.max_pool_mode),
+                    "{}/{} allows {} which the family does not list",
+                    family.id,
+                    profile.id,
+                    profile.quirks.max_pool_mode.as_str()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn nothing_multiplexes_without_a_way_to_know_what_a_statement_did() {
+        // Releasing a backend between transactions is a promise that it
+        // carries nothing from the last client. Either the driver can read
+        // statements well enough to make that promise, or the product had to
+        // spell out which of its statements are safe. Neither is optional.
+        for family in families() {
+            for profile in family.profiles {
+                if !profile.quirks.max_pool_mode.multiplexes() {
+                    continue;
+                }
+                assert!(
+                    family.capabilities.classifies_statements || profile.quirks.session.classifies(),
+                    "{}/{} multiplexes but nothing can tell a SELECT from a SET on it",
+                    family.id,
+                    profile.id
+                );
+            }
         }
     }
 

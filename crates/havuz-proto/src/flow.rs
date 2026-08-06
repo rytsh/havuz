@@ -4,83 +4,12 @@
 //! folds them into a single question the pool asks after every exchange: can
 //! this backend go back on the shelf?
 
-use std::fmt;
-
-use serde::Serialize;
-
 use havuz_registry::PoolMode;
 
-/// Why a backend is stuck with one client for the rest of its session.
-///
-/// This enum is the product's most valuable telemetry. Transaction-mode pooling
-/// silently degrades to session-mode whenever one of these fires, and no other
-/// pooler tells operators which one, for which user, on which query.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PinReason {
-    /// `SET` outside a transaction. `SET LOCAL` is scoped and does not pin.
-    SessionParameter,
-    /// `LISTEN` makes the connection a delivery target for asynchronous
-    /// notifications, so it can never be shared.
-    Listen,
-    /// Temporary tables live in a per-connection schema.
-    TempTable,
-    /// Session-level advisory locks outlive the transaction that took them.
-    AdvisoryLock,
-    /// `PREPARE` creates a session-scoped statement (distinct from the extended
-    /// query protocol's per-connection prepared statements).
-    ServerSidePrepare,
-    /// A cursor declared `WITH HOLD` survives commit.
-    HoldableCursor,
-    /// Bulk transfer has taken over the connection.
-    BulkTransfer,
-    /// Replication or change-stream mode.
-    Replication,
-    /// The family saw something it could not classify. Fails safe by pinning.
-    Unclassified,
-}
-
-impl PinReason {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            PinReason::SessionParameter => "session_parameter",
-            PinReason::Listen => "listen",
-            PinReason::TempTable => "temp_table",
-            PinReason::AdvisoryLock => "advisory_lock",
-            PinReason::ServerSidePrepare => "server_side_prepare",
-            PinReason::HoldableCursor => "holdable_cursor",
-            PinReason::BulkTransfer => "bulk_transfer",
-            PinReason::Replication => "replication",
-            PinReason::Unclassified => "unclassified",
-        }
-    }
-
-    /// Whether an operator can realistically fix this by changing their
-    /// application. Drives the "actionable" filter in the dashboard.
-    pub fn is_actionable(self) -> bool {
-        !matches!(self, PinReason::Replication | PinReason::Unclassified)
-    }
-
-    /// Every variant, so the UI can render a complete breakdown with zeros
-    /// instead of only the reasons seen so far.
-    pub const ALL: [PinReason; 9] = [
-        PinReason::SessionParameter,
-        PinReason::Listen,
-        PinReason::TempTable,
-        PinReason::AdvisoryLock,
-        PinReason::ServerSidePrepare,
-        PinReason::HoldableCursor,
-        PinReason::BulkTransfer,
-        PinReason::Replication,
-        PinReason::Unclassified,
-    ];
-}
-
-impl fmt::Display for PinReason {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
+// Defined in `havuz-registry` because the rules that produce one are static
+// per-product data, and re-exported here because [`FlowEvent`] is the vocabulary
+// families speak and a caller should not need two crates to say one thing.
+pub use havuz_registry::PinReason;
 
 /// What a family observed on the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -284,23 +213,6 @@ mod tests {
         let mut state = SessionState::new(PoolMode::Statement);
         state.observe(FlowEvent::InTransaction);
         assert!(!state.is_releasable(), "never release mid-transaction, whatever the mode claims");
-    }
-
-    #[test]
-    fn pin_reasons_are_all_enumerable_for_the_dashboard() {
-        assert_eq!(PinReason::ALL.len(), 9);
-        let mut seen: Vec<&str> = PinReason::ALL.iter().map(|r| r.as_str()).collect();
-        seen.sort_unstable();
-        seen.dedup();
-        assert_eq!(seen.len(), 9, "every reason needs a distinct metric label");
-    }
-
-    #[test]
-    fn actionable_reasons_exclude_the_ones_operators_cannot_fix() {
-        assert!(PinReason::SessionParameter.is_actionable());
-        assert!(PinReason::TempTable.is_actionable());
-        assert!(!PinReason::Replication.is_actionable());
-        assert!(!PinReason::Unclassified.is_actionable());
     }
 
     #[test]

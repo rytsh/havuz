@@ -114,6 +114,7 @@ impl ControlPlane for FakeFamily {
                 timeout_total: 0,
                 connect_error_total: 0,
                 discarded_total: 0,
+                unclean_total: 0,
                 wait: WaitStats { samples: 0, mean_micros: 0, max_micros: 0 },
             });
         }

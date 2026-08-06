@@ -111,6 +111,14 @@ pub enum AgentError {
     Timeout(Duration),
     #[error("cannot talk to the JDBC agent: {0}")]
     Transport(String),
+    /// No connection was free to run the statement on.
+    ///
+    /// Carried here rather than folded into `Transport` because the two send an
+    /// operator to opposite places: a transport failure means the JVM stopped
+    /// answering, this means the pool is at `max_size` and the client should
+    /// try again. The SQLSTATE has to say which.
+    #[error("{0}")]
+    Exhausted(String),
 }
 
 impl From<AgentError> for ProtoError {
@@ -129,6 +137,10 @@ impl AgentError {
             AgentError::Database { sql_state: Some(state), .. } if state.len() == 5 => state,
             AgentError::Database { .. } => "XX000",
             AgentError::Timeout(_) => "57014",
+            // What PostgreSQL sends when it is out of connection slots, which
+            // is what this is, so a client with a retry policy for that code
+            // already handles it.
+            AgentError::Exhausted(_) => "53300",
             _ => "08006",
         }
     }

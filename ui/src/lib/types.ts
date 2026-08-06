@@ -24,6 +24,8 @@ export interface PoolSnapshot {
   timeout_total: number;
   connect_error_total: number;
   discarded_total: number;
+  /** Of those, the ones closed because nothing could clean them for reuse. */
+  unclean_total: number;
   wait: WaitStats;
 }
 
@@ -149,7 +151,8 @@ export type Warning =
   | { kind: "idle_timeout_in_session_mode"; pool: string }
   | { kind: "users_without_backend_role"; pool: string; users: string[] }
   | { kind: "password_without_tls"; pool: string }
-  | { kind: "passthrough_pool"; pool: string };
+  | { kind: "passthrough_pool"; pool: string }
+  | { kind: "pool_without_reset"; pool: string };
 
 export interface Summary {
   uptime_seconds: number;
@@ -201,6 +204,34 @@ export interface DriverProfile {
   label: string;
   maturity: "stable" | "beta" | "experimental" | "planned";
   default_port: number | null;
+  quirks: Quirks;
+}
+
+/** Per-product deviations from the family baseline. */
+export interface Quirks {
+  supports_discard_all: boolean;
+  supports_advisory_locks: boolean;
+  supports_listen_notify: boolean;
+  supports_prepared_statements: boolean;
+  /**
+   * Highest pooling mode considered safe for this product. The family may
+   * offer more than this; the API refuses anything above it.
+   */
+  max_pool_mode: PoolMode;
+  session: SessionRules;
+}
+
+/**
+ * What a product's statements do to session state.
+ *
+ * Only consulted for families that cannot classify statements themselves, in
+ * practice the JDBC bridge. `reset_query: null` means connections are closed
+ * rather than reused.
+ */
+export interface SessionRules {
+  reset_query: string | null;
+  pins: { words: string; reason: PinReason }[];
+  shareable: string[];
 }
 
 /** What a field means to the pooler, as opposed to what the family calls it. */
@@ -278,6 +309,7 @@ export type PinReason =
   | "holdable_cursor"
   | "bulk_transfer"
   | "replication"
+  | "procedure_state"
   | "unclassified";
 
 export interface ReasonCount {

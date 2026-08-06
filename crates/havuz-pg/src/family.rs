@@ -11,8 +11,8 @@ use havuz_core::state::{PoolConfig, State};
 use havuz_core::{SslMode, StateStore, TraceLevel};
 use havuz_pool::PoolSnapshot;
 use havuz_proto::{
-    BackendConn, BackendConnector, PoolMode, PoolRoute, Probe, ProtoError, ProtoResult, ProtocolFamily, ResetOutcome,
-    ServeOutcome, SessionState,
+    BackendConn, BackendConnector, PoolMode, PoolRoute, Probe, ProtoError, ProtoResult, ProtocolFamily, ServeOutcome,
+    SessionState,
 };
 use havuz_registry::FamilyDescriptor;
 use havuz_secrets::MasterKey;
@@ -822,9 +822,7 @@ impl ProtocolFamily for PgFamily {
             // Clean before it goes back on the shelf. Without this, one
             // client's temp tables and session variables become the next
             // client's problem.
-            if matches!(checkout.reset().await, Ok(ResetOutcome::Discard) | Err(_)) {
-                checkout.discard();
-            }
+            checkout.recycle().await;
             drop(checkout);
 
             ServeOutcome {

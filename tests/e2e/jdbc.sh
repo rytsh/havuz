@@ -15,6 +15,7 @@ set -euo pipefail
 
 PG_PORT="${PG_PORT:-15432}"
 POOL_PORT="${POOL_PORT:-16452}"
+TXN_PORT="${TXN_PORT:-16453}"
 ADMIN_PORT="${ADMIN_PORT:-17452}"
 WORK="${WORK:-$(mktemp -d)}"
 
@@ -44,6 +45,12 @@ native() {
 tags_through_bridge() {
   docker run --rm --add-host host.docker.internal:host-gateway -e PGPASSWORD=pw -v "$WORK":/w postgres:16 \
     psql -tAX -h host.docker.internal -p "$POOL_PORT" -U svc -d legacy -f "/w/$(basename "$1")" 2>&1
+}
+
+# Through the transaction-mode pool, reading a file.
+txn_bridge() {
+  docker run --rm --add-host host.docker.internal:host-gateway -e PGPASSWORD=pw -v "$WORK":/w postgres:16 \
+    psql -qtAX -h host.docker.internal -p "$TXN_PORT" -U svc -d legacy_txn -f "/w/$(basename "$1")" 2>&1
 }
 
 # psql reading a file, so backslash commands work.
@@ -231,6 +238,81 @@ version="$(script_through_bridge "$WORK/version.sql")"
   || fail "a client must not be told it reached PostgreSQL directly: $version"
 [[ "$version" == *"PostgreSQL 16"* ]] \
   || fail "and must still learn what is behind the bridge: $version"
+
+echo "==> transaction mode multiplexes clients over fewer backends"
+# The claim the postgresql profile makes and the generic one refuses. One
+# backend, three clients connected at once: in session mode two of them would
+# sit in the queue until it timed out.
+api /api/v1/pools -H 'content-type: application/json' -d "{
+  \"name\": \"legacy_txn\", \"family\": \"jdbc\", \"profile\": \"postgresql\",
+  \"mode\": \"transaction\",
+  \"listen_port\": $TXN_PORT,
+  \"settings\": {
+    \"url\": \"jdbc:postgresql://127.0.0.1:$PG_PORT/appdb\",
+    \"username\": \"app\", \"password\": \"hunter2\",
+    \"driver_class\": \"org.postgresql.Driver\",
+    \"driver_paths\": \"$DRIVER\",
+    \"agent_jar\": \"$AGENT\"
+  },
+  \"limits\": {\"max_size\": 1, \"max_client_connections\": 20}}" > /dev/null
+
+api /api/v1/users/svc -X PATCH -H 'content-type: application/json' \
+  -d '{"pools":["legacy","legacy_txn"]}' > /dev/null
+
+# No reset_query in the settings above: the profile supplies DISCARD ALL, and a
+# pool that had not picked one up would refuse to reuse anything.
+ready_pools="$(grep -c "jdbc pool ready" "$WORK/havuz.log" || echo 0)"
+[[ "$ready_pools" -ge 2 ]] || fail "the transaction-mode pool did not start"
+
+cat > "$WORK/concurrent.sql" <<'SQL'
+begin; select 1; select pg_sleep(0.2); commit;
+begin; select 2; select pg_sleep(0.2); commit;
+select 3;
+SQL
+
+for i in 1 2 3; do
+  txn_bridge "$WORK/concurrent.sql" > "$WORK/txn-$i.out" 2>&1 &
+done
+wait
+
+for i in 1 2 3; do
+  grep -q "1" "$WORK/txn-$i.out" \
+    || fail "client $i could not work through a one-backend pool: $(cat "$WORK/txn-$i.out")"
+  if grep -qi "timeout\|exhausted\|too many" "$WORK/txn-$i.out"; then
+    fail "client $i was queued out; the backend was not being released between transactions"
+  fi
+done
+
+read -r txn_created txn_checkouts txn_unclean < <(api /api/v1/summary | python3 -c '
+import sys, json
+pools = {p["name"]: p for p in json.load(sys.stdin)["pool_snapshots"]}
+p = pools["legacy_txn"]
+print(p["created_total"], p["checkout_total"], p["unclean_total"])
+')
+[[ "$txn_created" == "1" ]] || fail "three concurrent clients opened $txn_created backend connections"
+[[ "$txn_checkouts" -gt 3 ]] \
+  || fail "only $txn_checkouts checkouts for 9 transactions; the backend is not being released"
+[[ "$txn_unclean" == "0" ]] \
+  || fail "$txn_unclean connections could not be cleaned; the profile's reset query did not take effect"
+echo "    3 concurrent clients, $txn_checkouts checkouts, $txn_created backend connection"
+
+echo "==> a statement that dirties the session pins it, by name"
+api /api/v1/pins -X DELETE > /dev/null
+cat > "$WORK/pinning.sql" <<'SQL'
+set application_name = 'pinner';
+select 1;
+SQL
+txn_bridge "$WORK/pinning.sql" > /dev/null 2>&1
+
+reason="$(api /api/v1/pins | python3 -c '
+import sys, json
+report = json.load(sys.stdin)
+top = [r for r in report["by_reason"] if r["count"] > 0]
+print(top[0]["reason"] if top else "none")
+')"
+[[ "$reason" == "session_parameter" ]] \
+  || fail "a SET should pin as session_parameter, got: $reason"
+echo "    reported as $reason rather than silently costing fan-in"
 
 echo
 echo "jdbc bridge: PASS"

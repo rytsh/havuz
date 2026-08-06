@@ -11,20 +11,20 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use havuz_control::{ControlPlane, Registries, RoutingReport, TargetPool, TargetReport};
-use havuz_core::state::{PoolConfig, State};
+use havuz_control::{ControlPlane, Registries, RoutingReport, TargetPool, TargetReport, TraceContext};
+use havuz_core::state::{PoolConfig, State, TraceLevel};
 use havuz_core::StateStore;
 use havuz_pg::protocol::sqlstate;
 use havuz_pg::{complete_startup, ClientHandshake, HandshakeOutcome, Message, StateAuthenticator};
 use havuz_pool::{Pool, PoolSnapshot};
-use havuz_proto::{BackendConn, PoolRoute, Probe, ProtoError, ProtoResult, ProtocolFamily, ServeOutcome};
-use havuz_registry::FamilyDescriptor;
+use havuz_proto::{PoolRoute, Probe, ProtoError, ProtoResult, ProtocolFamily, ServeOutcome};
+use havuz_registry::{FamilyDescriptor, PoolMode, SessionRules};
 use havuz_secrets::MasterKey;
 use tokio::net::TcpStream;
 
 use crate::agent::Agent;
 use crate::conn::{agent_command, JdbcConfig, JdbcConnector};
-use crate::session::{startup_parameters, Session};
+use crate::session::{startup_parameters, Session, SessionPolicy};
 
 /// The registry id this family serves.
 pub const FAMILY_ID: &str = "jdbc";
@@ -44,6 +44,16 @@ struct JdbcPool {
     pool: Arc<Pool<JdbcConnector>>,
     label: String,
     server_version: String,
+    /// How aggressively a backend may be taken back from a client. Captured
+    /// when the pool is built, because changing it under a live session would
+    /// move the release points mid-flight.
+    mode: PoolMode,
+    /// What the profile says its statements do to session state. In session
+    /// mode this is never consulted; in transaction mode it is what makes a
+    /// release safe.
+    rules: SessionRules,
+    idle_in_transaction: Duration,
+    trace: TraceLevel,
 }
 
 impl JdbcFamily {
@@ -108,7 +118,11 @@ impl JdbcFamily {
             driver_class: setting("driver_class").filter(|value| !value.is_empty()),
             driver_paths,
             connect_timeout_ms: config.limits.connect_timeout.as_millis() as u64,
-            reset_query: setting("reset_query").filter(|value| !value.trim().is_empty()),
+            // The pool's own setting first, then the profile's. An operator who
+            // picked "Oracle" should not also have to know the statement that
+            // resets an Oracle session, and one who does know better must be
+            // able to say so.
+            reset_query: config.reset_query(),
         })
     }
 
@@ -167,7 +181,21 @@ impl JdbcFamily {
             config.limits.clone(),
         ));
 
-        Ok(JdbcPool { name: name.to_string(), agent, pool, label: jdbc.label, server_version })
+        // `PoolConfig::validate` has already refused a mode this profile cannot
+        // hold, so reading both here is reading two facts that agree.
+        let profile = config.profile().expect("the family and profile are validated before a pool is built");
+
+        Ok(JdbcPool {
+            name: name.to_string(),
+            agent,
+            pool,
+            label: jdbc.label,
+            server_version,
+            mode: config.mode,
+            rules: profile.quirks.session,
+            idle_in_transaction: config.limits.idle_in_transaction_timeout,
+            trace: config.trace,
+        })
     }
 }
 
@@ -227,7 +255,7 @@ impl ControlPlane for JdbcFamily {
             .values()
             .map(|pool| TargetReport {
                 name: pool.name.clone(),
-                mode: "session".into(),
+                mode: pool.mode.as_str().into(),
                 read_write_split: false,
                 primary: TargetPool { label: pool.label.clone(), pool: pool.pool.snapshot() },
                 replicas: Vec::new(),
@@ -263,7 +291,7 @@ impl ProtocolFamily for JdbcFamily {
 
         let session_limit =
             self.state.load().users.get(&identity.user).map(|user| user.max_client_connections).unwrap_or(0);
-        let _registered = match self.registries.sessions.register(
+        let registered = match self.registries.sessions.register(
             &identity.user,
             &identity.pool,
             identity.application_name.as_deref(),
@@ -278,11 +306,23 @@ impl ProtocolFamily for JdbcFamily {
             }
         };
 
-        // Session mode: the client holds this connection until it disconnects.
-        // Transaction mode would need session state — schema, isolation,
-        // autocommit — to be carried between backends, and that is a decision
-        // to make with a second database in hand rather than in advance.
-        let mut checkout = match pool.pool.acquire().await {
+        let holder = self.registries.holders.session(
+            TraceContext {
+                pool: identity.pool.clone(),
+                user: identity.user.clone(),
+                application: identity.application_name.clone(),
+                client_addr: identity.peer.to_string(),
+                level: pool.trace,
+            },
+            pool.mode,
+        );
+        holder.waiting_for_startup();
+
+        // Acquired before the handshake completes in both modes, so an
+        // exhausted pool is something the client is told at connect time rather
+        // than something it discovers on its first query. In a multiplexing
+        // mode `Session::new` hands it straight back.
+        let checkout = match pool.pool.acquire().await {
             Ok(checkout) => checkout,
             Err(e) => {
                 let _ = Message::fatal(sqlstate::TOO_MANY_CONNECTIONS, &e.to_string()).write(&mut client).await;
@@ -294,24 +334,59 @@ impl ProtocolFamily for JdbcFamily {
         // that resolves to nothing rather than one that looks usable.
         complete_startup(&mut client, &startup_parameters(&pool.server_version), 0, 0).await?;
 
-        let mut session = Session::new(&pool.agent, checkout.handle());
-        let result = session.run(&mut client).await;
-        let stats = session.stats();
-        let exchanges = stats.exchanges;
+        let policy = SessionPolicy {
+            // Only carried into a multiplexing mode. In session mode the client
+            // owns its backend either way, so ending it early would free
+            // nothing that disconnecting would not.
+            idle_in_transaction: if pool.mode.multiplexes() {
+                pool.idle_in_transaction
+            } else {
+                std::time::Duration::ZERO
+            },
+            kick: registered.signal(),
+        };
 
-        if result.is_err() {
-            // The client went away mid-statement, so what the driver is doing
-            // is unknown. Retiring beats handing the next client a connection
-            // with a half-finished transaction on it.
-            checkout.poison();
+        let mut session =
+            Session::new(&pool.agent, &pool.pool, checkout, pool.mode, pool.rules, policy, &holder, pool.label.clone());
+        let result = session.run(&mut client).await;
+        let exchanges = session.stats().exchanges;
+        let pinned = session.pin();
+        let failed = result.is_err();
+
+        // Whatever the session was still holding when it ended. In transaction
+        // mode this is usually nothing: the backend went back at the last
+        // `ReadyForQuery`.
+        if let Some(mut checkout) = session.into_checkout() {
+            if failed {
+                // The client went away mid-statement, so what the driver is
+                // doing is unknown. Retiring beats handing the next client a
+                // connection with a half-finished transaction on it.
+                checkout.poison();
+            }
+            checkout.recycle().await;
         }
-        if matches!(checkout.reset().await, Ok(havuz_proto::ResetOutcome::Discard) | Err(_)) {
-            checkout.discard();
+        holder.clear();
+
+        // In session mode nothing was ever shared, so counting every session as
+        // clean would flatter the pin rate into uselessness.
+        if pool.mode.multiplexes() {
+            match pinned {
+                Some(reason) => {
+                    self.registries.pins.record(&identity.user, identity.application_name.as_deref(), reason);
+                    tracing::info!(
+                        user = %identity.user,
+                        pool = %identity.pool,
+                        application = identity.application_name.as_deref().unwrap_or("-"),
+                        reason = %reason,
+                        "jdbc session was pinned and could not be multiplexed"
+                    );
+                }
+                None => self.registries.pins.record_clean(),
+            }
         }
-        drop(checkout);
 
         result?;
-        Ok(ServeOutcome { authenticated: true, pinned: None, exchanges, bytes_to_client: 0, bytes_to_backend: 0 })
+        Ok(ServeOutcome { authenticated: true, pinned, exchanges, bytes_to_client: 0, bytes_to_backend: 0 })
     }
 
     async fn probe(&self, pool_name: &str) -> ProtoResult<Probe> {
@@ -434,6 +509,63 @@ mod tests {
 
         std::fs::remove_file(one).ok();
         std::fs::remove_file(two).ok();
+    }
+
+    #[test]
+    fn the_profile_supplies_a_reset_query_and_the_setting_overrides_it() {
+        // Without one, every connection is closed when its client leaves and
+        // the pool saves no handshakes at all. An operator who picked their
+        // database from a list should not also have to know the statement.
+        let dir = std::env::temp_dir();
+        let jar = dir.join("havuz-jdbc-reset.jar");
+        std::fs::write(&jar, b"x").unwrap();
+        let paths = jar.display().to_string();
+
+        let mut settings =
+            settings(&[("url", "jdbc:postgresql://db:5432/appdb"), ("username", "app"), ("driver_paths", &paths)]);
+        let mut config = pool_config(settings.clone());
+        config.profile = Some("postgresql".into());
+
+        let mut state = State::default();
+        state.pools.insert("app_main".into(), config);
+        let store = Arc::new(StateStore::ephemeral(state));
+        let family = JdbcFamily::new(store.clone(), Arc::new(MasterKey::generate()), Registries::ephemeral());
+
+        let state = store.load();
+        let jdbc = family.config_for("app_main", &state.pools["app_main"], &state).unwrap();
+        assert_eq!(jdbc.reset_query.as_deref(), Some("DISCARD ALL"));
+
+        // And an operator who knows better than the profile can say so.
+        settings.insert("reset_query".into(), json!("RESET ALL"));
+        let mut config = pool_config(settings);
+        config.profile = Some("postgresql".into());
+        let mut state = State::default();
+        state.pools.insert("app_main".into(), config);
+        let store = Arc::new(StateStore::ephemeral(state));
+        let state = store.load();
+        let jdbc = family.config_for("app_main", &state.pools["app_main"], &state).unwrap();
+        assert_eq!(jdbc.reset_query.as_deref(), Some("RESET ALL"));
+
+        std::fs::remove_file(jar).ok();
+    }
+
+    #[test]
+    fn the_generic_profile_closes_connections_rather_than_guessing_how_to_clean_them() {
+        let dir = std::env::temp_dir();
+        let jar = dir.join("havuz-jdbc-noreset.jar");
+        std::fs::write(&jar, b"x").unwrap();
+        let paths = jar.display().to_string();
+
+        let (family, store) = family_with(settings(&[
+            ("url", "jdbc:informix-sqli://db:9088/app"),
+            ("username", "app"),
+            ("driver_paths", &paths),
+        ]));
+        let state = store.load();
+        let jdbc = family.config_for("app_main", &state.pools["app_main"], &state).unwrap();
+        assert_eq!(jdbc.reset_query, None, "a database nobody named gets no invented reset statement");
+
+        std::fs::remove_file(jar).ok();
     }
 
     #[test]

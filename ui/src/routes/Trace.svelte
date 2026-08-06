@@ -262,6 +262,7 @@
       case "holdable_cursor": return "A WITH HOLD cursor survives COMMIT and remains attached to this backend.";
       case "bulk_transfer": return "COPY or another streaming operation keeps the backend attached until the stream or session ends.";
       case "replication": return "Replication mode is a long-lived backend-specific stream.";
+      case "procedure_state": return "Procedural code ran and may have left state that outlives the transaction, such as Oracle package globals. The statement text cannot say whether it did.";
       default: return "Session-scoped state prevents this backend from being shared until the client disconnects.";
     }
   }
