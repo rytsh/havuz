@@ -17,7 +17,9 @@ ui/dist/
 .env
 .env.*
 !.env.example
-havuz.toml
+# Anchored: without the slash this also swallowed docker/havuz.toml, which is
+# part of the image and not somebody's local config.
+/havuz.toml
 
 .DS_Store
 

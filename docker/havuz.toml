@@ -1,0 +1,49 @@
+# havuz configuration for the container image.
+#
+# It differs from havuz.example.toml in exactly two places, both forced by the
+# fact that a container is not a laptop: state lives under /var/lib/havuz, and
+# the admin listener is reachable from outside the container — which havuz only
+# permits with a token, so one is required. The entrypoint generates one when
+# the environment does not carry it.
+#
+# Mount your own over it to change anything:
+#
+#   -v ./havuz.toml:/etc/havuz/havuz.toml:ro
+#
+# /etc/havuz/havuz.example.toml in the image is the annotated original.
+
+[server]
+bind = "0.0.0.0"
+workers = 0
+max_client_connections = 1000
+
+[server.tls]
+# Mount the pair and uncomment. Needed by pools with backend_auth = per_user or
+# passthrough, which refuse to ask a client for its password in the clear.
+# cert = "/etc/havuz/tls/server.crt"
+# key  = "/etc/havuz/tls/server.key"
+require_client_cert = false
+
+[admin]
+# Not loopback, because loopback inside a container means nobody. havuz refuses
+# to start this way without authentication, which is the point.
+listen = "0.0.0.0:7432"
+auth = { type = "bearer", token_env = "HAVUZ_ADMIN_TOKEN" }
+ui = true
+
+[state]
+# Declared as a volume in the image. Losing it loses the master key and with it
+# every stored credential.
+dir = "/var/lib/havuz"
+
+[secrets]
+# Set HAVUZ_MASTER_KEY (havuz keygen) to keep the key out of the volume. With
+# no key supplied one is generated into the state directory, which protects a
+# stolen state file and not a stolen volume.
+auto_generate = true
+
+[log]
+filter = "info"
+# Containers get scraped, so structured output is the better default here.
+json = true
+log_connections = false

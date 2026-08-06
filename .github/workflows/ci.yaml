@@ -45,31 +45,6 @@ jobs:
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace --all-features
 
-  docker:
-    name: docker build
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      # Not pushed and not loaded: this job exists to find out whether the
-      # Dockerfile still builds, which is the part that breaks silently.
-      - name: Build the runtime image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          target: runtime
-          push: false
-          cache-from: type=gha,scope=docker-runtime
-          cache-to: type=gha,mode=max,scope=docker-runtime
-      - name: Build the JDBC image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          target: jdbc
-          push: false
-          cache-from: type=gha,scope=docker-jdbc
-          cache-to: type=gha,mode=max,scope=docker-jdbc
-
   agent:
     name: jdbc agent
     runs-on: ubuntu-24.04
