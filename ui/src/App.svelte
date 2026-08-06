@@ -9,6 +9,7 @@
   import Trace from "./routes/Trace.svelte";
   import Users from "./routes/Users.svelte";
   import NotFound from "./routes/NotFound.svelte";
+  import TokenGate from "./components/TokenGate.svelte";
 
   type Theme = "dark" | "light";
 
@@ -51,6 +52,8 @@
     "*": NotFound,
   };
 </script>
+
+<TokenGate />
 
 <div class="layout">
   <aside class="sidebar">

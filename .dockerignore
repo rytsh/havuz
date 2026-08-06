@@ -1,0 +1,25 @@
+# Build outputs: the image builds its own, and shipping a host-built one in the
+# context makes the image depend on whatever was lying around.
+target/
+ui/dist/
+ui/node_modules/
+agent/build/
+node_modules/
+.pnpm-store/
+
+# Runtime state. Contains sealed secrets and has no business in a build context.
+data/
+*.havuz-state.json
+*.havuz-state.json.tmp
+havuz.toml
+.env
+.env.*
+
+.git/
+.github/
+.opencode/
+graphify-out/
+tests/
+*.md
+!README.md
+.DS_Store

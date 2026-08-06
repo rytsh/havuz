@@ -1,6 +1,7 @@
 //! Bearer token middleware.
 
 use axum::extract::{Request, State};
+use axum::http::Method;
 use axum::middleware::Next;
 use axum::response::Response;
 
@@ -11,8 +12,21 @@ use crate::state::AdminState;
 ///
 /// Health endpoints are probed by orchestrators that have no credentials, and
 /// they expose nothing beyond liveness.
-fn is_public(path: &str) -> bool {
-    matches!(path, "/healthz" | "/readyz")
+///
+/// The dashboard's own files are public for a duller reason: a browser cannot
+/// attach an `Authorization` header to the navigation that loads them, so a
+/// dashboard behind the token is a dashboard nobody can ever enter a token
+/// into. What is served there is a static bundle; every byte of data it
+/// displays comes from `/api`, which stays shut. Only reads: a `POST` to a path
+/// the router does not know is not something to wave through.
+fn is_public(method: &Method, path: &str) -> bool {
+    if matches!(path, "/healthz" | "/readyz") {
+        return true;
+    }
+    if !matches!(*method, Method::GET | Method::HEAD) {
+        return false;
+    }
+    !(path == "/api" || path.starts_with("/api/") || path == "/metrics")
 }
 
 pub async fn require_token(
@@ -26,7 +40,7 @@ pub async fn require_token(
         return Ok(next.run(request).await);
     };
 
-    if is_public(request.uri().path()) {
+    if is_public(request.method(), request.uri().path()) {
         return Ok(next.run(request).await);
     }
 
@@ -60,10 +74,27 @@ mod tests {
 
     #[test]
     fn health_endpoints_stay_public() {
-        assert!(is_public("/healthz"));
-        assert!(is_public("/readyz"));
-        assert!(!is_public("/api/v1/pools"));
-        assert!(!is_public("/metrics"), "metrics can reveal topology and must be protected");
+        assert!(is_public(&Method::GET, "/healthz"));
+        assert!(is_public(&Method::GET, "/readyz"));
+        assert!(!is_public(&Method::GET, "/api/v1/pools"));
+        assert!(!is_public(&Method::GET, "/metrics"), "metrics can reveal topology and must be protected");
+    }
+
+    #[test]
+    fn the_dashboard_loads_but_its_data_does_not() {
+        // The shell has to arrive for the operator to have somewhere to type
+        // the token. Everything it then asks for is still refused without one.
+        assert!(is_public(&Method::GET, "/"));
+        assert!(is_public(&Method::GET, "/assets/app.js"));
+        assert!(is_public(&Method::GET, "/databases"), "a hard refresh on a client-side route");
+        assert!(!is_public(&Method::GET, "/api/v1/summary"));
+        assert!(!is_public(&Method::GET, "/api"));
+    }
+
+    #[test]
+    fn only_reads_are_public() {
+        assert!(!is_public(&Method::POST, "/"));
+        assert!(!is_public(&Method::DELETE, "/anything"));
     }
 
     #[test]

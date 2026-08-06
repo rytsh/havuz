@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A second push to a branch makes the first one's answer irrelevant.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: fmt, clippy, test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # The dashboard first: `--all-features` turns on embed-ui, which bakes
+      # ui/dist into the binary and does not compile without it.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Build the dashboard
+        working-directory: ui
+        run: |
+          npm install --global pnpm@11.1.1
+          pnpm install --frozen-lockfile
+          pnpm run build
+
+      # rustup honours rust-toolchain.toml, so the pinned version and its
+      # components arrive without naming them twice.
+      - name: Install the pinned toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo fmt --all --check
+      # Denied on the command line rather than through RUSTFLAGS: the latter
+      # applies to dependencies too, and their warnings are not ours to fix.
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo test --workspace --all-features
+
+  docker:
+    name: docker build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      # Not pushed and not loaded: this job exists to find out whether the
+      # Dockerfile still builds, which is the part that breaks silently.
+      - name: Build the runtime image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: runtime
+          push: false
+          cache-from: type=gha,scope=docker-runtime
+          cache-to: type=gha,mode=max,scope=docker-runtime
+      - name: Build the JDBC image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: jdbc
+          push: false
+          cache-from: type=gha,scope=docker-jdbc
+          cache-to: type=gha,mode=max,scope=docker-jdbc
+
+  agent:
+    name: jdbc agent
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      # HAVUZ_JAVAC=1 because a JDK is already here; build.sh would otherwise
+      # start a container to find one.
+      - run: HAVUZ_JAVAC=1 ./agent/build.sh

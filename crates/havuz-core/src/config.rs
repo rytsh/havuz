@@ -29,6 +29,11 @@ pub enum BootstrapError {
          set admin.auth or bind to localhost"
     )]
     UnauthenticatedRemoteAdmin { addr: SocketAddr },
+    #[error(
+        "admin listener is bound to {addr} and authenticates with ${env}, which is unset or empty; \
+         export it or bind to localhost"
+    )]
+    AdminTokenMissing { addr: SocketAddr, env: String },
     #[error("server.bind {bind} and the admin listener {admin} would collide on every pool port")]
     ListenerCollision { bind: IpAddr, admin: SocketAddr },
     #[error("server.tls.cert is set but server.tls.key is not (or vice versa)")]
@@ -110,6 +115,29 @@ impl Bootstrap {
             return Err(BootstrapError::AmbiguousMasterKey);
         }
         Ok(())
+    }
+
+    /// Refuse a remote admin listener whose token is not actually there.
+    ///
+    /// Separate from [`Self::validate`] because it reads the environment rather
+    /// than the file, and a config file is worth validating without one.
+    ///
+    /// It is nevertheless the same rule. `admin.auth` naming an environment
+    /// variable that turns out to be unset leaves the middleware with no token
+    /// to expect, and a middleware with nothing to compare against lets every
+    /// request through — on a listener that is, by definition, not loopback.
+    /// The file looks authenticated and the port is not.
+    pub fn check_admin_token(&self) -> Result<(), BootstrapError> {
+        let AdminAuth::Bearer { token_env } = &self.admin.auth else {
+            return Ok(());
+        };
+        if is_loopback(&self.admin.listen) {
+            return Ok(());
+        }
+        match self.admin.auth.expected_token()? {
+            Some(_) => Ok(()),
+            None => Err(BootstrapError::AdminTokenMissing { addr: self.admin.listen, env: token_env.clone() }),
+        }
     }
 }
 
@@ -497,6 +525,50 @@ mod tests {
             "#,
         )
         .expect("bearer auth unlocks a remote admin listener");
+    }
+
+    #[test]
+    fn remote_admin_whose_token_variable_is_unset_refuses_to_start() {
+        // The config file is fine. The environment it leans on is not, and the
+        // difference between the two is an unauthenticated admin API.
+        let config = parse(
+            r#"
+            [admin]
+            listen = "0.0.0.0:7432"
+            auth = { type = "bearer", token_env = "HAVUZ_TEST_ABSENT_ADMIN_TOKEN" }
+            "#,
+        )
+        .expect("the file itself is valid");
+        let err = config.check_admin_token().unwrap_err();
+        assert!(matches!(err, BootstrapError::AdminTokenMissing { .. }), "got {err}");
+    }
+
+    #[test]
+    fn remote_admin_with_the_token_present_starts() {
+        std::env::set_var("HAVUZ_TEST_PRESENT_ADMIN_TOKEN", "s3cret");
+        let config = parse(
+            r#"
+            [admin]
+            listen = "0.0.0.0:7432"
+            auth = { type = "bearer", token_env = "HAVUZ_TEST_PRESENT_ADMIN_TOKEN" }
+            "#,
+        )
+        .unwrap();
+        config.check_admin_token().expect("a token that resolves unlocks the listener");
+        std::env::remove_var("HAVUZ_TEST_PRESENT_ADMIN_TOKEN");
+    }
+
+    #[test]
+    fn a_loopback_listener_needs_no_token_in_the_environment() {
+        let config = parse(
+            r#"
+            [admin]
+            listen = "127.0.0.1:7432"
+            auth = { type = "bearer", token_env = "HAVUZ_TEST_ABSENT_ADMIN_TOKEN" }
+            "#,
+        )
+        .unwrap();
+        config.check_admin_token().expect("nothing remote can reach loopback");
     }
 
     #[test]

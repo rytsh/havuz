@@ -28,6 +28,20 @@ export function setToken(token: string | null) {
   else sessionStorage.removeItem(TOKEN_KEY);
 }
 
+/**
+ * Called when the admin API refuses what we presented, including nothing.
+ *
+ * The dashboard's own files load without a token — a browser cannot put a
+ * header on the navigation that fetches them, so they have to, or there is
+ * nowhere to type one in. That makes the first 401 the first news that this
+ * listener wants a token, and `TokenGate` turns it into a prompt.
+ */
+let onUnauthorized: (() => void) | null = null;
+
+export function setUnauthorizedHandler(handler: (() => void) | null) {
+  onUnauthorized = handler;
+}
+
 export class ApiError extends Error {
   constructor(
     readonly status: number,
@@ -47,6 +61,8 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   const response = await fetch(path, { ...init, headers });
 
   if (!response.ok) {
+    if (response.status === 401) onUnauthorized?.();
+
     let code = "unknown";
     let message = `${response.status} ${response.statusText}`;
     try {

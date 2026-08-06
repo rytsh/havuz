@@ -88,6 +88,11 @@ fn run(config_path: std::path::PathBuf) -> Result<()> {
 async fn serve(bootstrap: Bootstrap) -> Result<()> {
     havuz_core::tls::install_default_provider();
 
+    // Before anything binds. `validate` cleared the file; this clears the
+    // environment the file points at, and a remote admin listener whose token
+    // variable is missing is an open admin API rather than a closed one.
+    bootstrap.check_admin_token()?;
+
     // Generating a key is safe only because it is also persisted: the reason
     // this used to refuse to start was that a key created per run would orphan
     // everything the previous run sealed. See `SecretsConfig` for the order.

@@ -72,6 +72,48 @@ Open <http://127.0.0.1:7432>, add a database, create a user, then connect:
 psql "postgresql://svc_orders:yourpassword@127.0.0.1:6432/app_main"
 ```
 
+### Containers
+
+Two images, split where the cost is: only the JDBC bridge needs a Java runtime,
+and the JVM is larger than everything else in the image put together.
+
+| | |
+|---|---|
+| `ghcr.io/rytsh/havuz:latest` | the pooler and the dashboard |
+| `ghcr.io/rytsh/havuz:jdbc` | the same binary plus a JRE, the agent JAR and the drivers that may be redistributed |
+
+Both are `linux/amd64` and `linux/arm64`, and both exist under the release tag
+as well — `:0.1.0` and `:0.1.0-jdbc`, which is what a deployment should name.
+
+```sh
+docker run --rm \
+  -e HAVUZ_ADMIN_TOKEN="$(openssl rand -hex 24)" \
+  -p 7432:7432 -p 6432:6432 \
+  -v havuz-data:/var/lib/havuz \
+  ghcr.io/rytsh/havuz:latest
+```
+
+Then <http://127.0.0.1:7432>, which asks for that token before it shows
+anything.
+
+Three things differ from a binary on a host. All three follow from being in a
+container and none of them is tuning:
+
+* **The admin listener is on `0.0.0.0`**, because loopback inside a container
+  means nobody. havuz refuses that address without authentication, so the
+  image's config demands `HAVUZ_ADMIN_TOKEN` and the process will not start
+  without it. Supply none and the entrypoint generates one and prints it, which
+  is fine for a first look and changes on every restart.
+* **State lives in `/var/lib/havuz`**, declared as a volume. It holds
+  `state.json` and — unless `HAVUZ_MASTER_KEY` says otherwise — the master key
+  that opens it. Losing that volume loses every stored credential.
+* **Pool ports are yours to publish.** A pool declares its own port and havuz
+  learns it at runtime, so the image cannot know what to `EXPOSE`; only 7432 is.
+  `-p 6432:6432` covers the usual case.
+
+Mount a file over `/etc/havuz/havuz.toml` to change any of it. The annotated
+original is in the image at `/etc/havuz/havuz.example.toml`.
+
 ### The master key
 
 Backend passwords and client verifiers are sealed under an AES-256 key that
@@ -398,6 +440,55 @@ must be byte-identical — integers, text, booleans, `numeric`, `bytea`, dates,
 timestamps, `json`, arrays, `uuid`, unicode and nulls all included. Against
 Oracle there would be nothing to compare against.
 
+#### Drivers, and the container that carries some of them
+
+A JDBC driver is a JAR and nothing else. That is the quiet advantage over ODBC,
+where reaching Oracle means an Instant Client in the image, `LD_LIBRARY_PATH`,
+and a build that only works on the architecture it was assembled for. Here the
+image needs a JVM and a file.
+
+The `:jdbc` image carries the agent, a JRE and the drivers whose licences permit
+redistribution, under names with no version in them so a pool's setting survives
+an upgrade:
+
+| `driver_paths` | |
+|---|---|
+| `/opt/havuz/drivers/postgresql.jar` | PostgreSQL |
+| `/opt/havuz/drivers/mysql.jar` | MySQL |
+| `/opt/havuz/drivers/mariadb.jar` | MariaDB |
+| `/opt/havuz/drivers/sqlserver.jar` | SQL Server |
+| `/opt/havuz/drivers/ingres.jar` | Ingres |
+| `/opt/havuz/drivers/h2.jar` | H2 |
+
+`/opt/havuz/drivers/MANIFEST.txt` in the image records which version each one
+is. `driver_class` can stay empty for all of them: every JAR declares its driver
+in `META-INF/services/java.sql.Driver`, and that is how the agent looks for it.
+
+Oracle, DB2, Informix and Teradata are absent and will stay absent, because
+their licences do not allow anyone else to ship them. Mount what you have:
+
+```sh
+docker run ... \
+  -v /opt/jdbc/ojdbc11.jar:/opt/havuz/drivers/oracle.jar:ro \
+  ghcr.io/rytsh/havuz:jdbc
+```
+
+and set `driver_paths = /opt/havuz/drivers/oracle.jar` on the pool. It is a
+comma separated list of *files*; a directory does not work, because a Java class
+loader reads a directory as a tree of loose classes rather than as a place JARs
+live in.
+
+Baking them in is the same decision made once instead of per container:
+
+```sh
+docker build --target jdbc -t havuz-jdbc:oracle \
+  --build-arg DRIVERS="postgresql=org.postgresql:postgresql:42.7.13 \
+                       oracle=com.oracle.database.jdbc:ojdbc11:23.26.3.0.0" .
+```
+
+`DRIVERS` is `name=groupId:artifactId:version`, fetched from Maven Central, and
+`MAVEN_REPO` points the fetch at an internal mirror where there is one.
+
 ### Read/write split, and why it is off by default
 
 This is the feature most likely to break an application silently. A misrouted
@@ -632,6 +723,19 @@ cargo test --workspace          # 300+ tests, no database required
 cargo clippy --workspace --all-targets
 cd ui && pnpm install && pnpm build
 ```
+
+Images build from one Dockerfile with two targets, so the binary in them is the
+same build:
+
+```sh
+docker build --target runtime -t havuz .
+docker build --target jdbc    -t havuz:jdbc .
+```
+
+`.github/workflows/ci.yaml` runs the above on every push. Pushing a `v*` tag
+runs `release.yaml`, which publishes both images to ghcr.io for two
+architectures and attaches static Linux binaries, macOS binaries and
+`havuz-agent.jar` to the GitHub release.
 
 Integration tests need a real PostgreSQL and are not part of `cargo test`:
 

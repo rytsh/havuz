@@ -171,6 +171,28 @@
     @apply mb-0;
   }
 
+  /* The token prompt. Opaque rather than a translucent overlay: nothing behind
+     it has data in it yet, so there is nothing worth showing through. */
+  .token-gate {
+    @apply fixed inset-0 z-50 grid place-items-center bg-canvas p-4;
+  }
+
+  .token-card {
+    @apply w-full max-w-[440px] rounded-lg border border-line bg-panel p-6;
+  }
+
+  .token-card h1 {
+    @apply mb-3 text-xl;
+  }
+
+  .token-card .help {
+    @apply mb-4 text-xs text-muted;
+  }
+
+  .token-card .field {
+    @apply max-w-none;
+  }
+
   .cards {
     @apply mb-7 grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-6;
   }

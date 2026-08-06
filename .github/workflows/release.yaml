@@ -1,0 +1,278 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build, e.g. v0.1.0. Nothing is published to the release page."
+        required: true
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ---------------------------------------------------------------- metadata --
+  meta:
+    name: version
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.v.outputs.tag }}
+      version: ${{ steps.v.outputs.version }}
+      prerelease: ${{ steps.v.outputs.prerelease }}
+    steps:
+      - id: v
+        run: |
+          TAG="${{ github.event.inputs.version || github.ref_name }}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          # v0.1.0-rc1 is not what `latest` should point at.
+          case "${TAG#v}" in
+            *-*) echo "prerelease=true" >> "$GITHUB_OUTPUT" ;;
+            *)   echo "prerelease=false" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+  # ---------------------------------------------------------------- binaries --
+  binaries:
+    name: ${{ matrix.target }}
+    needs: meta
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # musl rather than glibc on Linux: a pooler is deployed onto whatever
+          # the database team already runs, and a static binary has no opinion
+          # about which glibc that is.
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+          - target: aarch64-apple-darwin
+            runner: macos-15
+          - target: x86_64-apple-darwin
+            runner: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Build the dashboard
+        working-directory: ui
+        run: |
+          npm install --global pnpm@11.1.1
+          pnpm install --frozen-lockfile
+          pnpm run build
+
+      - name: musl toolchain
+        if: endsWith(matrix.target, '-musl')
+        # rusqlite and ring both compile C, so the target needs a C compiler and
+        # not only a Rust one.
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes musl-tools
+
+      - name: Install the pinned toolchain
+        run: |
+          rustup show
+          rustup target add ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --package havuz-server --features embed-ui --target ${{ matrix.target }}
+
+      - name: Package
+        run: |
+          set -eu
+          NAME="havuz-${{ needs.meta.outputs.version }}-${{ matrix.target }}"
+          mkdir -p "dist/${NAME}"
+          cp "target/${{ matrix.target }}/release/havuz" "dist/${NAME}/"
+          cp README.md LICENSE havuz.example.toml "dist/${NAME}/"
+          tar -C dist -czf "dist/${NAME}.tar.gz" "${NAME}"
+          # Run from inside dist so the checksum file names the archive and not
+          # a path that only existed on this runner.
+          ( cd dist && shasum -a 256 "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256" )
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.target }}
+          path: dist/*.tar.gz*
+          if-no-files-found: error
+
+  # --------------------------------------------------------------- jdbc agent --
+  agent:
+    name: jdbc agent
+    needs: meta
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - run: HAVUZ_JAVAC=1 ./agent/build.sh
+      - name: Package
+        run: |
+          set -eu
+          mkdir -p dist
+          cp agent/build/havuz-agent.jar dist/havuz-agent.jar
+          ( cd dist && shasum -a 256 havuz-agent.jar > havuz-agent.jar.sha256 )
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agent-jar
+          path: dist/havuz-agent.jar*
+          if-no-files-found: error
+
+  # ------------------------------------------------------------------ images --
+  # Built on a machine of the right architecture rather than under emulation: a
+  # Rust build through qemu takes long enough to time out the job.
+  images:
+    name: image ${{ matrix.image }} (${{ matrix.arch }})
+    needs: meta
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [runtime, jdbc]
+        arch: [amd64, arm64]
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: ${{ matrix.image }}
+          platforms: ${{ matrix.platform }}
+          provenance: false
+          labels: |
+            org.opencontainers.image.version=${{ needs.meta.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha,scope=${{ matrix.image }}-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}-${{ matrix.arch }}
+          outputs: type=image,name=ghcr.io/${{ github.repository }},push-by-digest=true,name-canonical=true,push=true
+
+      # The manifest that ties the two architectures together is written by the
+      # merge job; all this one has to hand over is the digest it produced.
+      - name: Export the digest
+        run: |
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${{ steps.build.outputs.digest }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.image }}-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  manifest:
+    name: manifest ${{ matrix.image }}
+    needs: [meta, images]
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        image: [runtime, jdbc]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: digest-${{ matrix.image }}-*
+          path: /tmp/digests
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Create the multi-architecture tags
+        working-directory: /tmp/digests
+        run: |
+          set -eu
+          IMAGE="ghcr.io/${{ github.repository }}"
+          VERSION="${{ needs.meta.outputs.version }}"
+          # The pooler is the plain tag; the JDBC bridge is a suffix on it, so
+          # `:0.1.0` and `:0.1.0-jdbc` are the same build of the same binary.
+          if [ "${{ matrix.image }}" = "jdbc" ]; then
+            TAGS="--tag ${IMAGE}:${VERSION}-jdbc"
+            FLOATING="--tag ${IMAGE}:jdbc"
+          else
+            TAGS="--tag ${IMAGE}:${VERSION}"
+            FLOATING="--tag ${IMAGE}:latest"
+          fi
+          # A release candidate is not what an unqualified tag should resolve to.
+          if [ "${{ needs.meta.outputs.prerelease }}" = "false" ]; then
+            TAGS="${TAGS} ${FLOATING}"
+          fi
+          docker buildx imagetools create ${TAGS} \
+            $(printf "${IMAGE}@%s " *)
+      - name: Show what landed
+        run: docker buildx imagetools inspect "ghcr.io/${{ github.repository }}:${{ needs.meta.outputs.version }}${{ matrix.image == 'jdbc' && '-jdbc' || '' }}"
+
+  # ----------------------------------------------------------------- release --
+  release:
+    name: github release
+    needs: [meta, binaries, agent, manifest]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binary-*
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: agent-jar
+          path: dist
+      - name: Collect the checksums into one file
+        working-directory: dist
+        run: |
+          set -eu
+          cat ./*.sha256 > SHA256SUMS
+          rm -f ./*.sha256
+          ls -l
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.meta.outputs.tag }}
+          prerelease: ${{ needs.meta.outputs.prerelease == 'true' }}
+          generate_release_notes: true
+          files: dist/*
+          body: |
+            ## Containers
+
+            ```sh
+            docker run --rm -p 6432:6432 -p 7432:7432 \
+              -v havuz-data:/var/lib/havuz \
+              ghcr.io/${{ github.repository }}:${{ needs.meta.outputs.version }}
+            ```
+
+            `:${{ needs.meta.outputs.version }}-jdbc` is the same build with a JRE,
+            the JDBC agent and the redistributable drivers under
+            `/opt/havuz/drivers`. Both are linux/amd64 and linux/arm64.
+
+            ## Binaries
+
+            Linux binaries are static (musl) and need nothing installed. The
+            JDBC bridge additionally needs `havuz-agent.jar` and a JRE 17 or
+            newer; put the JAR in `/usr/share/havuz/` or name it with the
+            `agent_jar` pool setting.
